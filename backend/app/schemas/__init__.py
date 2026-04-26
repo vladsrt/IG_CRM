@@ -6,7 +6,15 @@ from app.schemas.account import (
 )
 from app.schemas.task import TaskBase, TaskCreate, TaskRead
 from app.schemas.proxy import ProxyBase, ProxyCreate, ProxyRead
-from app.schemas.asset import AssetBase, AssetCreate, AssetRead
+from app.schemas.asset import (
+    AssetBase,
+    AssetCreate,
+    AssetRead,
+    MediaFolderBase,
+    MediaFolderCreate,
+    MediaFolderRead,
+    UniqueizeRequest,
+)
 from app.schemas.billing import (
     SubscriptionBase,
     SubscriptionCreate,
@@ -30,6 +38,10 @@ __all__ = [
     "AssetBase",
     "AssetCreate",
     "AssetRead",
+    "MediaFolderBase",
+    "MediaFolderCreate",
+    "MediaFolderRead",
+    "UniqueizeRequest",
     "SubscriptionBase",
     "SubscriptionCreate",
     "SubscriptionUpdate",

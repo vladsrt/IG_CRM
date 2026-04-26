@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.account import AuthMethod
 
@@ -14,6 +14,7 @@ class InstagramAccountBase(BaseModel):
     proxy_session_id: str | None = None
     cookies: dict[str, Any] | None = None
     status: str | None = None
+    tags: list[str] = Field(default_factory=list)
 
 
 class InstagramAccountCreate(InstagramAccountBase):

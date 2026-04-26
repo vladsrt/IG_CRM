@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import Any, Sequence
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -25,6 +25,21 @@ class InstagramAccountUpdate(BaseModel):
     cookies: dict[str, Any] | None = None
     status: str | None = None
     error_log: str | None = None
+    tags: list[str] | None = Field(default=None)
+
+
+def _normalize_tags(tags: list[str] | None) -> list[str]:
+    """Lowercase, strip, dedupe — keeps the JSONB column tidy."""
+    if not tags:
+        return []
+    seen: dict[str, None] = {}
+    for raw in tags:
+        if not isinstance(raw, str):
+            continue
+        cleaned = raw.strip().lower()
+        if cleaned:
+            seen.setdefault(cleaned, None)
+    return list(seen.keys())
 
 
 # ── Read ────────────────────────────────────────────────────────────────
@@ -36,14 +51,30 @@ def list_accounts(
     db: Session,
     *,
     user_id: uuid.UUID | None = None,
+    tags: list[str] | None = None,
     skip: int = 0,
     limit: int = 100,
 ) -> Sequence[InstagramAccount]:
     stmt = select(InstagramAccount)
     if user_id is not None:
         stmt = stmt.where(InstagramAccount.user_id == user_id)
+    if tags:
+        # JSONB containment: row.tags must contain every requested tag.
+        wanted = _normalize_tags(tags)
+        if wanted:
+            stmt = stmt.where(InstagramAccount.tags.contains(wanted))
     stmt = stmt.offset(skip).limit(limit)
     return db.execute(stmt).scalars().all()
+
+
+def list_accounts_by_tags(
+    db: Session,
+    tags: list[str],
+    *,
+    user_id: uuid.UUID | None = None,
+) -> Sequence[InstagramAccount]:
+    """Convenience helper used by the AI orchestrator (Sprint 5)."""
+    return list_accounts(db, user_id=user_id, tags=tags, limit=10_000)
 
 
 # ── Create ──────────────────────────────────────────────────────────────
@@ -61,6 +92,7 @@ def create_account(
         if isinstance(account_in.auth_method, AuthMethod)
         else account_in.auth_method
     )
+    payload["tags"] = _normalize_tags(payload.get("tags"))
 
     account = InstagramAccount(**payload)
     db.add(account)
@@ -89,6 +121,8 @@ def update_account(
             raise ValueError(f"Proxy {data['proxy_id']} does not exist")
     if "auth_method" in data and isinstance(data["auth_method"], AuthMethod):
         data["auth_method"] = data["auth_method"].value
+    if "tags" in data:
+        data["tags"] = _normalize_tags(data["tags"])
 
     for field, value in data.items():
         setattr(account, field, value)

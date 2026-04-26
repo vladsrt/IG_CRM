@@ -106,6 +106,14 @@ class ParsedTaskPlan(BaseModel):
     priority: TaskPriority = Field(
         description="Inferred urgency of the task as a whole.",
     )
+    target_tags: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Lowercase account tags this plan should fan out to "
+            "(e.g. ['crypto', 'tier1']). Empty list means: target the "
+            "single account_id passed to the API call instead."
+        ),
+    )
     commands: list[ActionCommand] = Field(
         description="Ordered list of browser actions to execute.",
     )
@@ -115,6 +123,7 @@ class ParsedTaskPlan(BaseModel):
         return {
             "summary": self.summary,
             "priority": self.priority.value,
+            "target_tags": list(self.target_tags),
             "commands": [
                 {"action": cmd.action.value, "args": cmd.args_as_dict()}
                 for cmd in self.commands
