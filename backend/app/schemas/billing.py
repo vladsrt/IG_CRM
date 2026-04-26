@@ -1,21 +1,23 @@
 import uuid
 from datetime import datetime
-from decimal import Decimal
-
 from pydantic import BaseModel, ConfigDict
 
+class SubscriptionBase(BaseModel):
+    tier: str = "free"
+    valid_until: datetime | None = None
+    is_active: bool = True
 
-class BillingBalanceBase(BaseModel):
-    tokens_balance: Decimal = Decimal("0")
-
-
-class BillingBalanceCreate(BillingBalanceBase):
+class SubscriptionCreate(SubscriptionBase):
     user_id: uuid.UUID
 
+class SubscriptionUpdate(BaseModel):
+    tier: str | None = None
+    valid_until: datetime | None = None
+    is_active: bool | None = None
 
-class BillingBalanceRead(BillingBalanceBase):
+class SubscriptionRead(SubscriptionBase):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
     user_id: uuid.UUID
-    last_update: datetime
+    updated_at: datetime
