@@ -33,6 +33,14 @@ class Settings(BaseSettings):
     OPENAI_TIMEOUT_SECONDS: float = 60.0
     OPENAI_MAX_RETRIES: int = 2
 
+    # ── Media storage / FFmpeg ──────────────────────────────────────────
+    MEDIA_ROOT: str = "./media"                 # base dir for uploaded + processed assets
+    MEDIA_MAX_UPLOAD_BYTES: int = 500 * 1024 * 1024   # 500 MB hard cap per upload
+    FFMPEG_BIN: str = "ffmpeg"
+    FFPROBE_BIN: str = "ffprobe"
+    FFMPEG_TIMEOUT_SECONDS: int = 60 * 15       # 15 min per uniqueization pass
+    FFMPEG_DEFAULT_BITRATE_BPS: int = 3_000_000  # fallback if ffprobe can't read input
+
 
 # Singleton – import `settings` everywhere instead of re-instantiating.
 settings = Settings()

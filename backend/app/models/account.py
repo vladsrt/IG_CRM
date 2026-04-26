@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from typing import Any, TYPE_CHECKING
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, String, Text
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -68,6 +68,17 @@ class InstagramAccount(Base):
         nullable=True,
     )
 
+    # ── Tagging (Sprint 5) ──────────────────────────────────────────────
+    # Free-form list of lowercase string tags (e.g. ["crypto", "tier1"]).
+    # Stored as a JSONB array so the AI orchestrator can target groups via
+    # JSONB containment queries (`tags @> '["crypto"]'::jsonb`).
+    tags: Mapped[list[str]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        server_default=text("'[]'::jsonb"),
+    )
+
     # ── Relationships ───────────────────────────────────────────────────
     user: Mapped[User] = relationship(
         back_populates="instagram_accounts",
@@ -82,4 +93,4 @@ class InstagramAccount(Base):
     )
 
     def __repr__(self) -> str:
-        return f"<InstagramAccount @{self.ig_username}>"
+        return f"<InstagramAccount @{self.ig_username} tags={self.tags}>"
