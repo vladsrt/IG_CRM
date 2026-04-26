@@ -113,6 +113,7 @@ class TaskExecutor:
                 proxy_string=self.proxy_string,
                 user_agent=self.user_agent,
                 headless=self.headless,
+                task_id=self.task_id,
             )
 
             # Story 4.5: cookie injection
