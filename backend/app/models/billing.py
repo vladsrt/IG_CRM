@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, ForeignKey, Numeric, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -14,11 +13,10 @@ from app.core.database import Base
 if TYPE_CHECKING:
     from app.models.user import User
 
+class Subscription(Base):
+    """User subscription plan."""
 
-class BillingBalance(Base):
-    """Token-based billing balance for a user."""
-
-    __tablename__ = "billing_balance"
+    __tablename__ = "subscriptions"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -29,23 +27,33 @@ class BillingBalance(Base):
         UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
+        unique=True, # У одного юзера только одна активная подписка
     )
-    tokens_balance: Mapped[Decimal] = mapped_column(
-        Numeric(precision=18, scale=6),
+    tier: Mapped[str] = mapped_column(
+        String(50), 
+        nullable=False, 
+        default="free", # free, pro, enterprise
+    )
+    valid_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean,
         nullable=False,
-        default=Decimal("0"),
-        server_default="0",
+        default=True,
     )
-    last_update: Mapped[datetime] = mapped_column(
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
+        onupdate=func.now(),
         nullable=False,
     )
 
     # ── Relationships ───────────────────────────────────────────────────
     user: Mapped[User] = relationship(
-        back_populates="billing_balance",
+        back_populates="subscription",
     )
 
     def __repr__(self) -> str:
-        return f"<BillingBalance user={self.user_id} tokens={self.tokens_balance}>"
+        return f"<Subscription tier={self.tier} active={self.is_active}>"

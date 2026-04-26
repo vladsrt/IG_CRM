@@ -13,11 +13,11 @@ from app.core.database import Base
 if TYPE_CHECKING:
     from app.models.account import InstagramAccount
     from app.models.asset import Asset
-    from app.models.billing import BillingBalance
+    from app.models.billing import Subscription
 
 
 class User(Base):
-    """Application user who owns Instagram accounts, assets, and billing."""
+    """Application user who owns Instagram accounts, assets, and a subscription."""
 
     __tablename__ = "users"
 
@@ -52,9 +52,10 @@ class User(Base):
         cascade="all, delete-orphan",
         lazy="selectin",
     )
-    billing_balance: Mapped[list[BillingBalance]] = relationship(
+    subscription: Mapped[Subscription] = relationship(
         back_populates="user",
         cascade="all, delete-orphan",
+        uselist=False,
         lazy="selectin",
     )
 
