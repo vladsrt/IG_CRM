@@ -19,7 +19,7 @@ celery_app: Celery = Celery(
     "ig_crm",
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
-    include=["app.workers.celery_tasks"],
+    include=["app.workers.celery_tasks", "app.workers.media_tasks"],
 )
 
 celery_app.conf.update(
