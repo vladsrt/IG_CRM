@@ -19,6 +19,20 @@ class Settings(BaseSettings):
     # ── Database ────────────────────────────────────────────────────────
     DATABASE_URL: str = "postgresql+psycopg://user:password@localhost:5432/ig_crm"
 
+    # ── Redis / Celery ──────────────────────────────────────────────────
+    REDIS_URL: str = "redis://localhost:6379/0"
+    CELERY_BROKER_URL: str = "redis://localhost:6379/1"
+    CELERY_RESULT_BACKEND: str = "redis://localhost:6379/2"
+    CELERY_TASK_DEFAULT_QUEUE: str = "ig_crm.default"
+    CELERY_TASK_TIME_LIMIT: int = 60 * 30        # hard kill after 30 min
+    CELERY_TASK_SOFT_TIME_LIMIT: int = 60 * 25   # raise SoftTimeLimitExceeded at 25 min
+
+    # ── OpenAI ──────────────────────────────────────────────────────────
+    OPENAI_API_KEY: str = ""
+    OPENAI_MODEL: str = "gpt-4o-mini"
+    OPENAI_TIMEOUT_SECONDS: float = 60.0
+    OPENAI_MAX_RETRIES: int = 2
+
 
 # Singleton – import `settings` everywhere instead of re-instantiating.
 settings = Settings()
