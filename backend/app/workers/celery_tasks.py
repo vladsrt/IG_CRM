@@ -25,16 +25,21 @@ from app.core.database import SessionLocal
 from app.models.account import InstagramAccount
 from app.models.proxy import Proxy
 from app.models.task import Task, TaskStatus
+from workers.core.executor import TaskExecutor
 
 logger = logging.getLogger(__name__)
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
 def _build_proxy_string(proxy: Proxy | None) -> str | None:
-    """Render a proxy ORM row as a ``scheme://user:pass@host:port`` string."""
+    """Render a proxy ORM row as a ``user:pass@host:port`` string.
+
+    Note: ``InstagramBrowser`` / ``proxy_builder.create_proxy_extension``
+    parse this format directly — no scheme prefix.
+    """
     if proxy is None:
         return None
-    return f"http://{proxy.username}:{proxy.password}@{proxy.host}:{proxy.port}"
+    return f"{proxy.username}:{proxy.password}@{proxy.host}:{proxy.port}"
 
 
 def _set_task_status(
@@ -83,9 +88,9 @@ def validate_account_session(self: CeleryTask, account_id: str) -> dict[str, Any
         cookies = account.cookies or {}
 
         # ── Browser logic placeholder ───────────────────────────────────
-        # TODO: hand `proxy_string` and `cookies` to DrissionPage worker
-        # and have it return an "authenticated" boolean + diagnostic info.
-        # For now we optimistically mark the account as needing a re-check.
+        # TODO: hand `proxy_string` and `cookies` to a dedicated validator
+        # action via TaskExecutor once a `validate_session` action handler
+        # is registered. For now we optimistically mark the account.
         is_valid: bool = True
         error_message: str | None = None
 
@@ -114,7 +119,7 @@ def run_instagram_task(self: CeleryTask, task_id: str) -> dict[str, Any]:
         1. Load Task + Account + Proxy from the DB.
         2. Build the ``payload`` dict the browser worker consumes.
         3. Flip Task → RUNNING.
-        4. Call the browser worker (placeholder).
+        4. Hand the payload to ``TaskExecutor`` (which guarantees teardown).
         5. On success → COMPLETED. On error → FAILED + write traceback.
     """
     task_uuid = uuid.UUID(task_id)
@@ -134,6 +139,12 @@ def run_instagram_task(self: CeleryTask, task_id: str) -> dict[str, Any]:
 
         proxy = account.proxy  # eager-loaded via lazy="selectin" on the relationship
 
+        # The AI parser stores the full plan dict on Task.payload:
+        #   {"summary": ..., "priority": ..., "commands": [{action, args}, ...]}
+        # The executor expects payload["commands"] to be the *list* — flatten here.
+        plan: dict[str, Any] = task.payload or {}
+        commands_list: list[dict[str, Any]] = plan.get("commands") or []
+
         payload: dict[str, Any] = {
             "task_id": str(task.id),
             "account_id": str(account.id),
@@ -143,23 +154,18 @@ def run_instagram_task(self: CeleryTask, task_id: str) -> dict[str, Any]:
             "proxy_string": _build_proxy_string(proxy),
             "proxy_session_id": account.proxy_session_id,
             "cookies": account.cookies or {},
-            "commands": task.payload or {},
+            "commands": commands_list,
+            "plan_summary": plan.get("summary"),
+            "plan_priority": plan.get("priority"),
             "priority": task.priority,
         }
 
     # ── 3. Mark RUNNING ────────────────────────────────────────────────
     _set_task_status(task_uuid, TaskStatus.RUNNING)
 
-    # ── 4. Execute (with full lifecycle handling) ──────────────────────
+    # ── 4. Execute via TaskExecutor (Sprint 4) ─────────────────────────
     try:
-        # TODO: hand `payload` to the DrissionPage browser worker, e.g.:
-        #     from workers.core.browser_core import execute
-        #     result = execute(payload)
-        result: dict[str, Any] = {
-            "task_id": str(task_uuid),
-            "executed": False,
-            "note": "browser worker not yet wired",
-        }
+        result: dict[str, Any] = TaskExecutor(payload).execute()
 
     except SoftTimeLimitExceeded as exc:
         logger.error("[run_instagram_task] soft time limit hit for %s", task_uuid)
