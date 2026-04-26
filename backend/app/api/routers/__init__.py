@@ -1,5 +1,5 @@
 """FastAPI routers."""
 
-from app.api.routers import account, ai, orchestrator, proxy, task, user
+from app.api.routers import account, ai, media, orchestrator, proxy, task, user
 
-__all__ = ["account", "ai", "orchestrator", "proxy", "task", "user"]
+__all__ = ["account", "ai", "media", "orchestrator", "proxy", "task", "user"]
