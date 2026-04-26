@@ -3,7 +3,7 @@ from app.models.account import InstagramAccount, AuthMethod
 from app.models.task import Task, TaskStatus
 from app.models.proxy import Proxy, ProxyType
 from app.models.asset import Asset
-from app.models.billing import BillingBalance
+from app.models.billing import Subscription
 
 __all__ = [
     "User",
@@ -14,5 +14,5 @@ __all__ = [
     "Proxy",
     "ProxyType",
     "Asset",
-    "BillingBalance",
+    "Subscription",
 ]
