@@ -1,19 +1,18 @@
-"""AI-driven task generation endpoint."""
+"""AI-driven plan generation endpoint (Human-in-the-Loop, Sprint X).
+
+This endpoint is intentionally side-effect free: it converts a natural-language
+prompt into a strict ``ParsedTaskPlan`` and returns it to the frontend for
+human review. Persisting Tasks and dispatching them to Celery workers is the
+job of ``POST /orchestrator/tasks/fan-out``.
+"""
 
 from __future__ import annotations
 
 import logging
-import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
 
-from app.core.database import get_db
-from app.crud import account as crud_account
-from app.crud import task as crud_task
-from app.models.task import TaskStatus
-from app.schemas.ai import GenerateTaskRequest
-from app.schemas.task import TaskCreate, TaskRead
+from app.schemas.ai import GenerateTaskRequest, ParsedTaskPlan
 from app.services.ai_parser import AIParser, AIParserError
 
 logger = logging.getLogger(__name__)
@@ -22,38 +21,32 @@ router = APIRouter(prefix="/ai", tags=["ai"])
 
 
 def get_ai_parser() -> AIParser:
-    """FastAPI dependency — overridable in tests with `app.dependency_overrides`."""
+    """FastAPI dependency — overridable in tests via ``app.dependency_overrides``."""
     return AIParser()
 
 
 @router.post(
     "/generate-task",
-    response_model=TaskRead,
-    status_code=status.HTTP_201_CREATED,
-    summary="Translate a natural-language prompt into a DRAFT Task",
+    response_model=ParsedTaskPlan,
+    status_code=status.HTTP_200_OK,
+    summary="Translate a natural-language prompt into a ParsedTaskPlan (no DB writes)",
 )
 def generate_task(
     body: GenerateTaskRequest,
-    db: Session = Depends(get_db),
     parser: AIParser = Depends(get_ai_parser),
-) -> TaskRead:
-    # ── Validate target account exists ────────────────────────────────
-    try:
-        account_uuid = uuid.UUID(body.account_id)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"account_id is not a valid UUID: {exc}",
-        ) from exc
+) -> ParsedTaskPlan:
+    """Run the LLM and return the structured plan unchanged.
 
-    account = crud_account.get_account(db, account_uuid)
-    if account is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="InstagramAccount not found",
-        )
+    Possible outcomes the frontend must handle:
 
-    # ── Call the LLM ──────────────────────────────────────────────────
+    * ``plan.clarification_needed`` is a string → render it as the next
+      assistant turn in the chat. The user's reply gets concatenated to the
+      prior prompt and resubmitted to this endpoint.
+    * ``plan.clarification_needed`` is null AND ``plan.commands`` is non-empty
+      → ready to dispatch via ``POST /orchestrator/tasks/fan-out``.
+    * ``plan.clarification_needed`` is null AND ``plan.commands`` is empty
+      → the model decided the request is unsupported; ``plan.summary`` says why.
+    """
     try:
         plan = parser.parse(body.user_prompt)
     except AIParserError as exc:
@@ -63,28 +56,16 @@ def generate_task(
             detail=f"AI parser failed: {exc}",
         ) from exc
 
-    if not plan.commands:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                "The model could not translate the prompt into any actionable "
-                f"commands. Reason: {plan.summary}"
-            ),
+    if plan.clarification_needed:
+        logger.info(
+            "[ai.generate_task] clarification requested: %s",
+            plan.clarification_needed,
+        )
+    else:
+        logger.info(
+            "[ai.generate_task] returning plan with %d command(s), tags=%s",
+            len(plan.commands),
+            plan.target_tags,
         )
 
-    # ── Persist as a DRAFT Task ───────────────────────────────────────
-    task_in = TaskCreate(
-        account_id=account_uuid,
-        status=TaskStatus.DRAFT,
-        payload=plan.to_payload_dict(),
-        priority=plan.priority_as_int(),
-    )
-
-    try:
-        task = crud_task.create_task(db, task_in)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
-        ) from exc
-
-    return TaskRead.model_validate(task)
+    return plan
