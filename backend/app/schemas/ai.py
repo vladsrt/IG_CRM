@@ -8,6 +8,13 @@ which forbids ``additionalProperties: true``. That means an open-ended
 The portable workaround is to model arguments as a list of typed key/value
 pairs and convert to a regular ``dict`` after parsing — see
 ``ActionCommand.args_as_dict()``.
+
+Why ``clarification_needed`` is ``str | None`` (not omitted when null)
+─────────────────────────────────────────────────────────────────────
+OpenAI strict mode requires every property to appear in ``required``. A
+truly optional field is impossible. We instead model it as a nullable
+field — the LLM MUST emit a value, but is allowed (and instructed) to
+emit ``null`` when no clarification is required.
 """
 
 from __future__ import annotations
@@ -101,7 +108,7 @@ class ParsedTaskPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     summary: str = Field(
-        description="One-sentence human-readable summary of the user's intent.",
+        description="One-sentence human-readable summary of what was understood.",
     )
     priority: TaskPriority = Field(
         description="Inferred urgency of the task as a whole.",
@@ -110,16 +117,39 @@ class ParsedTaskPlan(BaseModel):
         default_factory=list,
         description=(
             "Lowercase account tags this plan should fan out to "
-            "(e.g. ['crypto', 'tier1']). Empty list means: target the "
-            "single account_id passed to the API call instead."
+            "(e.g. ['crypto', 'tier1']). Empty list means: defer targeting "
+            "to the explicit account_ids the caller passes to fan-out."
+        ),
+    )
+    clarification_needed: str | None = Field(
+        default=None,
+        description=(
+            "If the prompt is ambiguous or missing critical information "
+            "(no file for an upload, no recipient for a DM, vague targeting, "
+            "etc.), put a single polite question here ending in '?' and "
+            "leave `commands` empty. The frontend will show this to the "
+            "operator as a chat reply. Set to null when the plan is complete."
         ),
     )
     commands: list[ActionCommand] = Field(
-        description="Ordered list of browser actions to execute.",
+        default_factory=list,
+        description=(
+            "Ordered list of browser actions to execute. MUST be empty when "
+            "`clarification_needed` is set."
+        ),
     )
 
+    # ── Derived helpers ────────────────────────────────────────────────
+    def is_actionable(self) -> bool:
+        """True when the plan can actually be dispatched (no clarification, ≥1 command)."""
+        return self.clarification_needed is None and len(self.commands) > 0
+
     def to_payload_dict(self) -> dict[str, Any]:
-        """Serialize the plan into the dict that gets stored on ``Task.payload``."""
+        """Serialize the plan into the dict that gets stored on ``Task.payload``.
+
+        ``clarification_needed`` is intentionally excluded — it's planning
+        metadata, not something the browser worker should consume.
+        """
         return {
             "summary": self.summary,
             "priority": self.priority.value,
@@ -137,11 +167,18 @@ class ParsedTaskPlan(BaseModel):
 
 # ── API request schema ──────────────────────────────────────────────────
 class GenerateTaskRequest(BaseModel):
-    """Request body for ``POST /ai/generate-task``."""
+    """Request body for ``POST /ai/generate-task``.
+
+    ``account_id`` is now OPTIONAL: since this endpoint no longer creates a
+    Task in the DB (Human-in-the-Loop refactor), the field is purely a
+    contextual hint the frontend may pass through. Targeting at dispatch
+    time is handled by ``POST /orchestrator/tasks/fan-out``.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     user_prompt: str = Field(min_length=1, max_length=4000)
-    account_id: str = Field(
-        description="UUID of the InstagramAccount this plan should run against.",
+    account_id: str | None = Field(
+        default=None,
+        description="Optional UUID of an InstagramAccount for context only.",
     )
