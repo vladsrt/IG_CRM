@@ -18,7 +18,7 @@ from app.schemas.asset import MediaFolderCreate
 def get_folder(db: Session, folder_id: uuid.UUID) -> MediaFolder | None:
     return db.get(MediaFolder, folder_id)
 
-
+#list
 def list_folders(
     db: Session,
     *,
