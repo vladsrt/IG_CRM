@@ -27,7 +27,7 @@ class ProxyUpdate(BaseModel):
 def get_proxy(db: Session, proxy_id: uuid.UUID) -> Proxy | None:
     return db.get(Proxy, proxy_id)
 
-
+#list
 def list_proxies(db: Session, skip: int = 0, limit: int = 100) -> Sequence[Proxy]:
     stmt = select(Proxy).offset(skip).limit(limit)
     return db.execute(stmt).scalars().all()
