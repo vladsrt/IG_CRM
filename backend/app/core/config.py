@@ -2,7 +2,7 @@
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
+#base settings
 class Settings(BaseSettings):
     """Central application settings.
 
@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     )
 
     # ── Database ────────────────────────────────────────────────────────
-    DATABASE_URL: str = "postgresql+psycopg://user:password@localhost:5432/ig_crm"
+    DATABASE_URL: str = "postgresql+psycopg://ig_user:ig_password123@localhost:5433/ig_crm"
 
     # ── Redis / Celery ──────────────────────────────────────────────────
     REDIS_URL: str = "redis://localhost:6379/0"
