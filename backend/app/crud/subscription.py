@@ -34,6 +34,7 @@ def list_subscriptions(
 
 
 # ── Create ──────────────────────────────────────────────────────────────
+#Create sub
 def create_subscription(db: Session, sub_in: SubscriptionCreate) -> Subscription:
     if db.get(User, sub_in.user_id) is None:
         raise ValueError(f"User {sub_in.user_id} does not exist")
