@@ -5,6 +5,16 @@ Drives Instagram's web "Create → Post / Reel" flow against an already
 authenticated ``InstagramBrowser`` and uploads the file at
 ``args["file_path"]``.
 
+Every visible-element interaction (clicks, keystrokes, scrolls, pauses)
+is routed through ``HumanBehaviorEngine`` so the session emits Bezier
+mouse trajectories, variable keystroke timing, reading pauses, and
+micro-scrolls instead of the instantaneous synthetic events that Meta's
+risk engine flags as bot activity.
+
+The single exception is the hidden ``<input type="file">``: that is a
+programmatic file injection, not a user gesture — its element has no
+visible bounding rect, so we keep the raw ``.input(path)`` call there.
+
 Public API
 ~~~~~~~~~~
 ``execute_upload(browser, args) -> dict`` — invoked by ``TaskExecutor``.
@@ -21,20 +31,12 @@ Supported ``args``
 * ``disable_comments``  (optional, bool) — toggle "turn off commenting"
 * ``upload_timeout_s``  (optional, int)  — overall ceiling on the share→done wait
                                            (default 180s; raise for big videos)
-
-Locator strategy
-~~~~~~~~~~~~~~~~
-All selectors target **semantic attributes** (``aria-label``, ``role``,
-``placeholder``, visible text) rather than volatile React/Tailwind class
-hashes. Each step tries multiple fallbacks so a single DOM tweak by IG
-doesn't break the whole flow.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import random
 import sys
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional
@@ -42,6 +44,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 # Allow `python action_upload.py` from the actions/ dir for the smoke-test.
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
+from workers.core.behavior import HumanBehaviorEngine
 from workers.core.browser_core import InstagramBrowser
 
 logger = logging.getLogger(__name__)
@@ -51,8 +54,6 @@ logger = logging.getLogger(__name__)
 _HOME_URL: str = "https://www.instagram.com/"
 _DEFAULT_STEP_TIMEOUT_S: float = 20.0
 _DEFAULT_UPLOAD_TIMEOUT_S: float = 180.0
-_HUMAN_PAUSE_RANGE: tuple[float, float] = (1.0, 2.5)
-_LONG_PAUSE_RANGE: tuple[float, float] = (2.5, 4.5)
 
 _VIDEO_EXTS: frozenset[str] = frozenset(
     {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi"}
@@ -67,11 +68,7 @@ class UploadActionError(RuntimeError):
     """Raised when a step in the upload flow cannot complete."""
 
 
-# ── Human-mimicry helpers ───────────────────────────────────────────────
-def _human_pause(rng: tuple[float, float] = _HUMAN_PAUSE_RANGE) -> None:
-    time.sleep(random.uniform(*rng))
-
-
+# ── Helpers ─────────────────────────────────────────────────────────────
 def _detect_media_kind(file_path: str) -> str:
     suffix = os.path.splitext(file_path)[1].lower()
     if suffix in _VIDEO_EXTS:
@@ -81,7 +78,6 @@ def _detect_media_kind(file_path: str) -> str:
     return "unknown"
 
 
-# ── DrissionPage selector helpers ───────────────────────────────────────
 def _find_first(
     page: Any,
     selectors: Iterable[str],
@@ -90,10 +86,8 @@ def _find_first(
 ) -> Any | None:
     """Return the first selector that resolves to a real element, or ``None``.
 
-    DrissionPage's ``page.ele(selector, timeout=N)`` blocks for up to ``N``
-    seconds and returns the element (truthy) or ``None`` (falsy) on miss.
-    To bound total wait, we split the overall ``timeout`` budget across
-    candidate selectors.
+    The overall ``timeout`` budget is split across the candidate selectors
+    so a missing locator never burns the full window on its own.
     """
     selectors = list(selectors)
     if not selectors:
@@ -110,21 +104,22 @@ def _find_first(
     return None
 
 
-def _click_first(
+def _humanized_click_first(
     page: Any,
+    behavior: HumanBehaviorEngine,
     selectors: Iterable[str],
     *,
     timeout: float = _DEFAULT_STEP_TIMEOUT_S,
     label: str,
 ) -> Any:
-    """Find + click the first matching selector. Raises on miss / click failure."""
+    """Find the first matching selector and click it via the behavior engine."""
     ele = _find_first(page, selectors, timeout=timeout)
     if ele is None:
         raise UploadActionError(
             f"Could not locate {label!r} (tried {list(selectors)})"
         )
     try:
-        ele.click()
+        behavior.click(ele)
     except Exception as exc:
         raise UploadActionError(
             f"Found {label!r} but click failed: {exc}"
@@ -133,11 +128,7 @@ def _click_first(
 
 
 def _step(label: str, fn: Callable[[], Any]) -> Any:
-    """Wrap a step so failures carry their step name in the error chain.
-
-    Lets ``UploadActionError`` propagate verbatim; wraps any other exception
-    type so the executor (and thus the Celery task) gets a clear stack.
-    """
+    """Wrap a step so failures carry their step name in the error chain."""
     logger.info("[upload] step: %s", label)
     try:
         return fn()
@@ -150,7 +141,7 @@ def _step(label: str, fn: Callable[[], Any]) -> Any:
 
 
 # ── Step implementations ────────────────────────────────────────────────
-def _navigate_home(browser: InstagramBrowser) -> None:
+def _navigate_home(browser: InstagramBrowser, behavior: HumanBehaviorEngine) -> None:
     browser.page.get(_HOME_URL)
     landed = _find_first(
         browser.page,
@@ -162,14 +153,19 @@ def _navigate_home(browser: InstagramBrowser) -> None:
     )
     if landed is None:
         raise UploadActionError("Home feed did not render — session may be invalid")
-    _human_pause(_LONG_PAUSE_RANGE)
+
+    # Skim the feed briefly before doing anything (real users don't load IG
+    # and instantly hit Create).
+    behavior.read_pause(content_length=None)
+    behavior.micro_scroll()
 
 
-def _open_create_dialog(browser: InstagramBrowser) -> None:
-    # The "Create" entry point lives on the left sidebar. Some accounts get
-    # a submenu (Post / Reel / Story); others go straight to the file picker.
-    _click_first(
+def _open_create_dialog(
+    browser: InstagramBrowser, behavior: HumanBehaviorEngine
+) -> None:
+    _humanized_click_first(
         browser.page,
+        behavior,
         [
             'css:svg[aria-label="New post"]',
             'css:a[href="#"] svg[aria-label="New post"]',
@@ -178,10 +174,11 @@ def _open_create_dialog(browser: InstagramBrowser) -> None:
         ],
         label="Create button",
     )
-    _human_pause()
+    behavior.idle(0.6, 1.4)
 
-    # If the submenu appeared, pick "Post" — IG converts long videos to Reels
-    # server-side, so "Post" works for both kinds.
+    # Some accounts get a Post / Reel / Story submenu; others jump straight
+    # to the file picker. Click "Post" if the submenu shows up — IG turns
+    # long videos into Reels server-side, so "Post" handles both kinds.
     submenu_post = _find_first(
         browser.page,
         [
@@ -192,8 +189,8 @@ def _open_create_dialog(browser: InstagramBrowser) -> None:
     )
     if submenu_post is not None:
         try:
-            submenu_post.click()
-            _human_pause()
+            behavior.click(submenu_post)
+            behavior.idle(0.5, 1.1)
         except Exception as exc:
             logger.debug("[upload] submenu Post click failed (%s); ignoring", exc)
 
@@ -203,8 +200,11 @@ def _inject_file(browser: InstagramBrowser, file_path: str) -> None:
     if not os.path.isfile(abs_path):
         raise UploadActionError(f"Upload file does not exist: {abs_path}")
 
-    # Hidden file input — we never click "Select from computer" because that
-    # opens the OS file dialog which DrissionPage cannot drive.
+    # Hidden file input — we never click "Select from computer" because
+    # that opens an OS-level file dialog DrissionPage cannot drive. This
+    # is the one interaction in the flow that bypasses the behavior
+    # engine: a hidden element has no usable bounding rect, and a file
+    # injection is a programmatic event, not a user gesture.
     file_input = _find_first(
         browser.page,
         [
@@ -225,10 +225,10 @@ def _inject_file(browser: InstagramBrowser, file_path: str) -> None:
             f"file_input.input({abs_path!r}) failed: {exc}"
         ) from exc
 
-    _human_pause(_LONG_PAUSE_RANGE)
 
-
-def _dismiss_video_reels_notice(browser: InstagramBrowser) -> None:
+def _dismiss_video_reels_notice(
+    browser: InstagramBrowser, behavior: HumanBehaviorEngine
+) -> None:
     """When uploading a video IG sometimes interrupts with an OK-modal."""
     ok_btn = _find_first(
         browser.page,
@@ -240,15 +240,18 @@ def _dismiss_video_reels_notice(browser: InstagramBrowser) -> None:
     )
     if ok_btn is not None:
         try:
-            ok_btn.click()
-            _human_pause()
+            behavior.click(ok_btn)
+            behavior.idle(0.4, 0.9)
         except Exception as exc:
             logger.debug("[upload] OK-modal click failed (%s); ignoring", exc)
 
 
-def _click_next(browser: InstagramBrowser, *, label: str) -> None:
-    _click_first(
+def _click_next(
+    browser: InstagramBrowser, behavior: HumanBehaviorEngine, *, label: str
+) -> None:
+    _humanized_click_first(
         browser.page,
+        behavior,
         [
             'xpath://div[@role="button" and normalize-space()="Next"]',
             'xpath://button[normalize-space()="Next"]',
@@ -257,10 +260,12 @@ def _click_next(browser: InstagramBrowser, *, label: str) -> None:
         label=label,
         timeout=_DEFAULT_STEP_TIMEOUT_S,
     )
-    _human_pause()
+    behavior.idle(0.7, 1.5)
 
 
-def _write_caption(browser: InstagramBrowser, caption: str) -> None:
+def _write_caption(
+    browser: InstagramBrowser, behavior: HumanBehaviorEngine, caption: str
+) -> None:
     if not caption:
         return
     caption_box = _find_first(
@@ -276,15 +281,18 @@ def _write_caption(browser: InstagramBrowser, caption: str) -> None:
     if caption_box is None:
         raise UploadActionError("Caption editor not found")
     try:
-        caption_box.click()
-        _human_pause((0.4, 1.0))
-        caption_box.input(caption)
+        behavior.type_into(caption_box, caption)
     except Exception as exc:
         raise UploadActionError(f"Caption input failed: {exc}") from exc
-    _human_pause()
+
+    # Re-read what was typed before moving on — natural beat that scales
+    # with caption length.
+    behavior.read_pause(content_length=len(caption))
 
 
-def _add_location(browser: InstagramBrowser, location: str) -> None:
+def _add_location(
+    browser: InstagramBrowser, behavior: HumanBehaviorEngine, location: str
+) -> None:
     if not location:
         return
     loc_input = _find_first(
@@ -301,15 +309,13 @@ def _add_location(browser: InstagramBrowser, location: str) -> None:
         return
 
     try:
-        loc_input.click()
-        _human_pause((0.3, 0.8))
-        loc_input.input(location)
+        behavior.type_into(loc_input, location)
     except Exception as exc:
         logger.warning("[upload] location input typing failed (%s); skipping", exc)
         return
 
-    # Wait for the suggestions list to populate, then click the first hit.
-    _human_pause((1.5, 2.5))
+    # Wait for the suggestions list to populate, then pick the top hit.
+    behavior.idle(1.4, 2.2)
     suggestion = _find_first(
         browser.page,
         [
@@ -323,13 +329,15 @@ def _add_location(browser: InstagramBrowser, location: str) -> None:
         logger.warning("[upload] no location suggestion appeared — skipping pick")
         return
     try:
-        suggestion.click()
-        _human_pause()
+        behavior.click(suggestion)
+        behavior.idle(0.5, 1.1)
     except Exception as exc:
         logger.warning("[upload] location suggestion click failed (%s); skipping", exc)
 
 
-def _add_alt_text(browser: InstagramBrowser, alt_text: str) -> None:
+def _add_alt_text(
+    browser: InstagramBrowser, behavior: HumanBehaviorEngine, alt_text: str
+) -> None:
     if not alt_text:
         return
     accessibility_btn = _find_first(
@@ -345,8 +353,8 @@ def _add_alt_text(browser: InstagramBrowser, alt_text: str) -> None:
         logger.warning("[upload] Accessibility section not found — skipping alt text")
         return
     try:
-        accessibility_btn.click()
-        _human_pause()
+        behavior.click(accessibility_btn)
+        behavior.idle(0.5, 1.0)
     except Exception as exc:
         logger.warning("[upload] Accessibility expand failed (%s); skipping", exc)
         return
@@ -365,16 +373,15 @@ def _add_alt_text(browser: InstagramBrowser, alt_text: str) -> None:
         logger.warning("[upload] alt text input not found — skipping")
         return
     try:
-        alt_input.click()
-        _human_pause((0.3, 0.8))
-        alt_input.input(alt_text)
-        _human_pause()
+        behavior.type_into(alt_input, alt_text)
+        behavior.read_pause(content_length=len(alt_text))
     except Exception as exc:
         logger.warning("[upload] alt text input failed (%s); skipping", exc)
 
 
 def _toggle_advanced_settings(
     browser: InstagramBrowser,
+    behavior: HumanBehaviorEngine,
     *,
     hide_likes: bool,
     disable_comments: bool,
@@ -395,14 +402,12 @@ def _toggle_advanced_settings(
         logger.warning("[upload] Advanced settings section not found — skipping toggles")
         return
     try:
-        advanced_btn.click()
-        _human_pause()
+        behavior.click(advanced_btn)
+        behavior.idle(0.5, 1.1)
     except Exception as exc:
         logger.warning("[upload] Advanced settings expand failed (%s); skipping", exc)
         return
 
-    # IG renders the toggles as either <input role=switch> or <div role=switch>.
-    # We grab them all and pick by label proximity.
     if hide_likes:
         toggle = _find_first(
             browser.page,
@@ -416,8 +421,8 @@ def _toggle_advanced_settings(
         )
         if toggle is not None:
             try:
-                toggle.click()
-                _human_pause((0.3, 0.7))
+                behavior.click(toggle)
+                behavior.idle(0.3, 0.7)
             except Exception as exc:
                 logger.warning("[upload] hide_likes toggle failed (%s)", exc)
         else:
@@ -436,17 +441,22 @@ def _toggle_advanced_settings(
         )
         if toggle is not None:
             try:
-                toggle.click()
-                _human_pause((0.3, 0.7))
+                behavior.click(toggle)
+                behavior.idle(0.3, 0.7)
             except Exception as exc:
                 logger.warning("[upload] disable_comments toggle failed (%s)", exc)
         else:
             logger.warning("[upload] disable_comments toggle not found — skipping")
 
 
-def _click_share(browser: InstagramBrowser) -> None:
-    _click_first(
+def _click_share(
+    browser: InstagramBrowser, behavior: HumanBehaviorEngine
+) -> None:
+    # Last hesitation before publishing — humans pause before the big button.
+    behavior.idle(0.5, 1.1)
+    _humanized_click_first(
         browser.page,
+        behavior,
         [
             'xpath://div[@role="button" and normalize-space()="Share"]',
             'xpath://button[normalize-space()="Share"]',
@@ -455,11 +465,10 @@ def _click_share(browser: InstagramBrowser) -> None:
         label="Share button",
         timeout=_DEFAULT_STEP_TIMEOUT_S,
     )
-    _human_pause()
 
 
 def _wait_for_completion(browser: InstagramBrowser, timeout_s: float) -> str:
-    """Block until IG confirms the post landed. Returns the matched marker text."""
+    """Block until IG confirms the post landed. Returns the matched marker."""
     deadline = time.monotonic() + timeout_s
     confirm_selectors: List[str] = [
         'xpath://*[contains(text(),"Your reel has been shared")]',
@@ -483,7 +492,6 @@ def _wait_for_completion(browser: InstagramBrowser, timeout_s: float) -> str:
                 continue
             if ele:
                 logger.info("[upload] completion marker matched: %s", sel)
-                _human_pause((0.5, 1.2))
                 return sel
 
         for sel in error_selectors:
@@ -512,7 +520,7 @@ def _wait_for_completion(browser: InstagramBrowser, timeout_s: float) -> str:
 def execute_upload(
     browser: InstagramBrowser, args: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
-    """Drive Instagram's Create-Post flow end-to-end.
+    """Drive Instagram's Create-Post flow end-to-end with humanized inputs.
 
     The browser is owned by the caller (``TaskExecutor``); this function
     never instantiates a new one and never calls ``browser.close()``. Step
@@ -541,43 +549,50 @@ def execute_upload(
         hide_likes, disable_comments,
     )
 
+    # One engine per upload session — holds the cursor position across steps.
+    behavior = HumanBehaviorEngine(browser.page)
+
     _step("navigate to home feed",
-          lambda: _navigate_home(browser))
+          lambda: _navigate_home(browser, behavior))
 
     _step("open Create dialog",
-          lambda: _open_create_dialog(browser))
+          lambda: _open_create_dialog(browser, behavior))
 
     _step("inject file into hidden input",
           lambda: _inject_file(browser, abs_path))
 
+    # IG's client-side processing of the uploaded file takes a beat; this
+    # is also a natural moment for a human to look at the preview.
+    behavior.read_pause(content_length=None)
+
     if media_kind == "video":
         _step("dismiss reels-notice modal (if present)",
-              lambda: _dismiss_video_reels_notice(browser))
+              lambda: _dismiss_video_reels_notice(browser, behavior))
 
     _step("click Next (crop)",
-          lambda: _click_next(browser, label="Next button (crop step)"))
+          lambda: _click_next(browser, behavior, label="Next button (crop step)"))
 
     _step("click Next (filter/trim)",
-          lambda: _click_next(browser, label="Next button (filter step)"))
+          lambda: _click_next(browser, behavior, label="Next button (filter step)"))
 
     _step("write caption",
-          lambda: _write_caption(browser, caption))
+          lambda: _write_caption(browser, behavior, caption))
 
     _step("add location",
-          lambda: _add_location(browser, location))
+          lambda: _add_location(browser, behavior, location))
 
     _step("add alt text",
-          lambda: _add_alt_text(browser, alt_text))
+          lambda: _add_alt_text(browser, behavior, alt_text))
 
     _step("toggle advanced settings",
           lambda: _toggle_advanced_settings(
-              browser,
+              browser, behavior,
               hide_likes=hide_likes,
               disable_comments=disable_comments,
           ))
 
     _step("click Share",
-          lambda: _click_share(browser))
+          lambda: _click_share(browser, behavior))
 
     marker = _step("wait for completion",
                    lambda: _wait_for_completion(browser, upload_timeout_s))
