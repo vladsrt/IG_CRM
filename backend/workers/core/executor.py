@@ -13,11 +13,17 @@ leaked proxy-plugin folders — is enforced by the ``try/finally`` block in
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any, Callable, Dict, List
 
 from workers.actions.action_upload import execute_upload
 from workers.actions.action_warmup import execute_warmup
 from workers.core.browser_core import InstagramBrowser
+from workers.core.observability import (
+    CheckpointException,
+    MetricSample,
+    ObservabilityMonitor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +117,9 @@ class TaskExecutor:
             }
 
         browser: InstagramBrowser | None = None
+        monitor: ObservabilityMonitor | None = None
         results: List[Dict[str, Any]] = []
+        captured_samples: List[MetricSample] = []
 
         # ── Story 4.4: guaranteed teardown ─────────────────────────────
         try:
@@ -131,7 +139,25 @@ class TaskExecutor:
                     self.task_id,
                 )
 
+            # Epic 6: kick off network + URL watchers BEFORE any command runs.
+            # Started here (not in __init__) so the browser/page exists.
+            account_uuid = self._account_uuid()
+            if account_uuid is not None:
+                monitor = ObservabilityMonitor(
+                    page=browser.page, account_id=account_uuid
+                )
+                monitor.start()
+            else:
+                logger.warning(
+                    "[TaskExecutor] payload missing account_id — observability disabled"
+                )
+
             for index, command in enumerate(self.commands):
+                # Epic 6.2: between every command, abort if IG redirected
+                # the session to a challenge / suspended page.
+                if monitor is not None:
+                    monitor.check_checkpoint()
+
                 action = command.get("action")
                 args = command.get("args") or {}
                 if not isinstance(args, dict):
@@ -156,7 +182,24 @@ class TaskExecutor:
                     {"index": index, "action": action, "result": command_result}
                 )
 
+            # Final post-loop checkpoint sweep: a redirect after the last
+            # command should still be surfaced as a CheckpointException.
+            if monitor is not None:
+                monitor.check_checkpoint()
+
         finally:
+            # Stop the watchers + drain whatever they captured BEFORE the
+            # browser teardown — once the page is gone, samples are gone too.
+            if monitor is not None:
+                try:
+                    monitor.stop()
+                    captured_samples = monitor.drain_samples()
+                except Exception:
+                    logger.exception(
+                        "[TaskExecutor] observability stop/drain failed for task_id=%s",
+                        self.task_id,
+                    )
+
             # Crucial: zombie-process / proxy-folder cleanup.
             if browser is not None:
                 try:
@@ -168,12 +211,61 @@ class TaskExecutor:
                         self.task_id,
                     )
 
+        # ── Persist metrics + run analytics OUTSIDE the browser try/finally
+        # so a metric-write hiccup can never leak Chrome processes. ──────
+        metrics_summary = self._persist_and_analyze(captured_samples)
+
         return {
             "task_id": self.task_id,
             "status": "ok",
             "executed": len(results),
             "results": results,
+            "metrics": metrics_summary,
         }
+
+    def _account_uuid(self) -> uuid.UUID | None:
+        if not self.account_id:
+            return None
+        try:
+            return uuid.UUID(self.account_id)
+        except (ValueError, TypeError):
+            return None
+
+    def _persist_and_analyze(
+        self, samples: List[MetricSample]
+    ) -> Dict[str, Any]:
+        """Flush captured metrics + invoke shadowban detector. Best-effort."""
+        account_uuid = self._account_uuid()
+        if account_uuid is None or not samples:
+            return {"persisted": 0, "shadowban": None}
+
+        # Local imports keep `workers.core` free of `app.*` import-time deps.
+        try:
+            from app.core.database import SessionLocal
+            from app.services import shadowban as shadowban_service
+            from app.services.metrics import persist_samples
+        except Exception:
+            logger.exception(
+                "[TaskExecutor] could not import metric/shadowban services — "
+                "skipping persistence for task_id=%s",
+                self.task_id,
+            )
+            return {"persisted": 0, "shadowban": None}
+
+        persisted = 0
+        shadowban_result: Dict[str, Any] | None = None
+        try:
+            with SessionLocal() as db:
+                persisted = persist_samples(db, account_uuid, samples)
+                shadowban_result = shadowban_service.evaluate(db, account_uuid)
+        except Exception:
+            logger.exception(
+                "[TaskExecutor] metric persist / shadowban analysis failed for "
+                "task_id=%s",
+                self.task_id,
+            )
+
+        return {"persisted": persisted, "shadowban": shadowban_result}
 
     # ── Normalization helpers ──────────────────────────────────────────
     @staticmethod
