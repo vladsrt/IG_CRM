@@ -26,6 +26,9 @@ from app.models.account import InstagramAccount
 from app.models.proxy import Proxy
 from app.models.task import Task, TaskStatus
 from workers.core.executor import TaskExecutor
+from workers.core.observability import CheckpointException
+
+CHECKPOINT_ACCOUNT_STATUS: str = "checkpoint_required"
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +60,25 @@ def _set_task_status(
         task.status = new_status.value
         if error_log is not None:
             task.error_log = error_log
+        db.commit()
+
+
+def _mark_account_checkpoint(account_id: uuid.UUID, checkpoint_url: str) -> None:
+    """Flag an account as needing manual challenge resolution (Epic 6.2)."""
+    with SessionLocal() as db:
+        account = db.get(InstagramAccount, account_id)
+        if account is None:
+            logger.warning(
+                "Account %s vanished before checkpoint flag could be applied",
+                account_id,
+            )
+            return
+        account.status = CHECKPOINT_ACCOUNT_STATUS
+        timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        new_line = f"[{timestamp}] checkpoint_required at {checkpoint_url}"
+        account.error_log = (
+            f"{account.error_log}\n{new_line}" if account.error_log else new_line
+        )
         db.commit()
 
 
@@ -138,6 +160,9 @@ def run_instagram_task(self: CeleryTask, task_id: str) -> dict[str, Any]:
             )
 
         proxy = account.proxy  # eager-loaded via lazy="selectin" on the relationship
+        # Snapshot the account id outside the session — needed by the
+        # CheckpointException handler below, where `account` is detached.
+        account_uuid = account.id
 
         # The AI parser stores the full plan dict on Task.payload:
         #   {"summary": ..., "priority": ..., "commands": [{action, args}, ...]}
@@ -166,6 +191,22 @@ def run_instagram_task(self: CeleryTask, task_id: str) -> dict[str, Any]:
     # ── 4. Execute via TaskExecutor (Sprint 4) ─────────────────────────
     try:
         result: dict[str, Any] = TaskExecutor(payload).execute()
+
+    except CheckpointException as exc:
+        # Epic 6.2 — IG redirected the session to a challenge / suspended
+        # page. Mark the Task FAILED and the account checkpoint_required so
+        # the operator can resolve it manually before any further dispatch.
+        logger.warning(
+            "[run_instagram_task] checkpoint hit for task=%s account=%s url=%s",
+            task_uuid, account_uuid, exc.url,
+        )
+        _set_task_status(
+            task_uuid,
+            TaskStatus.FAILED,
+            error_log=f"CheckpointException: {exc.url}",
+        )
+        _mark_account_checkpoint(account_uuid, exc.url)
+        raise
 
     except SoftTimeLimitExceeded as exc:
         logger.error("[run_instagram_task] soft time limit hit for %s", task_uuid)
