@@ -4,6 +4,7 @@ from app.models.task import Task, TaskStatus
 from app.models.proxy import Proxy, ProxyType
 from app.models.asset import Asset, AssetStatus, MediaFolder
 from app.models.billing import Subscription
+from app.models.metric import AccountMetric, MetricType
 
 __all__ = [
     "User",
@@ -17,4 +18,6 @@ __all__ = [
     "AssetStatus",
     "MediaFolder",
     "Subscription",
+    "AccountMetric",
+    "MetricType",
 ]
