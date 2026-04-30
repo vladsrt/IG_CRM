@@ -21,7 +21,21 @@ from app.schemas.orchestrator import (
     FanOutTaskRequest,
 )
 from app.schemas.task import TaskCreate
+from app.services.spintax import uniqueize_plan_payload
+from app.services.trust import (
+    DEFAULT_MIN_TRUST_SCORE,
+    TrustReport,
+    evaluate_trust,
+)
 from app.workers.celery_tasks import run_instagram_task, validate_account_session
+
+# Sent to the trust scorer for the User-Agent check. Should match the
+# default UA the worker actually uses (workers.core.executor.DEFAULT_USER_AGENT).
+_DISPATCH_USER_AGENT: str = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +166,29 @@ def _resolve_target_accounts(
     return resolved, missing
 
 
+def _evaluate_account_trust(account: InstagramAccount) -> TrustReport:
+    """Run the Epic 8.1 trust gate for one account.
+
+    Wrapped so a probe-side failure (network blip, DNS hiccup) is caught
+    and translated into a `score=0` report rather than crashing the whole
+    fan-out loop.
+    """
+    try:
+        return evaluate_trust(account, user_agent=_DISPATCH_USER_AGENT)
+    except Exception as exc:
+        logger.exception(
+            "[fan_out] trust evaluation crashed for account_id=%s", account.id
+        )
+        return TrustReport(
+            score=0,
+            proxy_ok=False,
+            proxy_latency_ms=None,
+            user_agent_ok=False,
+            hygiene_ok=False,
+            reasons=[f"trust evaluator crashed: {type(exc).__name__}: {exc}"],
+        )
+
+
 def _create_and_dispatch_one(
     db: Session,
     account: InstagramAccount,
@@ -161,13 +198,33 @@ def _create_and_dispatch_one(
 
     Returns ``(task, celery_task_id, error_reason)``. Exactly one of
     ``celery_task_id`` or ``error_reason`` is non-None.
+
+    Pre-flight gates (Epic 8):
+      1. Trust score (8.1) — fail-fast before any DB write.
+      2. Spintax + link obfuscation (8.2/8.3) — produce a per-account
+         unique payload so 50 dispatched Tasks do not share bytes.
     """
-    # ── 1. Create the Task row in PENDING.
+    # ── Gate 1: trust score (Epic 8.1) ─────────────────────────────────
+    report = _evaluate_account_trust(account)
+    if not report.passed:
+        logger.info(
+            "[fan_out] trust gate failed for account_id=%s score=%d/%d",
+            account.id, report.score, DEFAULT_MIN_TRUST_SCORE,
+        )
+        return None, None, report.to_skip_reason()
+
+    # ── Gate 2: per-account uniqueization (Epic 8.2 + 8.3) ─────────────
+    # Each call mutates the plan dict with spintax expansions and
+    # obfuscated link tokens, so two cloned tasks never share a payload.
+    base_payload = request.plan.to_payload_dict()
+    unique_payload = uniqueize_plan_payload(base_payload)
+
+    # ── Persist + dispatch ─────────────────────────────────────────────
     try:
         task_in = TaskCreate(
             account_id=account.id,
             status=TaskStatus.PENDING,
-            payload=request.plan.to_payload_dict(),
+            payload=unique_payload,
             priority=request.plan.priority_as_int(),
         )
         task = crud_task.create_task(db, task_in)
