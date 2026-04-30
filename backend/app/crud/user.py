@@ -15,7 +15,6 @@ from app.models.billing import Subscription
 from app.models.user import User
 from app.schemas.user import UserCreate
 
-#user class
 class UserUpdate(BaseModel):
     """Fields that may be patched on an existing user."""
 

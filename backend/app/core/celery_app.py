@@ -8,7 +8,6 @@ The task module is auto-discovered from ``app.workers.celery_tasks`` so that
 ``run_instagram_task.delay(...)`` works from anywhere in the codebase as long
 as the worker process has imported this module.
 """
-#celery
 
 from __future__ import annotations
 

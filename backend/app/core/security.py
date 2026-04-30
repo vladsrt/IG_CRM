@@ -11,7 +11,6 @@ _ITERATIONS = 260_000
 _SALT_BYTES = 16
 _HASH_BYTES = 32
 
-#pass
 def hash_password(password: str) -> str:
     """Return a self-describing hash string of the form
     ``pbkdf2_sha256$<iterations>$<salt_hex>$<hash_hex>``.

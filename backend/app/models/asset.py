@@ -21,7 +21,6 @@ from app.core.database import Base
 if TYPE_CHECKING:
     from app.models.user import User
 
-
 # ── Enums ───────────────────────────────────────────────────────────────
 class AssetStatus(str, enum.Enum):
     """Lifecycle of an Asset row.

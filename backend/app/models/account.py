@@ -16,7 +16,6 @@ if TYPE_CHECKING:
     from app.models.proxy import Proxy
     from app.models.task import Task
 
-
 class AuthMethod(str, enum.Enum):
     """Allowed authentication methods for Instagram accounts."""
 

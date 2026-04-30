@@ -2,7 +2,7 @@
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-#base settings
+
 class Settings(BaseSettings):
     """Central application settings.
 
