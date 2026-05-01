@@ -15,6 +15,12 @@ The single exception is the hidden ``<input type="file">``: that is a
 programmatic file injection, not a user gesture — its element has no
 visible bounding rect, so we keep the raw ``.input(path)`` call there.
 
+CRITICAL-4 — file_path is validated against ``settings.MEDIA_ROOT`` via
+:func:`workers.core.safety.resolve_within_media_root` before we hand it
+to DrissionPage. An operator-supplied path that escapes the media root
+(or doesn't exist, or isn't a regular file) is rejected with
+``UploadActionError`` before any DOM interaction.
+
 Public API
 ~~~~~~~~~~
 ``execute_upload(browser, args) -> dict`` — invoked by ``TaskExecutor``.
@@ -24,6 +30,7 @@ in production and never closes it.
 Supported ``args``
 ~~~~~~~~~~~~~~~~~~
 * ``file_path``         (required, str)  — absolute path to image or video
+                                           UNDER ``settings.MEDIA_ROOT``
 * ``caption``           (optional, str)  — caption text. Defaults to ``""``.
 * ``location``          (optional, str)  — geotag query; first dropdown result is picked
 * ``alt_text``          (optional, str)  — accessibility alt text
@@ -44,8 +51,10 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 # Allow `python action_upload.py` from the actions/ dir for the smoke-test.
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
+from app.core.config import settings
 from workers.core.behavior import HumanBehaviorEngine
 from workers.core.browser_core import InstagramBrowser
+from workers.core.safety import UnsafePathError, resolve_within_media_root
 
 logger = logging.getLogger(__name__)
 
@@ -196,9 +205,11 @@ def _open_create_dialog(
 
 
 def _inject_file(browser: InstagramBrowser, file_path: str) -> None:
-    abs_path = os.path.abspath(file_path)
-    if not os.path.isfile(abs_path):
-        raise UploadActionError(f"Upload file does not exist: {abs_path}")
+    # CRITICAL-4 — refuse anything that escapes MEDIA_ROOT or doesn't exist.
+    try:
+        abs_path = resolve_within_media_root(file_path, settings.MEDIA_ROOT)
+    except UnsafePathError as exc:
+        raise UploadActionError(f"unsafe upload file_path: {exc}") from exc
 
     # Hidden file input — we never click "Select from computer" because
     # that opens an OS-level file dialog DrissionPage cannot drive. This
@@ -533,7 +544,13 @@ def execute_upload(
     if not file_path or not isinstance(file_path, str):
         raise UploadActionError("upload action requires a string 'file_path' arg")
 
-    abs_path = os.path.abspath(file_path)
+    # CRITICAL-4 — validate the path BEFORE doing anything browser-side so
+    # we surface the security error cleanly without launching a nav.
+    try:
+        abs_path = resolve_within_media_root(file_path, settings.MEDIA_ROOT)
+    except UnsafePathError as exc:
+        raise UploadActionError(f"unsafe upload file_path: {exc}") from exc
+
     media_kind = _detect_media_kind(abs_path)
     caption = str(args.get("caption") or "")
     location = str(args.get("location") or "").strip()

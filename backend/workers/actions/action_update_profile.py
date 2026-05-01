@@ -15,6 +15,12 @@ the avatar — same rationale as ``action_upload``: a hidden element has
 no usable bounding rect, and a file injection is a programmatic event,
 not a user gesture.
 
+CRITICAL-4 — ``avatar_path`` is validated against ``settings.MEDIA_ROOT``
+via :func:`workers.core.safety.resolve_within_media_root` before we hand
+it to DrissionPage. An operator-supplied path that escapes the media
+root (or doesn't exist, or isn't a regular file) is rejected with
+``ProfileActionError`` before any DOM interaction.
+
 Public API
 ~~~~~~~~~~
 ``execute_update_profile(browser, args) -> dict`` — invoked by
@@ -41,8 +47,10 @@ from typing import Any, Callable, Dict, Iterable, Optional
 # Allow `python action_update_profile.py` from the actions/ dir for the smoke-test.
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
+from app.core.config import settings
 from workers.core.behavior import HumanBehaviorEngine
 from workers.core.browser_core import InstagramBrowser
+from workers.core.safety import UnsafePathError, resolve_within_media_root
 
 logger = logging.getLogger(__name__)
 
@@ -144,9 +152,11 @@ def _set_avatar(
     behavior: HumanBehaviorEngine,
     avatar_path: str,
 ) -> None:
-    abs_path = os.path.abspath(avatar_path)
-    if not os.path.isfile(abs_path):
-        raise ProfileActionError(f"Avatar file does not exist: {abs_path}")
+    # CRITICAL-4 — refuse anything that escapes MEDIA_ROOT or doesn't exist.
+    try:
+        abs_path = resolve_within_media_root(avatar_path, settings.MEDIA_ROOT)
+    except UnsafePathError as exc:
+        raise ProfileActionError(f"unsafe avatar_path: {exc}") from exc
 
     _humanized_click_first(
         browser.page,
@@ -399,6 +409,14 @@ def execute_update_profile(
         raise ProfileActionError(
             "update_profile requires at least one of: bio, avatar_path, is_private"
         )
+
+    # CRITICAL-4 — pre-validate the avatar path BEFORE any browser nav so a
+    # path-traversal attempt fails fast with a clear error.
+    if avatar_path is not None:
+        try:
+            avatar_path = resolve_within_media_root(avatar_path, settings.MEDIA_ROOT)
+        except UnsafePathError as exc:
+            raise ProfileActionError(f"unsafe avatar_path: {exc}") from exc
 
     logger.info(
         "[update_profile] starting bio_len=%s avatar=%s is_private=%s",
