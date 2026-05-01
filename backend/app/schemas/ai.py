@@ -39,6 +39,12 @@ class ActionType(str, enum.Enum):
     UNFOLLOW_USER = "unfollow_user"
     COMMENT_POST = "comment_post"
     WARMUP = "warmup"
+    # Epic 9 — profile + privacy edits at /accounts/edit/ and the
+    # privacy settings page. Args (all optional, at least one required):
+    #   * bio          (str)  — new bio text; spintax is resolved upstream
+    #   * avatar_path  (str)  — absolute path to a local image file
+    #   * is_private   (bool) — desired privacy state; null means "leave alone"
+    UPDATE_PROFILE = "update_profile"
 
 
 class TaskPriority(str, enum.Enum):
