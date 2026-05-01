@@ -12,6 +12,14 @@ into a *unique* folder, so multiple tasks running in parallel inside the
 same Celery worker process never collide on disk. The folder name is
 derived from the optional ``task_id`` argument when available, otherwise
 from a fresh ``uuid.uuid4().hex``.
+
+Resource-leak invariant (CRITICAL-3)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+``__init__`` is wrapped in a try/except that calls ``self.close()`` on
+ANY partial failure before re-raising. Cleanup-relevant attributes
+(``self.page``, ``self.plugin_path``) are initialized to safe defaults
+BEFORE the first line that can raise, so ``self.close()`` is callable on
+a partially-constructed instance without ``AttributeError``.
 """
 
 import os
@@ -59,10 +67,23 @@ class InstagramBrowser:
                 proxy-extension folder name. If omitted, a random hex token
                 is generated. This is what makes concurrent ``InstagramBrowser``
                 instances in the same process safe.
+
+        Raises:
+            Any exception raised during Chromium setup is re-raised AFTER
+            ``self.close()`` has reaped whatever was partially constructed
+            (Chrome subprocess, plugin folder on disk).
         """
         self.proxy_string = proxy_string
         self.user_agent = user_agent
         self.task_id = task_id
+
+        # CRITICAL-3 — initialize cleanup-relevant attributes BEFORE any
+        # line that can raise, so self.close() is safe to call from the
+        # except branch even if construction blew up halfway through.
+        self.page: Optional[ChromiumPage] = None
+        self.co: Optional[ChromiumOptions] = None
+        self.plugin_path: str = ""
+        self.plugin_folder: str = ""
 
         # 1. Compute a unique, filesystem-safe folder name for this instance.
         if task_id:
@@ -74,30 +95,45 @@ class InstagramBrowser:
         else:
             token = uuid.uuid4().hex
 
-        self.plugin_folder: str = f"{_PLUGIN_FOLDER_PREFIX}_{token}"
+        self.plugin_folder = f"{_PLUGIN_FOLDER_PREFIX}_{token}"
 
-        # 2. Generate Proxy Extension into the unique folder.
-        self.plugin_path: str = create_proxy_extension(
-            self.proxy_string, self.plugin_folder
-        )
-        print(f"[*] Proxy extension generated at {self.plugin_path}")
+        try:
+            # 2. Generate Proxy Extension into the unique folder.
+            self.plugin_path = create_proxy_extension(
+                self.proxy_string, self.plugin_folder
+            )
+            print(f"[*] Proxy extension generated at {self.plugin_path}")
 
-        # 3. Setup Options
-        self.co = ChromiumOptions()
-        self.co.add_extension(self.plugin_path)
-        self.co.set_user_agent(self.user_agent)
+            # 3. Setup Options
+            self.co = ChromiumOptions()
+            self.co.add_extension(self.plugin_path)
+            self.co.set_user_agent(self.user_agent)
 
-        # Disable images to speed up page loading
-        self.co.set_pref("profile.default_content_setting_values.images", 2)
-        # Block browser notifications
-        self.co.set_pref("profile.default_content_setting_values.notifications", 2)
+            # Disable images to speed up page loading
+            self.co.set_pref("profile.default_content_setting_values.images", 2)
+            # Block browser notifications
+            self.co.set_pref("profile.default_content_setting_values.notifications", 2)
 
-        # Set headless preference
-        self.co.headless(headless)
+            # Set headless preference
+            self.co.headless(headless)
 
-        # 4. Launch Page
-        self.page = ChromiumPage(self.co)
-        print("[*] Browser launched successfully.")
+            # 4. Launch Page — this is the big-cost step. If it raises after
+            # spawning the Chrome subprocess, the except branch below reaps
+            # the orphan via self.close().
+            self.page = ChromiumPage(self.co)
+            print("[*] Browser launched successfully.")
+        except Exception:
+            # Partial construction failed. Reap whatever made it onto disk
+            # or into a subprocess before re-raising. The nested try/except
+            # inside close() ensures a cleanup error cannot mask the
+            # original construction error.
+            try:
+                self.close()
+            except Exception as cleanup_exc:
+                print(
+                    f"[!] Cleanup during failed __init__ also raised: {cleanup_exc}"
+                )
+            raise
 
     def inject_cookies(self, cookies_list: List[Dict[str, str]]) -> None:
         """
@@ -121,21 +157,29 @@ class InstagramBrowser:
     def close(self) -> None:
         """
         Safely shuts down the browser and cleans up *this instance's*
-        proxy-extension folder. Crucial for preventing memory leaks and
-        orphaned proxy folders — and, with the unique folder name, also
-        crucial for not nuking a sibling browser's plugin in concurrent runs.
+        proxy-extension folder. Idempotent and tolerant of partial
+        construction — uses ``getattr`` defaults so it works even when
+        ``__init__`` raised before any attribute was set.
         """
         print("[*] Shutting down browser...")
-        try:
-            if hasattr(self, "page") and self.page:
-                self.page.quit()
-        except Exception as e:
-            print(f"[!] Error closing browser: {e}")
+        page = getattr(self, "page", None)
+        if page is not None:
+            try:
+                page.quit()
+            except Exception as e:
+                print(f"[!] Error closing browser: {e}")
+            finally:
+                # Drop the ref so a follow-up close() call is cheap.
+                self.page = None
 
-        print(f"[*] Cleaning up proxy extension directory: {self.plugin_path}")
-        try:
-            if self.plugin_path and os.path.exists(self.plugin_path):
-                shutil.rmtree(self.plugin_path)
-                print(f"[*] Removed {self.plugin_path}")
-        except Exception as e:
-            print(f"[!] Error cleaning proxy directory: {e}")
+        plugin_path = getattr(self, "plugin_path", "")
+        if plugin_path:
+            print(f"[*] Cleaning up proxy extension directory: {plugin_path}")
+            try:
+                if os.path.exists(plugin_path):
+                    shutil.rmtree(plugin_path)
+                    print(f"[*] Removed {plugin_path}")
+            except Exception as e:
+                print(f"[!] Error cleaning proxy directory: {e}")
+            finally:
+                self.plugin_path = ""
