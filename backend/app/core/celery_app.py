@@ -4,6 +4,10 @@ Run a worker with::
 
     celery -A app.core.celery_app.celery_app worker --loglevel=info
 
+Run the periodic-task scheduler with::
+
+    celery -A app.core.celery_app.celery_app beat --loglevel=info
+
 The task module is auto-discovered from ``app.workers.celery_tasks`` so that
 ``run_instagram_task.delay(...)`` works from anywhere in the codebase as long
 as the worker process has imported this module.
@@ -39,6 +43,19 @@ celery_app.conf.update(
     # Result backend ─────────────────────────────────────────────────────
     result_expires=60 * 60 * 24,  # keep results for 24h
 )
+
+
+# ── Periodic schedule (Celery Beat) ─────────────────────────────────────
+# CRITICAL-1 janitor — sweep orphaned RUNNING Tasks every 5 minutes.
+# Combined with the at-task-start orphan-recovery in run_instagram_task,
+# this ensures no Task can stay stuck in RUNNING after a worker death.
+celery_app.conf.beat_schedule = {
+    "reap-stale-tasks-every-5-min": {
+        "task": "ig_crm.reap_stale_tasks",
+        "schedule": 300.0,  # seconds
+        "args": (),
+    },
+}
 
 
 @celery_app.task(name="ig_crm.ping")
