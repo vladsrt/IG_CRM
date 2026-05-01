@@ -16,6 +16,7 @@ import logging
 import uuid
 from typing import Any, Callable, Dict, List
 
+from workers.actions.action_update_profile import execute_update_profile
 from workers.actions.action_upload import execute_upload
 from workers.actions.action_warmup import execute_warmup
 from workers.core.browser_core import InstagramBrowser
@@ -44,12 +45,15 @@ DEFAULT_COOKIE_PATH: str = "/"
 ActionHandler = Callable[[InstagramBrowser, Dict[str, Any]], Dict[str, Any]]
 
 ACTION_REGISTRY: Dict[str, ActionHandler] = {
-    "warmup":       execute_warmup,
+    "warmup":         execute_warmup,
     # All three upload variants share one handler — IG decides server-side
     # whether a video becomes a Reel based on duration/aspect ratio.
-    "upload_reels": execute_upload,
-    "upload_post":  execute_upload,
-    "upload_story": execute_upload,
+    "upload_reels":   execute_upload,
+    "upload_post":    execute_upload,
+    "upload_story":   execute_upload,
+    # Profile / privacy edits (Epic 9). One handler covers bio, avatar,
+    # and the is_private toggle — the args dict drives which fields run.
+    "update_profile": execute_update_profile,
     # Wire additional handlers here as they are implemented:
     # "send_dm":      execute_send_dm,
     # "like_post":    execute_like_post,
