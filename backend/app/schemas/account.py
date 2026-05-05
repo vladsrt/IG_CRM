@@ -12,7 +12,7 @@ class InstagramAccountBase(BaseModel):
     ig_password: str
     auth_method: AuthMethod
     proxy_session_id: str | None = None
-    cookies: dict[str, Any] | None = None
+    cookies: list | None = None
     status: str | None = None
     tags: list[str] = Field(default_factory=list)
 
