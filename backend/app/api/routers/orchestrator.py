@@ -174,7 +174,7 @@ def _evaluate_account_trust(account: InstagramAccount) -> TrustReport:
     fan-out loop.
     """
     try:
-        return evaluate_trust(account, user_agent=_DISPATCH_USER_AGENT, skip_proxy_probe=True)
+        return evaluate_trust(account, user_agent=_DISPATCH_USER_AGENT)
     except Exception as exc:
         logger.exception(
             "[fan_out] trust evaluation crashed for account_id=%s", account.id
