@@ -9,8 +9,11 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.crud import account as crud_account
-from app.crud.account import InstagramAccountUpdate
-from app.schemas.account import InstagramAccountCreate, InstagramAccountRead
+from app.schemas.account import (
+    InstagramAccountCreate,
+    InstagramAccountRead,
+    InstagramAccountUpdate,
+)
 
 router = APIRouter(prefix="/accounts", tags=["instagram-accounts"])
 
