@@ -99,14 +99,25 @@ def _humanized_click_first(
     *,
     timeout: float = _DEFAULT_STEP_TIMEOUT_S,
     label: str,
+    safe: bool = False,
 ) -> Any:
+    """Locate the first matching element and click it via the behavior engine.
+
+    When ``safe=True`` the click is routed through
+    :meth:`HumanBehaviorEngine.safe_click_button` — element is scrolled
+    into view (centered) and given a 1s settle window before the click.
+    Use that for any commit-style button (Submit/Save/Confirm/Switch).
+    """
     ele = _find_first(page, selectors, timeout=timeout)
     if ele is None:
         raise ProfileActionError(
             f"Could not locate {label!r} (tried {list(selectors)})"
         )
     try:
-        behavior.click(ele)
+        if safe:
+            behavior.safe_click_button(ele)
+        else:
+            behavior.click(ele)
     except Exception as exc:
         raise ProfileActionError(
             f"Found {label!r} but click failed: {exc}"
@@ -168,6 +179,7 @@ def _set_avatar(
         ],
         label="Change photo button",
         timeout=_DEFAULT_STEP_TIMEOUT_S,
+        safe=True,
     )
     behavior.idle(0.5, 1.2)
 
@@ -215,19 +227,15 @@ def _set_bio(
     if bio_field is None:
         raise ProfileActionError("Bio field (#pepBio) not found")
 
-    # Best-effort clear of existing bio text. DrissionPage's `.clear()`
-    # works on textareas/inputs; for contenteditable variants it may
-    # no-op silently — in that case the new text would append. Logged
-    # for diagnosis but not raised, since "append" is recoverable.
-    try:
-        bio_field.clear()
-    except Exception as exc:
-        logger.debug(
-            "[update_profile] bio_field.clear() failed (%s); typing may append",
-            exc,
-        )
+    # Robust clear: DrissionPage's `.clear()` silently no-ops on the
+    # contenteditable bio variant, which causes typed text to append.
+    # `behavior.clear_input_field` does focus → Ctrl+A → Backspace with
+    # human-like delays, which works across input/textarea/contenteditable.
+    behavior.clear_input_field(bio_field, backspace_passes=2)
 
-    behavior.type_into(bio_field, bio)
+    # Re-focus before typing — clear_input_field already focuses, but a
+    # fresh click ensures the caret is at the start on stubborn fields.
+    behavior.type_into(bio_field, bio, focus_first=False)
     behavior.read_pause(content_length=len(bio))
 
 
@@ -291,8 +299,7 @@ def _set_privacy(
     )
     if confirm is not None:
         try:
-            behavior.click(confirm)
-            behavior.idle(0.5, 1.0)
+            behavior.safe_click_button(confirm)
         except Exception as exc:
             logger.debug(
                 "[update_profile] privacy confirmation click failed (%s); ignoring",
@@ -309,8 +316,12 @@ def _set_privacy(
 def _click_submit(
     browser: InstagramBrowser, behavior: HumanBehaviorEngine
 ) -> None:
-    # Final hesitation before persisting — humans pause before commit buttons.
-    behavior.idle(0.5, 1.1)
+    # Submit is at the bottom of /accounts/edit/ and is reliably out of
+    # the viewport after a long bio is typed. `safe=True` scrolls it into
+    # view (centered), waits 1s for layout to settle, then clicks. Without
+    # this, DrissionPage's synthetic mousedown lands on whatever element
+    # happens to be at the original coordinate and the form silently
+    # never submits.
     _humanized_click_first(
         browser.page,
         behavior,
@@ -322,6 +333,7 @@ def _click_submit(
         ],
         label="Submit button",
         timeout=_DEFAULT_STEP_TIMEOUT_S,
+        safe=True,
     )
 
 
