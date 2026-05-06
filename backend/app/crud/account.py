@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any, Sequence
+from typing import Sequence
 
-from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -13,19 +12,20 @@ from sqlalchemy.orm import Session
 from app.models.account import AuthMethod, InstagramAccount
 from app.models.proxy import Proxy
 from app.models.user import User
-from app.schemas.account import InstagramAccountCreate
+from app.schemas.account import InstagramAccountCreate, InstagramAccountUpdate
 
-
-class InstagramAccountUpdate(BaseModel):
-    ig_username: str | None = None
-    ig_password: str | None = None
-    auth_method: AuthMethod | None = None
-    proxy_id: uuid.UUID | None = None
-    proxy_session_id: str | None = None
-    cookies: dict[str, Any] | None = None
-    status: str | None = None
-    error_log: str | None = None
-    tags: list[str] | None = Field(default=None)
+# Backwards-compat re-export so legacy imports (`from app.crud.account import
+# InstagramAccountUpdate`) keep resolving — the canonical home is now
+# ``app.schemas.account``.
+__all__ = [
+    "InstagramAccountUpdate",
+    "create_account",
+    "delete_account",
+    "get_account",
+    "list_accounts",
+    "list_accounts_by_tags",
+    "update_account",
+]
 
 
 def _normalize_tags(tags: list[str] | None) -> list[str]:
