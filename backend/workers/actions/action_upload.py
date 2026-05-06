@@ -120,15 +120,26 @@ def _humanized_click_first(
     *,
     timeout: float = _DEFAULT_STEP_TIMEOUT_S,
     label: str,
+    safe: bool = False,
 ) -> Any:
-    """Find the first matching selector and click it via the behavior engine."""
+    """Find the first matching selector and click it via the behavior engine.
+
+    When ``safe=True`` the click is routed through
+    :meth:`HumanBehaviorEngine.safe_click_button` — element is scrolled
+    into view (centered) and given a 1s settle window before the click.
+    Use this for any commit-style button (Share, Next, Done) where IG
+    sometimes renders the control below the fold.
+    """
     ele = _find_first(page, selectors, timeout=timeout)
     if ele is None:
         raise UploadActionError(
             f"Could not locate {label!r} (tried {list(selectors)})"
         )
     try:
-        behavior.click(ele)
+        if safe:
+            behavior.safe_click_button(ele)
+        else:
+            behavior.click(ele)
     except Exception as exc:
         raise UploadActionError(
             f"Found {label!r} but click failed: {exc}"
@@ -270,6 +281,7 @@ def _click_next(
         ],
         label=label,
         timeout=_DEFAULT_STEP_TIMEOUT_S,
+        safe=True,
     )
     behavior.idle(0.7, 1.5)
 
@@ -463,8 +475,10 @@ def _toggle_advanced_settings(
 def _click_share(
     browser: InstagramBrowser, behavior: HumanBehaviorEngine
 ) -> None:
-    # Last hesitation before publishing — humans pause before the big button.
-    behavior.idle(0.5, 1.1)
+    # `safe=True` scrolls Share into the viewport center and waits 1s
+    # for the modal layout to settle before clicking. Without this, a
+    # tall caption pushes Share below the fold and the synthetic click
+    # lands on whatever element is at the original coordinate.
     _humanized_click_first(
         browser.page,
         behavior,
@@ -475,6 +489,7 @@ def _click_share(
         ],
         label="Share button",
         timeout=_DEFAULT_STEP_TIMEOUT_S,
+        safe=True,
     )
 
 
