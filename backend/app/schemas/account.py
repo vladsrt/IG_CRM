@@ -22,6 +22,22 @@ class InstagramAccountCreate(InstagramAccountBase):
     proxy_id: uuid.UUID | None = None
 
 
+class InstagramAccountUpdate(BaseModel):
+    """PATCH payload — every field optional, ``exclude_unset`` semantics in CRUD."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ig_username: str | None = None
+    ig_password: str | None = None
+    auth_method: AuthMethod | None = None
+    proxy_id: uuid.UUID | None = None
+    proxy_session_id: str | None = None
+    cookies: dict[str, Any] | None = None
+    status: str | None = None
+    error_log: str | None = None
+    tags: list[str] | None = Field(default=None)
+
+
 class InstagramAccountRead(InstagramAccountBase):
     model_config = ConfigDict(from_attributes=True)
 
