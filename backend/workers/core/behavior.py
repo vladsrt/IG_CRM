@@ -37,7 +37,7 @@ import logging
 import math
 import random
 import time
-from typing import Any, Optional, Protocol, Tuple, Union
+from typing import Any, Dict, Iterable, Optional, Protocol, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +171,121 @@ class HumanBehaviorEngine:
             else:
                 raise
 
+    def safe_click_button(
+        self,
+        target: _HasRect,
+        *,
+        settle_s: float = 1.0,
+        pre_click_pause_range_s: Tuple[float, float] = (0.4, 0.9),
+    ) -> None:
+        """Click a button after guaranteeing it is visible in the viewport.
+
+        Off-screen ``Submit`` / ``Save`` / ``Share`` buttons are the #1 cause
+        of silent click failures in DrissionPage — the synthetic mousedown
+        lands on whatever element happens to be under the cursor at that
+        coordinate, not the intended button. This helper:
+
+        1. Calls ``element.scroll.to_see(center=True)`` to bring the button
+           into the viewport center.
+        2. Waits ``settle_s`` seconds for the layout to stabilize (IG often
+           reflows after a scroll, especially with sticky headers).
+        3. Adds a short pre-click hesitation — humans don't click a button
+           the millisecond it appears.
+        4. Routes the click through :meth:`click` so the cursor still
+           travels along a Bezier path.
+
+        Always prefer this over plain ``.click()`` for any commit-style
+        button (Submit, Save, Share, Confirm, Post).
+        """
+        try:
+            target.scroll.to_see(center=True)  # type: ignore[union-attr]
+        except Exception as exc:
+            logger.debug(
+                "[behavior] scroll.to_see(center=True) failed (%s); proceeding without",
+                exc,
+            )
+        # Settle the layout — IG's sticky header sometimes overshoots the
+        # scroll target, and the safest fix is just to wait a beat.
+        time.sleep(max(0.0, settle_s))
+        self.idle(*pre_click_pause_range_s)
+        self.click(target)
+
+    def clear_input_field(
+        self,
+        target: _HasRect,
+        *,
+        focus_first: bool = True,
+        backspace_passes: int = 1,
+    ) -> None:
+        """Clear an input/textarea/contenteditable with human-like keystrokes.
+
+        Why not ``element.clear()``? On Instagram's React-driven forms,
+        ``.clear()`` either:
+
+        * silently no-ops on contenteditable ``<div>`` fields (the bio
+          field has been one in recent rollouts), so subsequent typing
+          *appends* to the existing value, OR
+        * fires a single synthetic ``input`` event which IG's client-side
+          telemetry can fingerprint as scripted.
+
+        The robust pattern that works across all three field flavors
+        (input, textarea, contenteditable) is what a human would do:
+        focus → ``Ctrl+A`` → ``Backspace``. We add humanized delays
+        between each keystroke and an optional second backspace pass for
+        stubborn fields that re-populate from React state on first delete.
+        """
+        if backspace_passes < 1:
+            raise ValueError(f"backspace_passes must be >= 1, got {backspace_passes}")
+
+        if focus_first:
+            self.click(target)
+            self.idle(0.18, 0.45)
+
+        for pass_idx in range(backspace_passes):
+            # Ctrl+A — DrissionPage's `actions.key_down/key_up` is the
+            # most portable way to send a chord. Fall back to the
+            # element-level `.input` API if the page doesn't expose it.
+            try:
+                actions = self._page.actions
+                actions.key_down("ctrl")
+                self.idle(0.04, 0.12)
+                actions.type("a")
+                self.idle(0.04, 0.12)
+                actions.key_up("ctrl")
+            except Exception as exc:
+                logger.debug(
+                    "[behavior] Ctrl+A via actions failed (%s); trying element fallback",
+                    exc,
+                )
+                try:
+                    target.input("a", clear=False)  # type: ignore[call-arg]
+                except Exception as exc2:
+                    logger.debug(
+                        "[behavior] element-level Ctrl+A fallback failed (%s); "
+                        "skipping select-all on pass %d",
+                        exc2, pass_idx,
+                    )
+
+            self.idle(0.10, 0.28)
+
+            # Backspace — single key, with the same human cadence as typing.
+            try:
+                self._page.actions.type("")  #  = Backspace
+            except Exception as exc:
+                logger.debug(
+                    "[behavior] actions.type(Backspace) failed (%s); using ele.input",
+                    exc,
+                )
+                try:
+                    target.input("", clear=False)  # type: ignore[call-arg]
+                except Exception as exc2:
+                    logger.debug(
+                        "[behavior] Backspace fallback failed (%s); pass %d may have left text",
+                        exc2, pass_idx,
+                    )
+
+            self.idle(0.12, 0.30)
+
     def type_into(
         self,
         target: _HasRect,
@@ -253,6 +368,227 @@ class HumanBehaviorEngine:
         if min_s < 0 or max_s < min_s:
             raise ValueError(f"Invalid idle range: ({min_s}, {max_s})")
         time.sleep(self._rng.uniform(min_s, max_s))
+
+    # ── Deep humanization helpers (Warmup 2.0) ─────────────────────────
+    def deep_scroll_session(
+        self,
+        *,
+        duration_s: float,
+        upward_correction_probability: float = 0.18,
+        flick_probability: float = 0.12,
+    ) -> Dict[str, int]:
+        """Scroll the feed for ~``duration_s`` seconds with rich variance.
+
+        Behaviour mix per tick (chosen randomly each iteration):
+
+        * **Slow read** — small downward delta + a long reading pause
+          weighted by an imagined post length.
+        * **Skim** — medium downward delta + short pause.
+        * **Flick** — large fast scroll burst (3-6 stacked deltas) with
+          almost no pause, simulating a bored thumb-flick.
+        * **Upward correction** — occasional scroll-back, like a user
+          who saw something interesting and went back to look at it.
+
+        Returns a small counter dict for logging in action results.
+        """
+        if duration_s <= 0:
+            raise ValueError(f"duration_s must be > 0, got {duration_s}")
+        if not 0.0 <= upward_correction_probability <= 1.0:
+            raise ValueError(
+                f"upward_correction_probability out of [0,1]: {upward_correction_probability}"
+            )
+        if not 0.0 <= flick_probability <= 1.0:
+            raise ValueError(f"flick_probability out of [0,1]: {flick_probability}")
+
+        counters: Dict[str, int] = {
+            "slow_reads": 0, "skims": 0, "flicks": 0, "upward_corrections": 0,
+        }
+        deadline = time.monotonic() + duration_s
+
+        while time.monotonic() < deadline:
+            roll = self._rng.random()
+            try:
+                if roll < upward_correction_probability:
+                    self._page.scroll.up(self._rng.randint(180, 520))
+                    self.idle(0.6, 1.7)
+                    counters["upward_corrections"] += 1
+                elif roll < upward_correction_probability + flick_probability:
+                    bursts = self._rng.randint(3, 6)
+                    for _ in range(bursts):
+                        self._page.scroll.down(self._rng.randint(420, 880))
+                        time.sleep(self._rng.uniform(0.05, 0.18))
+                    self.idle(0.4, 1.1)
+                    counters["flicks"] += 1
+                elif self._rng.random() < 0.55:
+                    # Slow read — short scroll, long dwell
+                    self._page.scroll.down(self._rng.randint(160, 360))
+                    # Imagine a 200-1500 char post and "read" it
+                    self.read_pause(content_length=self._rng.randint(200, 1500))
+                    counters["slow_reads"] += 1
+                else:
+                    # Skim — medium scroll, medium dwell
+                    self._page.scroll.down(self._rng.randint(280, 560))
+                    self.idle(1.2, 3.4)
+                    counters["skims"] += 1
+            except Exception as exc:
+                # Don't kill the whole session on one bad scroll — log and
+                # back off briefly. Common cause: page is in a transient
+                # navigation that briefly detaches the scroll target.
+                logger.debug("[behavior] deep_scroll tick failed (%s); backing off", exc)
+                time.sleep(self._rng.uniform(0.5, 1.4))
+
+        return counters
+
+    def maybe_like_visible_post(
+        self,
+        *,
+        like_probability: float = 0.25,
+    ) -> bool:
+        """With ``like_probability``, like the post currently centered in view.
+
+        Looks for an unliked Like button (``aria-label="Like"``) on a
+        post visible in the viewport and clicks it humanly. If the
+        button is already in the "Unlike" state we skip — accidentally
+        un-liking a post on the visible feed is a real-user-impact bug.
+
+        Returns True iff a like was actually clicked.
+        """
+        if not 0.0 <= like_probability <= 1.0:
+            raise ValueError(f"like_probability out of [0,1]: {like_probability}")
+        if self._rng.random() >= like_probability:
+            return False
+
+        like_btn = self._first_visible_element(
+            [
+                'css:section svg[aria-label="Like"]',
+                'xpath://section//*[@aria-label="Like" and @role="img"]',
+                'xpath://*[@role="button"]//*[@aria-label="Like"]',
+            ]
+        )
+        if like_btn is None:
+            return False
+
+        try:
+            self.safe_click_button(like_btn, settle_s=0.4, pre_click_pause_range_s=(0.6, 1.2))
+        except Exception as exc:
+            logger.debug("[behavior] maybe_like click failed (%s)", exc)
+            return False
+
+        # Tiny dwell — humans don't immediately scroll past a post they liked.
+        self.idle(0.7, 1.6)
+        return True
+
+    def browse_comments(
+        self,
+        *,
+        open_probability: float = 0.35,
+        like_count_range: Tuple[int, int] = (0, 2),
+        read_seconds_range: Tuple[float, float] = (3.0, 9.0),
+    ) -> Dict[str, int]:
+        """Maybe open a post's comments, scroll through them, like 0-2.
+
+        With ``open_probability`` we click the comments icon on the
+        post currently in the viewport, scroll through the list as if
+        reading replies, and like a random subset of comments. Returns
+        a counter dict suitable for the warmup result log.
+        """
+        if not 0.0 <= open_probability <= 1.0:
+            raise ValueError(f"open_probability out of [0,1]: {open_probability}")
+        lk_lo, lk_hi = like_count_range
+        if lk_lo < 0 or lk_hi < lk_lo:
+            raise ValueError(f"Invalid like_count_range: {like_count_range}")
+
+        result: Dict[str, int] = {"opened": 0, "comments_liked": 0, "scrolls": 0}
+
+        if self._rng.random() >= open_probability:
+            return result
+
+        comment_icon = self._first_visible_element(
+            [
+                'css:section svg[aria-label="Comment"]',
+                'xpath://section//*[@aria-label="Comment" and @role="img"]',
+            ]
+        )
+        if comment_icon is None:
+            return result
+
+        try:
+            self.safe_click_button(comment_icon, settle_s=0.5, pre_click_pause_range_s=(0.4, 1.0))
+        except Exception as exc:
+            logger.debug("[behavior] browse_comments open failed (%s)", exc)
+            return result
+        result["opened"] = 1
+
+        # Read through the modal — small scrolls inside the comment dialog.
+        read_for_s = self._rng.uniform(*read_seconds_range)
+        end = time.monotonic() + read_for_s
+        while time.monotonic() < end:
+            try:
+                self._page.scroll.down(self._rng.randint(120, 320))
+            except Exception as exc:
+                logger.debug("[behavior] comment-modal scroll failed (%s)", exc)
+                break
+            result["scrolls"] += 1
+            self.idle(0.8, 2.4)
+
+        # Like a few comments. Comment heart icons share the post heart's
+        # aria-label, but they live INSIDE the comment list (ul/li).
+        target_likes = self._rng.randint(lk_lo, lk_hi)
+        for _ in range(target_likes):
+            heart = self._first_visible_element(
+                [
+                    'xpath://ul//li//*[@aria-label="Like" and @role="img"]',
+                    'xpath://div[@role="dialog"]//li//*[@aria-label="Like"]',
+                ]
+            )
+            if heart is None:
+                break
+            try:
+                self.safe_click_button(
+                    heart, settle_s=0.3, pre_click_pause_range_s=(0.5, 1.1)
+                )
+                result["comments_liked"] += 1
+                self.idle(0.9, 2.1)
+            except Exception as exc:
+                logger.debug("[behavior] comment like failed (%s); stopping", exc)
+                break
+
+        # Close the comments modal — the close button has aria-label="Close"
+        # in the dialog corner. If we can't find it, hit Escape as a fallback.
+        close_btn = self._first_visible_element(
+            [
+                'xpath://div[@role="dialog"]//*[@aria-label="Close"]',
+                'css:svg[aria-label="Close"]',
+            ]
+        )
+        if close_btn is not None:
+            try:
+                self.click(close_btn)
+            except Exception:
+                self._press_escape()
+        else:
+            self._press_escape()
+        self.idle(0.6, 1.4)
+        return result
+
+    # ── Internals for the helpers above ────────────────────────────────
+    def _first_visible_element(self, selectors: Iterable[str]) -> Any | None:
+        """Return the first selector that resolves to an element, or None."""
+        for sel in selectors:
+            try:
+                ele = self._page.ele(sel, timeout=2)
+            except Exception as exc:
+                logger.debug("[behavior] selector %r raised (%s)", sel, exc)
+                continue
+            if ele:
+                return ele
+        return None
+
+    def _press_escape(self) -> None:
+        try:
+            self._page.actions.type("")  #  = Escape
+        except Exception as exc:
+            logger.debug("[behavior] Escape via actions failed (%s)", exc)
 
     # ── Internals ──────────────────────────────────────────────────────
     def _coord_of(self, target: Locator) -> Coord:
