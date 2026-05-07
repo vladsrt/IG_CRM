@@ -1,44 +1,48 @@
 """
 Warmup Action — v2 ("Warmup 2.0")
 ---------------------------------
-Drives a humanized feed-browsing session against an already-authenticated
-``InstagramBrowser``. The goal is *not* to do anything observable on the
-account; it is to make the account look alive to Meta's risk engine —
-spending realistic time on the feed, reading posts, looking at comments,
-liking the occasional thing, with no two sessions ever looking identical.
+Drives a humanized, time-bounded Instagram session against an
+already-authenticated ``InstagramBrowser``. The goal is *not* to do
+anything observable on the account; it is to make the account look
+alive — spending realistic time on the feed, occasionally watching
+Reels, dipping into comment threads, visiting profiles, liking the
+odd post. No two sessions look the same.
+
+Design — the time-based event loop
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The whole session is one ``while time.monotonic() < end_time`` loop.
+Each tick the script picks a single high-level action by weighted
+random choice — by default:
+
+    * scroll feed only       60%
+    * watch Reels for a bit  15%
+    * open comment thread    15%
+    * visit a profile        10%
+
+The picked action runs, returns, and we go back to the loop. Most
+actions also include their own internal smooth-scrolls and humanized
+pauses, so the session naturally varies in rhythm.
+
+Every visible-element interaction is routed through
+:class:`HumanBehaviorEngine` — Bezier mouse trajectories, JS-driven
+smooth scroll, hover-then-click, swallowed locator errors. Missing
+elements never crash the session; they just bias the next dice roll.
 
 Public API
 ~~~~~~~~~~
 ``execute_warmup(browser, args)`` — invoked by ``TaskExecutor``. The
 browser is owned by the executor; this module never instantiates one in
-production. The action never swallows exceptions; it lets them propagate
-so the executor can mark the parent Task FAILED.
-
-Behaviour mix
-~~~~~~~~~~~~~
-Every session is composed of multiple "phases" (3-6 of them) drawn from
-a weighted pool. Each phase has its own randomized duration. The phase
-order itself is shuffled, so a session might start with a fast skim and
-end with a long read, or the other way around. Within each phase,
-:meth:`HumanBehaviorEngine.deep_scroll_session` mixes slow reads, skims,
-flicks, and upward corrections with their own weighted dice rolls.
-
-Why so much randomness? Because uniform behaviour is itself a tell.
-Two warmup sessions that scroll-down-N-pixels-pause-M-seconds at the
-exact same cadence are indistinguishable from a script even when each
-delta is humanized in isolation. The variance has to compound.
+production. The action never swallows fatal exceptions; per-tick failures
+are caught (so one bad locator doesn't end a 15-minute session) but
+configuration errors and broken sessions propagate.
 
 Tunable args (all optional)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
-* ``feed_url`` (str)            — URL to start on. Default IG home.
-* ``page_load_wait_s`` (float)  — Initial wait after navigation.
-* ``total_minutes_min`` (float) — Lower bound on overall session time.
-* ``total_minutes_max`` (float) — Upper bound on overall session time.
-* ``phases_min`` (int)          — Lower bound on number of phases.
-* ``phases_max`` (int)          — Upper bound on number of phases.
-* ``like_probability`` (float)  — Per-tick probability of liking a post.
-* ``open_comments_probability`` (float) — Per-tick probability of
-                                          opening a comments modal.
+* ``feed_url`` (str)              — URL to start on. Default IG home.
+* ``page_load_wait_s`` (float)    — Initial wait after navigation.
+* ``duration_minutes`` (float)    — Total session ceiling. Default 15.
+* ``action_weights`` (dict)       — Override the default weighted-choice
+                                    distribution (see ``DEFAULT_WEIGHTS``).
 """
 
 from __future__ import annotations
@@ -48,10 +52,9 @@ import os
 import random
 import sys
 import time
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
-# Add backend directory to module search path so `workers` is resolvable
-# when this file is executed directly via `python action_warmup.py`.
+# Allow `python action_warmup.py` from the actions/ dir for the smoke-test.
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
 from workers.core.behavior import HumanBehaviorEngine
@@ -63,172 +66,359 @@ logger = logging.getLogger(__name__)
 # ── Defaults ────────────────────────────────────────────────────────────
 DEFAULT_FEED_URL: str = "https://www.instagram.com/"
 DEFAULT_PAGE_LOAD_WAIT_S: float = 5.0
-DEFAULT_TOTAL_MINUTES_MIN: float = 3.0
-DEFAULT_TOTAL_MINUTES_MAX: float = 8.0
-DEFAULT_PHASES_MIN: int = 3
-DEFAULT_PHASES_MAX: int = 6
-DEFAULT_LIKE_PROBABILITY: float = 0.22
-DEFAULT_OPEN_COMMENTS_PROBABILITY: float = 0.30
+DEFAULT_DURATION_MINUTES: float = 15.0
 
-# Phase profiles — each is a multiplier set the deep_scroll_session uses
-# to bias its own dice rolls. We pick from this pool with weights, and
-# every session is built from a *shuffled* sequence of phases so the
-# rhythm of the session itself varies.
-_PHASE_POOL: List[Dict[str, Any]] = [
-    {"name": "casual_skim",     "upward": 0.10, "flick": 0.08, "weight": 3},
-    {"name": "deep_read",       "upward": 0.22, "flick": 0.04, "weight": 3},
-    {"name": "fast_flick",      "upward": 0.06, "flick": 0.30, "weight": 2},
-    {"name": "back_and_forth",  "upward": 0.34, "flick": 0.10, "weight": 2},
-    {"name": "patient_browse",  "upward": 0.18, "flick": 0.06, "weight": 3},
+# Weights are picked by ``random.choices`` — relative magnitudes only,
+# they don't have to sum to 1.0. Re-tune freely via the ``action_weights``
+# arg without code changes.
+DEFAULT_WEIGHTS: Dict[str, float] = {
+    "scroll_feed": 60.0,
+    "watch_reels": 15.0,
+    "open_comments": 15.0,
+    "visit_profile": 10.0,
+}
+
+# ── Locators (curated against current IG web DOM as of 2026-Q2) ────────
+# Single source of truth — bumping a selector here updates every action.
+PROFILE_LINK_LOCATOR = 'css:a[role="link"][href^="/"] span[dir="auto"]'
+PROFILE_FIRST_POST_LOCATOR = 'css:a[href*="/p/"], a[href*="/reel/"]'
+COMMENT_ICON_LOCATOR = 'css:svg[aria-label="Comment"][height="24"]'
+POST_LIKE_ICON_LOCATOR = 'css:svg[aria-label="Like"][height="24"]'
+CLOSE_ICON_LOCATOR = 'css:svg[aria-label="Close"]'
+REELS_TAB_LOCATOR = 'css:svg[aria-label="Reels"]'
+NEXT_REEL_LOCATOR = 'css:div[aria-label="Navigate to next Reel"] svg'
+# Comment hearts are smaller (12px or 16px) and we MUST NOT toggle a
+# heart that is already in the "Unlike" state — that would un-like a
+# real user's comment, which is observable and bad.
+COMMENT_LIKE_LOCATORS: List[str] = [
+    'css:svg[aria-label="Like"][height="12"]',
+    'css:svg[aria-label="Like"][height="16"]',
 ]
 
+# Per-tick budgets — the loop stops cleanly between ticks so a long Reel
+# watch can't blow the overall duration_minutes budget by more than ~30s.
+_REEL_WATCH_S_RANGE: tuple[float, float] = (5.0, 30.0)
+_REELS_PER_VISIT_RANGE: tuple[int, int] = (2, 7)
+_COMMENT_LIKES_RANGE: tuple[int, int] = (1, 3)
+_PROFILE_DWELL_S_RANGE: tuple[float, float] = (3.0, 9.0)
+_POST_MODAL_DWELL_S_RANGE: tuple[float, float] = (4.0, 12.0)
 
-def _pick_phase(rng: random.Random) -> Dict[str, Any]:
-    bag: List[Dict[str, Any]] = []
-    for profile in _PHASE_POOL:
-        bag.extend([profile] * int(profile["weight"]))
-    return rng.choice(bag)
+
+# ── Helpers ────────────────────────────────────────────────────────────
+def _safe_find(page: Any, selector: str, *, timeout: float = 2.5) -> Any | None:
+    """Return the first matching element or ``None`` — never raises."""
+    try:
+        return page.ele(selector, timeout=timeout)
+    except Exception as exc:
+        logger.debug("[warmup] selector %r raised: %s", selector, exc)
+        return None
 
 
-# ── Public action handler ───────────────────────────────────────────────
+def _safe_find_all(page: Any, selector: str, *, timeout: float = 2.5) -> List[Any]:
+    """Return all matching elements (possibly empty) — never raises."""
+    try:
+        return list(page.eles(selector, timeout=timeout) or [])
+    except Exception as exc:
+        logger.debug("[warmup] eles(%r) raised: %s", selector, exc)
+        return []
+
+
+def _is_already_liked(svg_ele: Any) -> bool:
+    """Return True iff the heart icon is in the 'Unlike' state.
+
+    The post-like SVG flips its ``aria-label`` between ``Like`` and
+    ``Unlike`` — we only ever click on a ``Like`` heart. This guard is
+    paranoid because mis-toggling the user's real activity is the one
+    thing a warmup must NEVER do.
+    """
+    try:
+        label = (svg_ele.attr("aria-label") or "").strip().lower()
+    except Exception:
+        return True  # fail closed — don't click if we can't tell
+    return label == "unlike"
+
+
+# ── Action: scroll the feed ────────────────────────────────────────────
+def _action_scroll_feed(
+    browser: InstagramBrowser,
+    behavior: HumanBehaviorEngine,
+    rng: random.Random,
+    counters: Dict[str, int],
+) -> None:
+    # 2-5 smooth scrolls in a row, with one optional "like the post under
+    # me right now" sprinkled in.
+    for _ in range(rng.randint(2, 5)):
+        behavior.smooth_scroll(min_y=300, max_y=900, upward_probability=0.18)
+
+    if rng.random() < 0.35:
+        like_btn = _safe_find(browser.page, POST_LIKE_ICON_LOCATOR, timeout=2.0)
+        if like_btn is not None and not _is_already_liked(like_btn):
+            if behavior.safe_click(like_btn):
+                counters["posts_liked"] += 1
+                behavior.idle(0.8, 1.8)
+
+
+# ── Action: open comment thread on the visible post ────────────────────
+def _action_open_comments(
+    browser: InstagramBrowser,
+    behavior: HumanBehaviorEngine,
+    rng: random.Random,
+    counters: Dict[str, int],
+) -> None:
+    icon = _safe_find(browser.page, COMMENT_ICON_LOCATOR, timeout=3.0)
+    if icon is None or not behavior.safe_click(icon):
+        return
+    counters["comment_modals_opened"] += 1
+    behavior.idle(1.4, 2.6)
+
+    # Read through — smooth scrolls inside the dialog.
+    for _ in range(rng.randint(2, 6)):
+        behavior.smooth_scroll(
+            min_y=180, max_y=420,
+            upward_probability=0.10,
+            post_scroll_pause_range_s=(0.9, 2.4),
+        )
+
+    # Like 1-3 random comments, but never re-toggle an already-liked one.
+    target_likes = rng.randint(*_COMMENT_LIKES_RANGE)
+    candidates: List[Any] = []
+    for sel in COMMENT_LIKE_LOCATORS:
+        candidates.extend(_safe_find_all(browser.page, sel, timeout=2.0))
+    rng.shuffle(candidates)
+
+    for heart in candidates:
+        if target_likes <= 0:
+            break
+        if _is_already_liked(heart):
+            continue
+        if behavior.safe_click(heart):
+            counters["comments_liked"] += 1
+            target_likes -= 1
+            behavior.idle(0.7, 1.7)
+
+    # Close the modal.
+    close_btn = _safe_find(browser.page, CLOSE_ICON_LOCATOR, timeout=2.0)
+    behavior.safe_click(close_btn)
+    behavior.idle(0.6, 1.3)
+
+
+# ── Action: hop into Reels and watch a few ─────────────────────────────
+def _action_watch_reels(
+    browser: InstagramBrowser,
+    behavior: HumanBehaviorEngine,
+    rng: random.Random,
+    counters: Dict[str, int],
+) -> None:
+    reels_tab = _safe_find(browser.page, REELS_TAB_LOCATOR, timeout=3.0)
+    if reels_tab is None or not behavior.safe_click(reels_tab):
+        return
+    behavior.idle(2.0, 4.0)
+    counters["reels_sessions"] += 1
+
+    n_reels = rng.randint(*_REELS_PER_VISIT_RANGE)
+    for _ in range(n_reels):
+        # Watch — sleep is the point, no scrolling.
+        watch_s = rng.uniform(*_REEL_WATCH_S_RANGE)
+        time.sleep(watch_s)
+        counters["reels_watched"] += 1
+        counters["reels_watch_seconds"] = int(
+            counters.get("reels_watch_seconds", 0) + watch_s
+        )
+
+        # Maybe like or open comments while watching.
+        roll = rng.random()
+        if roll < 0.25:
+            heart = _safe_find(browser.page, POST_LIKE_ICON_LOCATOR, timeout=1.5)
+            if heart is not None and not _is_already_liked(heart):
+                if behavior.safe_click(heart):
+                    counters["reels_liked"] += 1
+                    behavior.idle(0.6, 1.4)
+        elif roll < 0.40:
+            icon = _safe_find(browser.page, COMMENT_ICON_LOCATOR, timeout=1.5)
+            if icon is not None and behavior.safe_click(icon):
+                counters["reels_comment_modals"] += 1
+                behavior.idle(2.0, 5.0)
+                close_btn = _safe_find(browser.page, CLOSE_ICON_LOCATOR, timeout=2.0)
+                behavior.safe_click(close_btn)
+
+        # Next reel.
+        next_btn = _safe_find(browser.page, NEXT_REEL_LOCATOR, timeout=2.0)
+        if next_btn is None or not behavior.safe_click(next_btn):
+            # If we can't advance via the button, a smooth downward scroll
+            # is the keyboard-less native gesture.
+            behavior.smooth_scroll(min_y=600, max_y=1100, upward_probability=0.0)
+        behavior.idle(0.4, 1.2)
+
+
+# ── Action: visit a random profile ─────────────────────────────────────
+def _action_visit_profile(
+    browser: InstagramBrowser,
+    behavior: HumanBehaviorEngine,
+    rng: random.Random,
+    counters: Dict[str, int],
+) -> None:
+    candidates = _safe_find_all(browser.page, PROFILE_LINK_LOCATOR, timeout=3.0)
+    if not candidates:
+        return
+    target = rng.choice(candidates)
+    if not behavior.safe_click(target):
+        return
+    counters["profiles_visited"] += 1
+    behavior.idle(*_PROFILE_DWELL_S_RANGE)
+
+    # Skim the grid briefly.
+    for _ in range(rng.randint(1, 3)):
+        behavior.smooth_scroll(min_y=300, max_y=800, upward_probability=0.10)
+
+    # Maybe open the first post / reel and look at it.
+    if rng.random() < 0.55:
+        first = _safe_find(browser.page, PROFILE_FIRST_POST_LOCATOR, timeout=2.0)
+        if first is not None and behavior.safe_click(first):
+            counters["profile_posts_opened"] += 1
+            behavior.idle(*_POST_MODAL_DWELL_S_RANGE)
+
+            # Scroll inside the modal a bit.
+            for _ in range(rng.randint(1, 3)):
+                behavior.smooth_scroll(min_y=120, max_y=360, upward_probability=0.10)
+
+            close_btn = _safe_find(browser.page, CLOSE_ICON_LOCATOR, timeout=2.0)
+            behavior.safe_click(close_btn)
+            behavior.idle(0.7, 1.6)
+
+    # Browser-Back to the feed.
+    try:
+        browser.page.back()
+    except Exception as exc:
+        logger.debug("[warmup] page.back() failed (%s); navigating home", exc)
+        try:
+            browser.page.get(DEFAULT_FEED_URL)
+        except Exception as exc2:
+            logger.debug("[warmup] feed-recovery nav also failed (%s)", exc2)
+    behavior.idle(1.4, 2.8)
+
+
+# ── Dispatch table ─────────────────────────────────────────────────────
+_ActionFn = Callable[
+    [InstagramBrowser, HumanBehaviorEngine, random.Random, Dict[str, int]], None
+]
+_ACTIONS: Dict[str, _ActionFn] = {
+    "scroll_feed":   _action_scroll_feed,
+    "open_comments": _action_open_comments,
+    "watch_reels":   _action_watch_reels,
+    "visit_profile": _action_visit_profile,
+}
+
+
+def _pick_action(weights: Dict[str, float], rng: random.Random) -> str:
+    keys = list(weights.keys())
+    vals = [max(0.0, float(weights[k])) for k in keys]
+    if not any(vals):
+        return "scroll_feed"  # safest fallback if user zeroed everything
+    return rng.choices(keys, weights=vals, k=1)[0]
+
+
+# ── Public entrypoint ──────────────────────────────────────────────────
 def execute_warmup(
     browser: InstagramBrowser,
-    args: Dict[str, Any] | None = None,
+    args: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Drive a randomized, multi-phase feed-browsing session.
+    """Drive a time-bounded, weighted-random IG warmup session.
 
     The browser is owned by the caller (``TaskExecutor``); this function
     never instantiates a new one and never calls ``browser.close()``.
-    Step failures propagate.
+    Per-tick failures are swallowed so a transient missing locator
+    doesn't end a 15-minute session — the next dice roll just picks
+    another action. Configuration errors and outright dead browsers
+    propagate.
     """
     args = args or {}
     rng = random.Random()
 
     feed_url = str(args.get("feed_url", DEFAULT_FEED_URL))
     page_load_wait_s = float(args.get("page_load_wait_s", DEFAULT_PAGE_LOAD_WAIT_S))
+    duration_minutes = float(args.get("duration_minutes", DEFAULT_DURATION_MINUTES))
+    if duration_minutes <= 0:
+        raise ValueError(f"duration_minutes must be > 0, got {duration_minutes}")
 
-    total_min = float(args.get("total_minutes_min", DEFAULT_TOTAL_MINUTES_MIN))
-    total_max = float(args.get("total_minutes_max", DEFAULT_TOTAL_MINUTES_MAX))
-    if total_min <= 0 or total_max < total_min:
-        raise ValueError(
-            f"Invalid total_minutes bounds: min={total_min}, max={total_max}"
-        )
+    # Merge user overrides on top of defaults; unknown keys are ignored.
+    weights = dict(DEFAULT_WEIGHTS)
+    for k, v in (args.get("action_weights") or {}).items():
+        if k in weights:
+            weights[k] = float(v)
 
-    phases_min = int(args.get("phases_min", DEFAULT_PHASES_MIN))
-    phases_max = int(args.get("phases_max", DEFAULT_PHASES_MAX))
-    if phases_min < 1 or phases_max < phases_min:
-        raise ValueError(
-            f"Invalid phases bounds: min={phases_min}, max={phases_max}"
-        )
-
-    like_probability = float(args.get("like_probability", DEFAULT_LIKE_PROBABILITY))
-    open_comments_probability = float(
-        args.get("open_comments_probability", DEFAULT_OPEN_COMMENTS_PROBABILITY)
-    )
-
-    total_seconds = rng.uniform(total_min * 60.0, total_max * 60.0)
-    n_phases = rng.randint(phases_min, phases_max)
-
-    # Distribute total_seconds across phases unevenly. Dirichlet-ish
-    # mix: random weights, normalize, multiply. This ensures one phase
-    # might take 60% of the session and another 5%, like real attention.
-    raw_weights = [rng.uniform(0.5, 2.0) for _ in range(n_phases)]
-    weight_sum = sum(raw_weights)
-    phase_durations = [w / weight_sum * total_seconds for w in raw_weights]
-
-    phases: List[Dict[str, Any]] = []
-    for dur in phase_durations:
-        profile = _pick_phase(rng)
-        phases.append({**profile, "duration_s": dur})
-    rng.shuffle(phases)  # phase order itself varies — no two sessions look alike
+    end_time = time.monotonic() + duration_minutes * 60.0
 
     logger.info(
-        "[warmup] starting session total=%.1fs phases=%d profile_seq=%s",
-        total_seconds,
-        n_phases,
-        [p["name"] for p in phases],
+        "[warmup] navigating to %s (duration=%.1fmin, weights=%s)",
+        feed_url, duration_minutes, weights,
     )
-
-    # ── Navigate ───────────────────────────────────────────────────────
     browser.page.get(feed_url)
     time.sleep(page_load_wait_s)
 
     behavior = HumanBehaviorEngine(browser.page)
     # Initial "I just opened the app" beat — humans don't engage instantly.
-    behavior.read_pause(content_length=None)
-    behavior.micro_scroll()
+    behavior.idle(2.0, 4.0)
 
-    aggregate: Dict[str, int] = {
-        "slow_reads": 0,
-        "skims": 0,
-        "flicks": 0,
-        "upward_corrections": 0,
-        "posts_liked": 0,
-        "comment_modals_opened": 0,
-        "comments_liked": 0,
+    counters: Dict[str, int] = {
+        "ticks":                  0,
+        "posts_liked":            0,
+        "comment_modals_opened":  0,
+        "comments_liked":         0,
+        "reels_sessions":         0,
+        "reels_watched":          0,
+        "reels_watch_seconds":    0,
+        "reels_liked":            0,
+        "reels_comment_modals":   0,
+        "profiles_visited":       0,
+        "profile_posts_opened":   0,
     }
-    phase_log: List[Dict[str, Any]] = []
+    action_log: List[Dict[str, Any]] = []
 
-    # ── Phase loop ─────────────────────────────────────────────────────
-    for idx, phase in enumerate(phases, 1):
-        logger.info(
-            "[warmup] phase %d/%d: %s (~%.1fs)",
-            idx, len(phases), phase["name"], phase["duration_s"],
-        )
+    while time.monotonic() < end_time:
+        action_name = _pick_action(weights, rng)
+        action_fn = _ACTIONS[action_name]
+        tick_started_at = time.monotonic()
+        logger.info("[warmup] tick %d: %s", counters["ticks"] + 1, action_name)
 
-        scroll_counts = behavior.deep_scroll_session(
-            duration_s=phase["duration_s"],
-            upward_correction_probability=phase["upward"],
-            flick_probability=phase["flick"],
-        )
-        for k, v in scroll_counts.items():
-            aggregate[k] = aggregate.get(k, 0) + v
+        try:
+            action_fn(browser, behavior, rng, counters)
+            ok = True
+            err: Optional[str] = None
+        except Exception as exc:
+            # Per-tick guard — a single missing locator must NOT end the
+            # session. We log it, count it, and roll again.
+            ok = False
+            err = f"{type(exc).__name__}: {exc}"
+            logger.warning("[warmup] tick %r failed (%s) — continuing", action_name, err)
 
-        # Inter-phase engagement burst — 1-3 chances to like / open comments.
-        burst_count = rng.randint(1, 3)
-        for _ in range(burst_count):
-            try:
-                if behavior.maybe_like_visible_post(like_probability=like_probability):
-                    aggregate["posts_liked"] += 1
-            except Exception as exc:
-                logger.debug("[warmup] like attempt raised (%s); ignoring", exc)
+        counters["ticks"] += 1
+        action_log.append({
+            "action":     action_name,
+            "ok":         ok,
+            "elapsed_s":  round(time.monotonic() - tick_started_at, 2),
+            "error":      err,
+        })
 
-            try:
-                comment_stats = behavior.browse_comments(
-                    open_probability=open_comments_probability,
-                )
-                aggregate["comment_modals_opened"] += comment_stats.get("opened", 0)
-                aggregate["comments_liked"] += comment_stats.get("comments_liked", 0)
-            except Exception as exc:
-                logger.debug("[warmup] browse_comments raised (%s); ignoring", exc)
-
-            behavior.micro_scroll()
-            behavior.idle(0.6, 1.8)
-
-        phase_log.append(
-            {
-                "name": phase["name"],
-                "duration_s": round(phase["duration_s"], 2),
-                "scroll_counts": scroll_counts,
-            }
-        )
+        # Inter-tick breath. Long enough to break up timing fingerprints,
+        # short enough that we still hit the duration budget.
+        behavior.idle(1.2, 3.4)
 
     logger.info(
-        "[warmup] session done: %s",
-        {k: v for k, v in aggregate.items() if v},
+        "[warmup] session done after %d ticks: %s",
+        counters["ticks"], {k: v for k, v in counters.items() if v},
     )
     return {
-        "action": "warmup",
-        "version": 2,
-        "feed_url": feed_url,
-        "total_seconds": round(total_seconds, 1),
-        "phase_count": len(phases),
-        "phase_log": phase_log,
-        "aggregate": aggregate,
+        "action":            "warmup",
+        "version":           2,
+        "feed_url":          feed_url,
+        "duration_minutes":  duration_minutes,
+        "weights":           weights,
+        "counters":          counters,
+        "action_log":        action_log,
     }
 
 
-# ── Standalone smoke-test (not used in production) ──────────────────────
+# ── Standalone smoke-test (not used in production) ─────────────────────
 _SMOKE_TEST_PROXY: str = "8d1f77cde74f6dffffea__cr.us:80fe1a46ee235b27@gw.dataimpulse.com:823"
 
 _SMOKE_TEST_USER_AGENT: str = (
@@ -251,9 +441,8 @@ _SMOKE_TEST_COOKIES = [
 
 
 def _run_standalone_smoke_test() -> None:
-    """Original ``run_warmup`` behavior — kept for manual debugging only."""
     print("=" * 55)
-    print("  Instagram Worker - Standalone Warmup 2.0 Smoke Test")
+    print("  Instagram Worker - Warmup 2.0 Smoke Test")
     print("=" * 55)
 
     browser: InstagramBrowser | None = None
@@ -264,18 +453,9 @@ def _run_standalone_smoke_test() -> None:
             headless=False,
         )
         browser.inject_cookies(_SMOKE_TEST_COOKIES)
-        # Short config so the smoke test finishes in ~1 minute.
-        result = execute_warmup(
-            browser,
-            args={
-                "total_minutes_min": 0.6,
-                "total_minutes_max": 1.2,
-                "phases_min": 2,
-                "phases_max": 3,
-            },
-        )
+        result = execute_warmup(browser, args={"duration_minutes": 1.5})
         print(f"[+] Warmup result: {result}")
-    except Exception as exc:  # smoke-test only — production uses TaskExecutor
+    except Exception as exc:
         import traceback
         print(f"[!] Smoke test failed: {exc}")
         traceback.print_exc()
