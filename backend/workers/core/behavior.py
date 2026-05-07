@@ -369,6 +369,146 @@ class HumanBehaviorEngine:
             raise ValueError(f"Invalid idle range: ({min_s}, {max_s})")
         time.sleep(self._rng.uniform(min_s, max_s))
 
+    # ── JS-driven smooth scroll (preferred over DrissionPage's hard scrolls) ──
+    def smooth_scroll(
+        self,
+        min_y: int = 300,
+        max_y: int = 800,
+        *,
+        upward_probability: float = 0.15,
+        post_scroll_pause_range_s: Tuple[float, float] = (0.8, 2.6),
+    ) -> int:
+        """Smoothly scroll the page by a randomized amount via injected JS.
+
+        DrissionPage's ``page.scroll.down(N)`` issues an instant
+        ``scrollTo``-style jump that produces a single, choppy scroll
+        event with no intermediate frames. Real browsers, when a user
+        rolls the wheel, emit dozens of incremental scroll events as the
+        viewport eases to its new position. We replicate that by calling
+        ``window.scrollBy({top: y, behavior: 'smooth'})`` — the browser
+        handles the easing animation natively.
+
+        Args:
+            min_y: Lower bound on scroll distance (pixels). Must be > 0.
+            max_y: Upper bound on scroll distance (pixels).
+            upward_probability: Chance the scroll goes UP instead of down,
+                simulating a user who saw something interesting and went
+                back to look at it. Defaults to 15%.
+            post_scroll_pause_range_s: After-scroll pause range. The pause
+                always happens — humans don't fire wheel events
+                back-to-back without at least a beat to look at the new
+                content.
+
+        Returns:
+            Signed pixel delta actually requested (negative = upward).
+        """
+        if min_y < 1 or max_y < min_y:
+            raise ValueError(f"Invalid smooth_scroll bounds: ({min_y}, {max_y})")
+        if not 0.0 <= upward_probability <= 1.0:
+            raise ValueError(
+                f"upward_probability out of [0,1]: {upward_probability}"
+            )
+
+        magnitude = self._rng.randint(min_y, max_y)
+        direction = -1 if self._rng.random() < upward_probability else 1
+        # Upward corrections are usually shorter than the original scroll,
+        # because a real user nudges back, not flicks all the way.
+        if direction == -1:
+            magnitude = max(80, magnitude // 2)
+
+        y_offset = direction * magnitude
+        try:
+            self._page.run_js(
+                f"window.scrollBy({{top: {y_offset}, behavior: 'smooth'}});"
+            )
+        except Exception as exc:
+            # JS injection failed (rare — usually a detached frame mid-nav).
+            # Fall back to DrissionPage's scroll so the session keeps moving.
+            logger.debug(
+                "[behavior] run_js smooth scroll failed (%s); using fallback",
+                exc,
+            )
+            try:
+                if direction == 1:
+                    self._page.scroll.down(magnitude)
+                else:
+                    self._page.scroll.up(magnitude)
+            except Exception as exc2:
+                logger.debug(
+                    "[behavior] fallback scroll also failed (%s); skipping tick",
+                    exc2,
+                )
+                return 0
+
+        # Pause for layout + reading. Always non-zero — back-to-back wheel
+        # events with no settle are themselves a bot signal.
+        self.idle(*post_scroll_pause_range_s)
+        return y_offset
+
+    def safe_click(
+        self,
+        target: Any,
+        *,
+        hover_first: bool = True,
+        pre_click_pause_range_s: Tuple[float, float] = (0.2, 0.7),
+    ) -> bool:
+        """Click ``target`` with humanized timing, swallowing locator errors.
+
+        Behaviour:
+
+        1. If ``hover_first`` and the target has a ``.rect`` (i.e. it's a
+           DrissionPage element, not a coord), move the cursor to it
+           along a Bezier path — that's the "hover".
+        2. Sleep ``pre_click_pause_range_s`` (default 0.2-0.7s) — a real
+           user doesn't click the instant the cursor lands.
+        3. Issue the click.
+
+        EVERYTHING is wrapped in try/except. If ``target`` is ``None``, a
+        stale element, or the click itself raises, this method returns
+        ``False`` instead of propagating — exactly what the warmup loop
+        wants, since "the comment icon wasn't visible this iteration"
+        should never crash a 15-minute session.
+
+        Returns:
+            True iff the click was issued without raising.
+        """
+        if target is None:
+            return False
+
+        try:
+            if hover_first and hasattr(target, "rect"):
+                try:
+                    self.move_to(target)
+                except Exception as exc:
+                    logger.debug("[behavior] safe_click hover failed (%s)", exc)
+
+            self.idle(*pre_click_pause_range_s)
+
+            # Prefer the trajectory-preserving actions.click() path; if
+            # that fails, fall back to the element's own click().
+            try:
+                self._page.actions.click()
+                return True
+            except Exception as exc:
+                logger.debug(
+                    "[behavior] safe_click actions.click failed (%s); "
+                    "falling back to ele.click",
+                    exc,
+                )
+                if hasattr(target, "click"):
+                    try:
+                        target.click()
+                        return True
+                    except Exception as exc2:
+                        logger.debug(
+                            "[behavior] safe_click ele.click also failed (%s)",
+                            exc2,
+                        )
+        except Exception as exc:
+            # Defensive catch-all — safe_click must never throw.
+            logger.debug("[behavior] safe_click outer guard caught (%s)", exc)
+        return False
+
     # ── Deep humanization helpers (Warmup 2.0) ─────────────────────────
     def deep_scroll_session(
         self,
