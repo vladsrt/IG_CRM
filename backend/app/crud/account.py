@@ -9,10 +9,11 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models.account import AuthMethod, InstagramAccount
+from app.models.account import AuthMethod, InstagramAccount, Platform
 from app.models.proxy import Proxy
 from app.models.user import User
 from app.schemas.account import InstagramAccountCreate, InstagramAccountUpdate
+from workers.utils.ua_generator import get_random_user_agent
 
 # Backwards-compat re-export so legacy imports (`from app.crud.account import
 # InstagramAccountUpdate`) keep resolving — the canonical home is now
@@ -94,6 +95,17 @@ def create_account(
     )
     payload["tags"] = _normalize_tags(payload.get("tags"))
 
+    # Pin a UA at creation time. If the operator did not supply one,
+    # pick from the pool that matches the chosen platform — and persist
+    # it. Once stored, the UA is NEVER auto-rotated; rotating mid-life
+    # is a stronger bot signal than picking an unfortunate string.
+    platform_raw = payload.get("platform") or Platform.WINDOWS.value
+    payload["platform"] = (
+        platform_raw.value if isinstance(platform_raw, Platform) else platform_raw
+    )
+    if not payload.get("user_agent"):
+        payload["user_agent"] = get_random_user_agent(payload["platform"])
+
     account = InstagramAccount(**payload)
     db.add(account)
     try:
@@ -120,6 +132,8 @@ def update_account(
             raise ValueError(f"Proxy {data['proxy_id']} does not exist")
     if "auth_method" in data and isinstance(data["auth_method"], AuthMethod):
         data["auth_method"] = data["auth_method"].value
+    if "platform" in data and isinstance(data["platform"], Platform):
+        data["platform"] = data["platform"].value
     if "tags" in data:
         data["tags"] = _normalize_tags(data["tags"])
 

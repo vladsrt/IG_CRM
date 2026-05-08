@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.models.account import AuthMethod
+from app.models.account import AuthMethod, Platform
 
 
 class InstagramAccountBase(BaseModel):
@@ -15,6 +15,8 @@ class InstagramAccountBase(BaseModel):
     cookies: list | None = None
     status: str | None = None
     tags: list[str] = Field(default_factory=list)
+    platform: Platform = Platform.WINDOWS
+    user_agent: str | None = None
 
 
 class InstagramAccountCreate(InstagramAccountBase):
@@ -36,6 +38,8 @@ class InstagramAccountUpdate(BaseModel):
     status: str | None = None
     error_log: str | None = None
     tags: list[str] | None = Field(default=None)
+    platform: Platform | None = None
+    user_agent: str | None = None
 
 
 class InstagramAccountRead(InstagramAccountBase):

@@ -23,6 +23,20 @@ class AuthMethod(str, enum.Enum):
     MANUAL = "manual"
 
 
+class Platform(str, enum.Enum):
+    """Operating system the spoofed Chromium build advertises.
+
+    Bound to the account at creation time and used to seed the
+    User-Agent if the operator did not supply one. Once persisted, the
+    UA stays pinned for the lifetime of the account so we don't emit
+    "browser changed OS overnight" telemetry.
+    """
+
+    WINDOWS = "windows"
+    MACOS = "macos"
+    LINUX = "linux"
+
+
 class InstagramAccount(Base):
     """An Instagram account linked to a user."""
 
@@ -31,6 +45,10 @@ class InstagramAccount(Base):
         CheckConstraint(
             "auth_method IN ('cookies', 'manual')",
             name="ck_instagram_accounts_auth_method",
+        ),
+        CheckConstraint(
+            "platform IN ('windows', 'macos', 'linux')",
+            name="ck_instagram_accounts_platform",
         ),
     )
 
@@ -64,6 +82,23 @@ class InstagramAccount(Base):
     error_log: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_check: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
+        nullable=True,
+    )
+
+    # ── Browser fingerprint pinning ─────────────────────────────────────
+    # ``platform`` decides which UA pool the account is seeded from at
+    # creation time. ``user_agent`` is the resolved UA string; once set
+    # it is NEVER auto-rotated — rotating UAs between sessions is itself
+    # a strong bot signal, since real browsers don't change their major
+    # version mid-week.
+    platform: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default=Platform.WINDOWS.value,
+        server_default=text("'windows'"),
+    )
+    user_agent: Mapped[str | None] = mapped_column(
+        String(512),
         nullable=True,
     )
 
