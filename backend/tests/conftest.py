@@ -69,6 +69,8 @@ def make_fake_account(**overrides: Any) -> SimpleNamespace:
         error_log=None,
         last_check=None,
         tags=[],
+        platform="windows",
+        user_agent=None,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -83,6 +85,7 @@ def make_fake_proxy(**overrides: Any) -> SimpleNamespace:
         password="ppass",
         rotation_url="https://rotate.example.com/x",
         type="ordinary",
+        protocol="http",
     )
     base.update(overrides)
     return SimpleNamespace(**base)
