@@ -5,22 +5,23 @@ from __future__ import annotations
 import uuid
 from typing import Sequence
 
-from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models.proxy import Proxy, ProxyType
-from app.schemas.proxy import ProxyCreate
+from app.models.proxy import Proxy
+from app.schemas.proxy import ProxyCreate, ProxyUpdate
 
-
-class ProxyUpdate(BaseModel):
-    host: str | None = None
-    port: int | None = None
-    username: str | None = None
-    password: str | None = None
-    rotation_url: str | None = None
-    type: ProxyType | None = None
+# Backwards-compat re-export — ``ProxyUpdate`` now lives in
+# ``app.schemas.proxy`` (canonical home), but legacy imports keep working.
+__all__ = [
+    "ProxyUpdate",
+    "create_proxy",
+    "delete_proxy",
+    "get_proxy",
+    "list_proxies",
+    "update_proxy",
+]
 
 
 # ── Read ────────────────────────────────────────────────────────────────

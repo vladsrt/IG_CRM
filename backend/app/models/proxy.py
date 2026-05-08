@@ -4,7 +4,7 @@ import enum
 import uuid
 from typing import TYPE_CHECKING
 
-from sqlalchemy import CheckConstraint, Integer, String
+from sqlalchemy import CheckConstraint, Integer, String, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -21,6 +21,22 @@ class ProxyType(str, enum.Enum):
     STICKY = "sticky"
 
 
+class ProxyProtocol(str, enum.Enum):
+    """Wire protocol used to talk to the upstream proxy.
+
+    ``HTTP`` / ``HTTPS`` — handled natively by Chrome's authenticated
+    proxy extension. ``SOCKS4`` / ``SOCKS5`` — Chrome supports them as
+    transports but does NOT support per-request auth via
+    ``webRequest.onAuthRequired``; SOCKS proxies must be IP-whitelisted
+    at the provider for credentials to be omitted from the request URL.
+    """
+
+    HTTP = "http"
+    HTTPS = "https"
+    SOCKS4 = "socks4"
+    SOCKS5 = "socks5"
+
+
 class Proxy(Base):
     """Proxy server configuration."""
 
@@ -29,6 +45,10 @@ class Proxy(Base):
         CheckConstraint(
             "type IN ('ordinary', 'sticky')",
             name="ck_proxies_type",
+        ),
+        CheckConstraint(
+            "protocol IN ('http', 'https', 'socks4', 'socks5')",
+            name="ck_proxies_protocol",
         ),
     )
 
@@ -43,6 +63,12 @@ class Proxy(Base):
     password: Mapped[str] = mapped_column(String(255), nullable=False)
     rotation_url: Mapped[str] = mapped_column(String(2048), nullable=False)
     type: Mapped[str] = mapped_column(String(20), nullable=False)
+    protocol: Mapped[str] = mapped_column(
+        String(10),
+        nullable=False,
+        default=ProxyProtocol.HTTP.value,
+        server_default=text("'http'"),
+    )
 
     # ── Relationships ───────────────────────────────────────────────────
     instagram_accounts: Mapped[list[InstagramAccount]] = relationship(
