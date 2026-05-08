@@ -52,29 +52,64 @@ class InstagramBrowser:
     def __init__(
         self,
         proxy_string: str,
-        user_agent: str,
+        user_agent: Optional[str] = None,
         headless: bool = False,
         task_id: Optional[str] = None,
+        *,
+        account_user_agent: Optional[str] = None,
+        account_platform: Optional[str] = None,
     ):
         """
         Initializes the browser environment.
 
         Args:
-            proxy_string (str): Proxy string in IP:PORT or USER:PASS@IP:PORT format.
-            user_agent (str): User-Agent string to spoof.
-            headless (bool): Whether to run the browser in headless mode.
-            task_id (str | None): Optional Task UUID used to derive a unique
-                proxy-extension folder name. If omitted, a random hex token
-                is generated. This is what makes concurrent ``InstagramBrowser``
-                instances in the same process safe.
+            proxy_string: Proxy URL in any form accepted by
+                :func:`workers.utils.proxy_builder.parse_proxy_url`.
+                Preferred form is ``protocol://user:pass@host:port``;
+                a bare ``user:pass@host:port`` is treated as ``http``.
+            user_agent: Explicit User-Agent override. If omitted, the
+                engine resolves a UA in this priority order:
+
+                    1. ``account_user_agent`` (the value persisted on
+                       the ``InstagramAccount`` row — preferred path,
+                       since each account is supposed to keep one UA
+                       for life).
+                    2. A random Chrome UA from the pool that matches
+                       ``account_platform`` (last-resort fallback for
+                       legacy rows where the column is still NULL).
+                    3. A safe Windows Chrome UA — only if neither of
+                       the above is available.
+
+            headless: Whether to run the browser in headless mode.
+            task_id: Optional Task UUID used to derive a unique
+                proxy-extension folder name. If omitted, a random hex
+                token is generated. This is what makes concurrent
+                ``InstagramBrowser`` instances in the same process safe.
+            account_user_agent: The ``user_agent`` value persisted on
+                the ``InstagramAccount`` row. Pass this when launching a
+                browser for a specific account so the spoofed
+                fingerprint stays pinned across sessions.
+            account_platform: The account's ``platform`` enum value
+                (``windows`` / ``macos`` / ``linux``). Used only when
+                ``account_user_agent`` is missing — to seed a UA from
+                the matching pool.
 
         Raises:
-            Any exception raised during Chromium setup is re-raised AFTER
-            ``self.close()`` has reaped whatever was partially constructed
-            (Chrome subprocess, plugin folder on disk).
+            ValueError: if ``proxy_string`` cannot be parsed.
+            Any exception raised during Chromium setup is re-raised
+            AFTER ``self.close()`` has reaped whatever was partially
+            constructed (Chrome subprocess, plugin folder on disk).
         """
         self.proxy_string = proxy_string
-        self.user_agent = user_agent
+        # Resolve the UA up front — explicit > account-pinned > pool-by-platform
+        # > Windows fallback. Doing this here (rather than in the caller) keeps
+        # the priority rule in one place and the public API of every action
+        # handler unchanged.
+        self.user_agent = self._resolve_user_agent(
+            explicit=user_agent,
+            account_user_agent=account_user_agent,
+            account_platform=account_platform,
+        )
         self.task_id = task_id
 
         # CRITICAL-3 — initialize cleanup-relevant attributes BEFORE any
@@ -98,11 +133,17 @@ class InstagramBrowser:
         self.plugin_folder = f"{_PLUGIN_FOLDER_PREFIX}_{token}"
 
         try:
-            # 2. Generate Proxy Extension into the unique folder.
+            # 2. Generate Proxy Extension into the unique folder. The
+            # builder accepts a full ``protocol://user:pass@host:port``
+            # URL so HTTP/HTTPS/SOCKS proxies all share one path.
             self.plugin_path = create_proxy_extension(
                 self.proxy_string, self.plugin_folder
             )
-            print(f"[*] Proxy extension generated at {self.plugin_path}")
+            print(
+                f"[*] Proxy extension generated at {self.plugin_path} "
+                f"(proxy={self._redacted_proxy()})"
+            )
+            print(f"[*] Spoofing User-Agent: {self.user_agent}")
 
             # 3. Setup Options
             self.co = ChromiumOptions()
@@ -134,6 +175,53 @@ class InstagramBrowser:
                     f"[!] Cleanup during failed __init__ also raised: {cleanup_exc}"
                 )
             raise
+
+    # ── UA / proxy resolution helpers ───────────────────────────────────
+    @staticmethod
+    def _resolve_user_agent(
+        *,
+        explicit: Optional[str],
+        account_user_agent: Optional[str],
+        account_platform: Optional[str],
+    ) -> str:
+        """Pick the UA to spoof, applying the priority rule documented above.
+
+        Kept as a static method so it can be unit-tested without booting a
+        Chromium subprocess.
+        """
+        # Local import — keeps the workers/utils/ua_generator dependency
+        # out of the import path until we actually need it. The module
+        # itself has no side effects so a top-level import would also be
+        # fine; this just keeps cold-start time honest.
+        from workers.utils.ua_generator import (
+            Platform as _Platform,
+            get_random_user_agent,
+        )
+
+        if explicit:
+            return explicit
+        if account_user_agent:
+            return account_user_agent
+        if account_platform:
+            try:
+                return get_random_user_agent(account_platform)
+            except ValueError:
+                # Unknown platform string — fall through to the safe default.
+                pass
+        return get_random_user_agent(_Platform.WINDOWS)
+
+    def _redacted_proxy(self) -> str:
+        """Return the proxy URL with credentials masked, for safe logging."""
+        if "@" not in self.proxy_string:
+            return self.proxy_string
+        # Strip the credential block (everything between "://"-or-start and "@").
+        scheme_split = self.proxy_string.split("://", 1)
+        if len(scheme_split) == 2:
+            scheme, rest = scheme_split
+            after_at = rest.split("@", 1)[1]
+            return f"{scheme}://***@{after_at}"
+        after_at = self.proxy_string.split("@", 1)[1]
+        return f"***@{after_at}"
 
     def inject_cookies(self, cookies_list: List[Dict[str, str]]) -> None:
         """
