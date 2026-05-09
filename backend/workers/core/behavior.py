@@ -215,24 +215,38 @@ class HumanBehaviorEngine:
         target: _HasRect,
         *,
         focus_first: bool = True,
-        backspace_passes: int = 1,
-    ) -> None:
-        """Clear an input/textarea/contenteditable with human-like keystrokes.
+        backspace_passes: int = 1,  # kept for API compat; ignored by the JS path
+    ) -> bool:
+        """Hard-clear an input/textarea/contenteditable via JS injection.
 
-        Why not ``element.clear()``? On Instagram's React-driven forms,
-        ``.clear()`` either:
+        React-controlled forms (Instagram's bio editor, the upload
+        caption, every place we type) ignore hardware ``Backspace``
+        keys whenever the React state for the node holds a non-empty
+        value — the hardware keystroke clears the DOM, then React
+        re-renders the old value back in on the next tick. The only
+        reliable wipe is to write directly to the node's ``value`` AND
+        ``textContent``, then dispatch a synthetic ``input`` event
+        (the one React listens for) so its internal state catches up
+        to the DOM.
 
-        * silently no-ops on contenteditable ``<div>`` fields (the bio
-          field has been one in recent rollouts), so subsequent typing
-          *appends* to the existing value, OR
-        * fires a single synthetic ``input`` event which IG's client-side
-          telemetry can fingerprint as scripted.
+        Strategy:
 
-        The robust pattern that works across all three field flavors
-        (input, textarea, contenteditable) is what a human would do:
-        focus → ``Ctrl+A`` → ``Backspace``. We add humanized delays
-        between each keystroke and an optional second backspace pass for
-        stubborn fields that re-populate from React state on first delete.
+        1. Focus the target so the caret is in the right place when
+           the caller later types into it.
+        2. Run a JS payload on the node that:
+             * sets ``.value`` (input/textarea path),
+             * sets ``.textContent`` and ``.innerText`` (contenteditable),
+             * dispatches a bubbling ``input`` event so React reconciles.
+        3. Read the field back. If it's still non-empty (rare, but
+           possible if React owns the value entirely), fall back to a
+           keystroke-based ``Ctrl+A`` + ``Backspace`` retry.
+
+        Returns:
+            ``True`` if the field is empty when we return, ``False`` if
+            we couldn't fully wipe it. Callers should check this and
+            decide whether to abort the action — typing into a
+            non-empty field will *append*, which is the bug we're
+            fixing here.
         """
         if backspace_passes < 1:
             raise ValueError(f"backspace_passes must be >= 1, got {backspace_passes}")
@@ -241,50 +255,114 @@ class HumanBehaviorEngine:
             self.click(target)
             self.idle(0.18, 0.45)
 
-        for pass_idx in range(backspace_passes):
-            # Ctrl+A — DrissionPage's `actions.key_down/key_up` is the
-            # most portable way to send a chord. Fall back to the
-            # element-level `.input` API if the page doesn't expose it.
+        # ── Step 1 — JS wipe on the element handle ─────────────────────
+        js_wipe = (
+            "this.value = '';"
+            "this.textContent = '';"
+            "this.innerText = '';"
+            "this.dispatchEvent(new Event('input',  { bubbles: true }));"
+            "this.dispatchEvent(new Event('change', { bubbles: true }));"
+        )
+        wiped = False
+        try:
+            target.run_js(js_wipe)  # type: ignore[union-attr]
+            wiped = True
+            logger.info("[behavior] clear_input_field: JS wipe dispatched on element")
+        except Exception as exc:
+            logger.warning(
+                "[behavior] clear_input_field: element-level run_js failed (%s); "
+                "trying page-level injection on document.activeElement",
+                exc,
+            )
+            # Some DrissionPage versions don't expose run_js on the
+            # element handle. Fall through to a page-level eval that
+            # operates on document.activeElement (the field we just
+            # focused above).
             try:
-                actions = self._page.actions
-                actions.key_down("ctrl")
-                self.idle(0.04, 0.12)
-                actions.type("a")
-                self.idle(0.04, 0.12)
-                actions.key_up("ctrl")
+                self._page.run_js(
+                    "var el = document.activeElement;"
+                    "if (el) {"
+                    "  el.value = '';"
+                    "  el.textContent = '';"
+                    "  el.innerText = '';"
+                    "  el.dispatchEvent(new Event('input',  { bubbles: true }));"
+                    "  el.dispatchEvent(new Event('change', { bubbles: true }));"
+                    "}"
+                )
+                wiped = True
+                logger.info("[behavior] clear_input_field: page-level JS wipe dispatched")
+            except Exception as exc2:
+                logger.warning(
+                    "[behavior] clear_input_field: page-level run_js also failed (%s)",
+                    exc2,
+                )
+
+        self.idle(0.12, 0.28)
+
+        # ── Step 2 — verify empty ──────────────────────────────────────
+        residual: str = ""
+        if wiped:
+            try:
+                raw = target.run_js(  # type: ignore[union-attr]
+                    "return (this.value || '') + (this.textContent || '');"
+                )
+                residual = (raw or "").strip()
             except Exception as exc:
                 logger.debug(
-                    "[behavior] Ctrl+A via actions failed (%s); trying element fallback",
+                    "[behavior] clear_input_field: residual read failed (%s); "
+                    "assuming success",
                     exc,
                 )
+                residual = ""
+
+        # ── Step 3 — keystroke fallback if anything remains ────────────
+        if residual:
+            logger.warning(
+                "[behavior] clear_input_field: %d chars remained after JS wipe; "
+                "falling back to Ctrl+A + Backspace",
+                len(residual),
+            )
+            for pass_idx in range(max(1, backspace_passes)):
                 try:
-                    target.input("a", clear=False)  # type: ignore[call-arg]
-                except Exception as exc2:
+                    actions = self._page.actions
+                    actions.key_down("ctrl")
+                    self.idle(0.04, 0.12)
+                    actions.type("a")
+                    self.idle(0.04, 0.12)
+                    actions.key_up("ctrl")
+                except Exception as exc:
                     logger.debug(
-                        "[behavior] element-level Ctrl+A fallback failed (%s); "
-                        "skipping select-all on pass %d",
-                        exc2, pass_idx,
+                        "[behavior] fallback Ctrl+A failed (%s) on pass %d",
+                        exc, pass_idx,
                     )
+                self.idle(0.08, 0.20)
+                try:
+                    self._page.actions.type("\b")  # \b = Backspace
+                except Exception as exc:
+                    logger.debug(
+                        "[behavior] fallback Backspace failed (%s) on pass %d",
+                        exc, pass_idx,
+                    )
+                self.idle(0.10, 0.24)
 
-            self.idle(0.10, 0.28)
-
-            # Backspace — single key, with the same human cadence as typing.
             try:
-                self._page.actions.type("")  #  = Backspace
-            except Exception as exc:
-                logger.debug(
-                    "[behavior] actions.type(Backspace) failed (%s); using ele.input",
-                    exc,
+                raw = target.run_js(  # type: ignore[union-attr]
+                    "return (this.value || '') + (this.textContent || '');"
                 )
-                try:
-                    target.input("", clear=False)  # type: ignore[call-arg]
-                except Exception as exc2:
-                    logger.debug(
-                        "[behavior] Backspace fallback failed (%s); pass %d may have left text",
-                        exc2, pass_idx,
-                    )
+                residual = (raw or "").strip()
+            except Exception:
+                residual = ""
 
-            self.idle(0.12, 0.30)
+        success = not residual
+        if success:
+            logger.info("[behavior] clear_input_field: field wiped clean")
+        else:
+            logger.error(
+                "[behavior] clear_input_field: %d chars STILL present after "
+                "JS + keystroke fallbacks",
+                len(residual),
+            )
+        return success
 
     def type_into(
         self,
