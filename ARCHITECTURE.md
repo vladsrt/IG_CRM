@@ -1,10 +1,22 @@
 # Instagram CRM — Technical Architecture
 
 > Senior-engineering reference for the IG CRM platform.
-> Reflects the post Security & Reliability Sprint state (CRITICAL-1 → 4
-> hardening landed). Read this before adding a new feature, writing a
-> frontend integration, onboarding another agent, or reviewing PRs that
-> touch the worker fleet.
+> Reflects the **post Anti-Detection & React-Hardening Sprint** state
+> (current as of 2026-Q2). The Security & Reliability Sprint
+> (CRITICAL-1 → 4) shipped earlier; on top of that we now have:
+>
+> * Manifest V3 proxy extension with an authenticated `webRequestAuthProvider` listener.
+> * SOCKS-with-credentials auto-downgrade to HTTP (Chrome's MV3 auth callback only fires for HTTP/HTTPS).
+> * `InstagramBrowser` no-proxy branch + fresh `user_data_dir` mode + context manager + orphan-extension sweeper.
+> * Account model gains `platform` + `user_agent` columns; Proxy model gains `protocol`. Migration `9b21f0c4ae37`.
+> * Warmup 2.0 — time-bounded, weighted-random session loop with hardcoded engagement probabilities.
+> * `HumanBehaviorEngine` extensive expansion: smooth-scroll, hover-then-click, JS-clear, navigate_left_rail, comment engagement, etc.
+> * 3-layer modal dismissal (text-button → backdrop click → ESC) shared by every action.
+> * SVG → clickable-parent resolution cascade (`_walk_up_to_clickable`) used everywhere we click an icon.
+> * `test_cli.py` interactive QA harness at the repo root — 7 menu options covering every action plus modal-dismissal verification.
+>
+> Read this before adding a new feature, writing a frontend integration,
+> onboarding another agent, or reviewing PRs that touch the worker fleet.
 
 ---
 
@@ -56,7 +68,8 @@ at signup with `tier="free"`. See [`models/billing.py`](backend/app/models/billi
 | State + persistence | ORM | **SQLAlchemy 2.0 (sync)** | Sync session model maps cleanly onto Celery worker threads; 2.0 typed `Mapped[...]` syntax is mypy-friendly |
 | Schema migrations | Migration tool | **Alembic** | Standard for SQLAlchemy; checked-in under `migrations/` |
 | Browser automation | Driver | **DrissionPage** | Lightweight Chromium control without Selenium grid; supports network listening + raw mouse coordinate moves needed for bezier trajectories |
-| Browser automation | Proxy auth | **Generated MV2 extension** | Authenticated HTTP proxies cannot be configured via Chromium CLI; a per-instance unpacked extension is the only reliable path |
+| Browser automation | Proxy auth | **Generated MV3 extension** (per-instance, unpacked) | Manifest V3 service-worker + `webRequestAuthProvider` permission for the blocking `onAuthRequired` listener. Authenticated HTTP proxies cannot be configured via Chromium CLI; a per-instance unpacked extension is the only reliable path. SOCKS-with-credentials auto-downgrades to HTTP because `webRequestAuthProvider` only fires for HTTP/HTTPS — see [`workers/utils/proxy_builder.py`](backend/workers/utils/proxy_builder.py). |
+| Browser automation | Profile isolation | **`user_data_dir="fresh"` per launch** (test/QA path) | Each launch gets a brand-new ``tempfile.mkdtemp`` profile; deleted on `close()`. Eliminates cross-run leakage of cached proxy decisions, ServiceWorkers, cookies. Production callers can also pin a specific dir for persistent sessions. |
 | AI planning | LLM provider | **OpenAI (`gpt-4o-mini` default)** | Strict Structured Outputs guarantees a Pydantic-validated plan with no JSON parsing in our code path |
 | Media processing | Encoder | **FFmpeg / FFprobe** | Per-clone bitrate jitter, noise filter, metadata stripping for anti-fingerprinting |
 | Password hashing | KDF | **PBKDF2-HMAC-SHA256 (stdlib)** | Zero external dependency for the auth path; replaceable with bcrypt / argon2 |
@@ -214,12 +227,26 @@ state.
 |---|---|---|
 | `User` | Platform tenant | `email` (unique), `hashed_password` (PBKDF2) |
 | `Subscription` | Billing tier | `tier` (`free` / `pro` / `enterprise`), `valid_until` |
-| `InstagramAccount` | One IG identity | `cookies` JSONB, `tags` JSONB (lowercase array), `status` (FSM-ish string) |
-| `Proxy` | Authenticated proxy | rendered as `user:pass@host:port` (no scheme prefix) |
+| `InstagramAccount` | One IG identity | `cookies` JSONB, `tags` JSONB (lowercase array), `status` (FSM-ish string), **`platform`** enum (`windows`/`macos`/`linux`), **`user_agent`** str-512 (auto-pinned at create from the platform-keyed UA pool, never auto-rotated for the lifetime of the row) |
+| `Proxy` | Authenticated proxy | rendered as `protocol://user:pass@host:port`. **`protocol`** enum (`http`/`https`/`socks4`/`socks5`, default `http`) added in migration `9b21f0c4ae37`. |
 | `Task` | Unit of execution | `payload` JSONB (the full ParsedTaskPlan), `status` FSM, `priority` int |
 | `Asset` | Media file on disk | `parent_id` (self-FK for variants), `status` FSM (`raw`/`processing`/`ready`) |
 | `MediaFolder` | Asset grouping | `name` |
 | `AccountMetric` | Time-series metric | `(account_id, metric_type, captured_at)` indexed; rows from network interception |
+
+**UA pool** ([`workers/utils/ua_generator.py`](backend/workers/utils/ua_generator.py)):
+small static `Dict[Platform, List[str]]` of recent stable Chrome UAs.
+Picked once at account creation by `crud.create_account` and persisted in
+`InstagramAccount.user_agent` — pinning is deliberate; rotating UAs
+between sessions is itself a stronger bot signal than picking an
+unfortunate string.
+
+**Migrations:**
+
+| Revision | Adds |
+|---|---|
+| `54c53356ac82_init_db` | initial schema |
+| `9b21f0c4ae37_proxy_protocol_account_platform_ua` | `proxies.protocol`, `instagram_accounts.platform`, `instagram_accounts.user_agent`, plus `CHECK` constraints for the two enums |
 
 **Why sync SQLAlchemy:** Celery workers are thread-pool processes. Sync
 sessions map 1:1 onto worker threads with no `asyncio` event-loop
@@ -241,10 +268,34 @@ CREATE INDEX ix_accounts_tags ON instagram_accounts USING GIN (tags);
 **`InstagramBrowser`** ([`workers/core/browser_core.py`](backend/workers/core/browser_core.py))
 is the lifecycle owner of one Chromium process per task. It:
 
-1. Generates a per-instance unpacked Chrome extension (MV2) for proxy auth
-2. Launches headless Chromium with that extension, custom UA, image-loading disabled
-3. Injects cookies after navigating to `/robots.txt` to set the IG domain context
-4. Tears down both Chromium AND the on-disk extension folder on `close()`
+1. **With proxy** — generates a per-instance unpacked Chrome **Manifest V3** extension (service-worker + `webRequestAuthProvider`) for proxy auth.
+   * SOCKS proxies with credentials are auto-downgraded to HTTP (configurable via `socks_auth_policy`).
+2. **Without proxy** — bypasses extension generation entirely AND
+   forces `--no-proxy-server` on Chromium's command line plus
+   `co.set_proxy("")` to clear DrissionPage's INI-cached proxy. This
+   eliminates the "cached `--proxy-server=` from a previous run leaks
+   into the next launch" failure mode.
+3. Resolves the spoofed User-Agent in priority order:
+   *explicit arg → `account_user_agent` → random pick from the
+   platform-keyed pool → safe Windows default*.
+4. Optional `user_data_dir`:
+   * `None` → DrissionPage default profile.
+   * `"fresh"` → per-launch `tempfile.mkdtemp(prefix="ig_crm_chrome_profile_")`,
+     auto-deleted on `close()`.
+   * any path → use that path (caller owns lifecycle).
+5. Launches headless Chromium with the resolved options.
+6. Injects cookies after navigating to `/robots.txt` to set the IG domain context.
+7. Tears down both Chromium AND the on-disk extension folder
+   (and the owned profile dir, if any) on `close()`.
+
+Plus two ergonomic conveniences:
+
+* **Context-manager protocol** (`with InstagramBrowser(...) as b:`)
+  — guarantees `close()` runs even on exceptions.
+* **`InstagramBrowser.cleanup_orphaned_extensions(root, *, older_than_seconds)`**
+  — janitorial static method that scans for `runtime_proxy_plugin_*`
+  folders left behind by SIGKILLed sessions; safe to schedule via
+  Celery Beat or a worker startup hook.
 
 **`TaskExecutor`** ([`workers/core/executor.py`](backend/workers/core/executor.py))
 owns the per-task pipeline:
@@ -261,9 +312,9 @@ owns the per-task pipeline:
 
 | Action key | Handler | Notes |
 |---|---|---|
-| `warmup` | `execute_warmup` | Randomized feed scroll (low-risk activity) |
-| `upload_reels` / `upload_post` / `upload_story` | `execute_upload` | One handler — IG decides server-side based on duration / aspect ratio |
-| `update_profile` | `execute_update_profile` | Bio, avatar, privacy toggle |
+| `warmup` | `execute_warmup` | **Warmup 2.0** — time-bounded weighted-action loop (`while time.monotonic() < end_time`). Default 15-min session, weighted action choice (60% scroll feed / 15% watch reels / 15% open comments / 10% visit profile). Per-element engagement: 30% chance to like, 45% chance to open comments + engage with 3-4 comments at 60-70% per-comment chance. Aggressive 3-layer modal sweep at start + on every per-tick lookup miss. |
+| `upload_reels` / `upload_post` / `upload_story` | `execute_upload` | One handler — IG decides server-side based on duration / aspect ratio. Uses `navigate_left_rail("create")` (hover-hydrated) → `page.set.upload_files()` interception → `Select from computer` → `Original` crop → caption (with JS-clear) → Share (with in-function modal sweep + JS-click fallback). |
+| `update_profile` | `execute_update_profile` | Bio, avatar, privacy toggle. Avatar-only path persists asynchronously via `Profile photo added.` toast + dialog Cancel — does **not** click the form Submit. Bio (or bio + avatar) path fires Submit + waits for the `Profile saved.` toast. Bio field is wiped via JS injection (`this.value=''; this.textContent=''; dispatchEvent(input)`) because React's controlled input ignores hardware Backspace. |
 
 Adding a handler = one entry in `ACTION_REGISTRY` + a function with
 signature `(browser, args) -> dict`. Handlers must NOT instantiate or
@@ -334,6 +385,92 @@ a signal.
 The engine accepts an optional `rng_seed` constructor argument that seeds
 its `random.Random` instance. Tests get reproducible trajectories;
 production passes `None` (true randomness via `SystemRandom`).
+
+### 5.6 React-state-aware interactions (Anti-Detection Sprint additions)
+
+Instagram's React frontend has two persistent friction points that
+killed naive automation: **decorative SVG icons** (no inherited
+`HTMLElement.click()`, often `pointer-events: none`) and
+**stack-mounted nag modals** that overlay the viewport between any
+two interactions. The engine now ships dedicated handling for both.
+
+#### `_walk_up_to_clickable(svg)` — SVG → wrapping button cascade
+
+Five-layer fallback to find the nearest interactive ancestor of an
+SVG icon, in priority order:
+
+| Layer | What it tries | Catches |
+|---|---|---|
+| 1 | `ele.parent('@role=button')` | IG's standard `<div role="button">` wrappers |
+| 2 | `ele.parent('tag:button')` | Real HTML `<button>` |
+| 3 | `ele.parent('tag:a')` | Anchor wrappers (most left-rail entries) |
+| 4 | `ele.parent(2)` | Bounding-box grandparent (when no role/tag matches) |
+| 5 | `ele.parent(1)` | Immediate parent — near-universal safety net |
+
+Used by `navigate_left_rail` (Create / Reels / Profile / Home / Explore / Search), and indirectly by warmup's `_find_svg_then_parent` helper. Returns `None` only when the element is fully detached.
+
+**Why it matters:** calling `ele.click(by_js=True)` on an `<svg>` throws `TypeError: this.click is not a function` because `SVGElement` doesn't inherit `HTMLElement.click()`. `_ensure_clickable(ele)` runs every JS-mode click target through the cascade first.
+
+#### `dismiss_instagram_modals(page)` — 3-layer modal defense
+
+Standalone module-level helper (importable without an engine instance) and the engine's `dismiss_interruptions()` both delegate to this:
+
+| Layer | What it does | Fires when |
+|---|---|---|
+| **L1 — text-button sweep** | Iterates `_MODAL_DISMISS_SELECTORS`: `Not Now` / `Cancel` / dialog-`Close` / `OK` (`t:` first, XPath fallback). Re-sweeps up to `max_dismissals=3` times to handle stacked modals. | Always |
+| **L2 — backdrop click** | `page.actions.move_to((10, 10))` → `page.actions.click()`. Most IG modals dismiss themselves when their backdrop is clicked. | Only if a `<div role="dialog">` is still on screen after L1 |
+| **L3 — ESC key** | `page.actions.type('\x1b')` → `''` (W3C) → JS-dispatched `KeyboardEvent('keydown', {key:'Escape'})`. | Only if dialog is still present after L2 |
+
+**STRICTLY no class-hash selectors** — IG rotates `_a9--`, `_ap36`, `_a9_1` etc. every couple of months. Every selector matches by visible text, `aria-label`, or DOM role.
+
+**Soft-fail absolute** — every layer is wrapped in try/except. The function never raises; worst case it returns `0` and the caller proceeds.
+
+#### `navigate_left_rail(target)` — hover-hydrate then JS click
+
+Instagram's left rail mounts each entry's React click handler only on the first `mouseenter`. The method:
+
+1. Locates a rail anchor (Home icon by default — always present) and hovers it.
+2. Sleeps `hover_dwell_s=1.0` while React mounts the listeners and the rail labels fade in.
+3. Resolves the target via `_LEFT_RAIL_TARGETS[key]` (parent `<a>` first, SVG last) — supports `"create"`, `"reels"`, `"home"`, `"profile"`, `"explore"`, `"search"`.
+4. Hovers the resolved target itself; sleeps another second.
+5. Runs through `_ensure_clickable` (auto-walks SVG → wrapping button) and dispatches `clickable.click(by_js=True)`. JS click bypasses any invisible hydration overlay that would absorb a coordinate-based click.
+6. Three-tier fallback: JS click → humanized `safe_click` → `safe_click_button` (scroll-into-view).
+
+#### `clear_input_field(target)` — JS-injection wipe
+
+React's controlled-input gate ignores hardware `Backspace` keys whenever its state holds a non-empty value (the keystroke clears the DOM, then React re-renders the old value back on the next tick). The engine now wipes via:
+
+```js
+this.value = '';
+this.textContent = '';
+this.innerText = '';
+this.dispatchEvent(new Event('input',  { bubbles: true }));
+this.dispatchEvent(new Event('change', { bubbles: true }));
+```
+
+Verifies the field is empty afterward; if React still owns the value, falls back to a `Ctrl+A` + `Backspace` keystroke pass. Returns `bool`.
+
+#### `smooth_scroll(min_y, max_y)` — JS-driven scroll
+
+Calls `window.scrollBy({top: y, behavior: 'smooth'})` so Chrome handles easing natively. 15% of scrolls are upward corrections (real users skim forward then back). DrissionPage's `scroll.down(N)` jumps the viewport in a single frame; that's a strong bot signal — the JS path emits the dozens of incremental scroll events a real wheel does.
+
+#### `safe_click(target)`, `safe_click_button(target)`, `hover_then_click(target)`
+
+Three click variants for different contexts:
+
+| Method | When to use |
+|---|---|
+| `safe_click(target)` | General-purpose — hover + 0.2-0.7s pause + click. Returns `bool`, swallows locator errors. |
+| `safe_click_button(target)` | Commit-style buttons (Submit / Save / Share). Calls `target.scroll.to_see(center=True)` first, waits 1s for layout to settle, then clicks. Solves the "Share button rendered below the fold absorbs the click into whatever's at the original coord" bug. |
+| `hover_then_click(target, hover_dwell_range_s=(0.5,1.0))` | Left-rail icons specifically — explicit `mouseenter` event for React hydration, dwell, then click. |
+
+#### Deep-humanization helpers (Warmup 2.0)
+
+| Method | Behaviour |
+|---|---|
+| `deep_scroll_session(duration_s)` | Mixes slow reads, skims, flicks, and upward corrections with weighted dice rolls; returns counters by phase type. |
+| `maybe_like_visible_post(like_probability)` | Locates the visible post's heart icon, walks up to the wrapper, clicks it humanely. Returns whether a like was actually issued. |
+| `browse_comments(open_probability, like_count_range)` | Opens the comments modal, scrolls through reading, likes 0-2 comments, closes. |
 
 ---
 
@@ -829,6 +966,37 @@ celery -A app.core.celery_app.celery_app beat --loglevel=info
 ```
 
 OpenAPI docs at `http://localhost:8000/docs`.
+
+### B.1.1 Local QA harness — `test_cli.py`
+
+For iterating on individual DrissionPage actions WITHOUT booting the
+API + Celery + Postgres + Redis stack, use the interactive CLI at the
+repo root:
+
+```bash
+# From repo root (IG_CRM/)
+python test_cli.py
+```
+
+The script asks for a proxy (optional), protocol, OS platform to
+spoof, then drops into a menu loop. Each test launches a fresh
+`InstagramBrowser` (with `user_data_dir="fresh"` for a clean
+Chromium profile) and tears it down on exit. Failures stay in the
+menu — the CLI never exits on a single test failure.
+
+| Option | Exercises |
+|---|---|
+| `[1] Test Warmup 2.0` | Modal sweep + 30/45/60-70 probabilities + weighted action loop |
+| `[2] Test Update Profile Bio` | Bio path: form Submit + `Profile saved.` toast |
+| `[3] Test Update Avatar` | Avatar-only path: async toast + Cancel-on-dialog (NO Submit) |
+| `[4] Test Upload Media` | `navigate_left_rail("create")` flow, file interception, Share with JS-click fallback |
+| `[5] Test FFmpeg Uniqueization` | No-DB wrapper around `_build_ffmpeg_cmd` + `_run_ffmpeg` |
+| `[6] Test Update Bio + Avatar` | Combined path: avatar dialog cancelled, then bio + Submit fire |
+| `[7] Test Modal Dismissal` | Three sweeps back-to-back so QA can verify L1 → L2 → L3 fallbacks fire |
+| `[0] Exit` | |
+
+`COOKIES`, `MANUAL_USER_AGENT`, and `HEADLESS` are hardcoded constants
+at the top of the file — paste your real session before running.
 
 ### B.2 Deployment checklist
 

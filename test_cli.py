@@ -20,6 +20,50 @@ How to use
        BEFORE Chromium boots so you can sanity-check.
     4. Pick from the numbered menu. The menu loops until [0] Exit.
 
+Behaviour notes for QA
+~~~~~~~~~~~~~~~~~~~~~~
+* **Update Profile** has three distinct code paths the CLI exercises
+  separately:
+    - Bio only           (option 2) — fires the form Submit + waits
+                                      for the "Profile saved." toast.
+    - Avatar only        (option 3) — file injection is asynchronous;
+                                      "Profile photo added." toast +
+                                      Cancel-on-dialog handles persistence.
+                                      Submit is intentionally NOT clicked.
+    - Bio + Avatar       (option 6) — combined: avatar dialog is
+                                      cancelled, then bio + Submit fire.
+* **Upload** uses the left-rail Create flow
+  (``navigate_left_rail("create")``) with mandatory hover-hydration
+  and a 3-layer interruption-modal sweep at the start. The
+  empty-state profile-Reels fallback has been removed.
+* **Warmup 2.0** uses the same left-rail navigation for the Reels
+  tab. Probabilities are hard-pinned: 30% like / 45% open comments /
+  60-70% per-comment × 3-4 attempts. The action loop is
+  time-bounded (``while time.monotonic() < end_time``) with weighted
+  action selection.
+* **Modal dismissal** is a 3-layer defense:
+  L1 = text-button click (Not Now / Cancel / OK / Close);
+  L2 = backdrop click at viewport (10, 10) if a dialog is still
+       present;
+  L3 = ESC key (``\\x1b`` first, then W3C ``\\ue00c``, then a
+       JS-dispatched ``KeyboardEvent``).
+  Option [7] runs three sweeps back-to-back so QA can see all three
+  layers fire in isolation.
+* **SVG clicks** are auto-resolved to their wrapping ``<a>`` /
+  ``<button>`` / ``[role="button"]`` ancestor before any JS click
+  (``_walk_up_to_clickable`` cascade: ``@role=button`` →
+  ``tag:button`` → ``tag:a`` → ``parent(2)`` → ``parent(1)``).
+  This is what makes the New-post left-rail icon clickable
+  reliably — a JS click on the bare SVG throws
+  ``TypeError: this.click is not a function``.
+* **Browser** uses a fresh Chromium ``user_data_dir`` per launch
+  (``user_data_dir="fresh"`` passed to ``InstagramBrowser``), so
+  cached proxy decisions / ServiceWorkers / cookies from previous
+  test runs cannot leak into the current one. The dir is auto-deleted
+  on ``close()``.
+* **FFmpeg uniqueization** runs at the production-locked noise level
+  of 4 (regression-safe, deterministic).
+
 Failure handling
 ~~~~~~~~~~~~~~~~
 Every action call is wrapped in try/except. A failed test prints the
@@ -43,11 +87,10 @@ _BACKEND = os.path.join(_HERE, "backend")
 if _BACKEND not in sys.path:
     sys.path.insert(0, _BACKEND)
 
-from DrissionPage import ChromiumOptions, ChromiumPage  # noqa: E402
-
 from workers.actions.action_update_profile import execute_update_profile  # noqa: E402
 from workers.actions.action_upload import execute_upload  # noqa: E402
 from workers.actions.action_warmup import execute_warmup  # noqa: E402
+from workers.core.behavior import dismiss_instagram_modals  # noqa: E402
 from workers.core.browser_core import InstagramBrowser  # noqa: E402
 from workers.utils.proxy_builder import parse_proxy_url  # noqa: E402
 from workers.utils.ua_generator import (  # noqa: E402
@@ -63,12 +106,54 @@ logger = logging.getLogger(__name__)
 #   Replace the example values below with your real session cookies.
 # ───────────────────────────────────────────────────────────────────────
 COOKIES: List[Dict[str, str]] = [
-    # {"domain": ".instagram.com", "name": "sessionid",  "value": "...", "path": "/"},
-    # {"domain": ".instagram.com", "name": "ds_user_id", "value": "...", "path": "/"},
-    # {"domain": ".instagram.com", "name": "csrftoken",  "value": "...", "path": "/"},
-    # {"domain": ".instagram.com", "name": "datr",       "value": "...", "path": "/"},
-    # {"domain": ".instagram.com", "name": "mid",        "value": "...", "path": "/"},
-    # {"domain": ".instagram.com", "name": "rur",        "value": "...", "path": "/"},
+    {
+        "name": "datr",
+        "value": "hsdvabaLFXims1PZzQrFtubo",
+        "domain": ".instagram.com",
+        "path": "/"
+    },
+    {
+        "name": "ds_user_id",
+        "value": "66998291245",
+        "domain": ".instagram.com",
+        "path": "/"
+    },
+    {
+        "name": "csrftoken",
+        "value": "sljjAJ4xxm6KXrD4r0enyuZCYGvnkuzQ",
+        "domain": ".instagram.com",
+        "path": "/"
+    },
+    {
+        "name": "ig_did",
+        "value": "F9841847-BA9C-405E-947B-9D2D9D937D2C",
+        "domain": ".instagram.com",
+        "path": "/"
+    },
+    {
+        "name": "wd",
+        "value": "1806x967",
+        "domain": ".instagram.com",
+        "path": "/"
+    },
+    {
+        "name": "mid",
+        "value": "aW_HhgAEAAG-A2g3tEgSI9ruSOL7",
+        "domain": ".instagram.com",
+        "path": "/"
+    },
+    {
+        "name": "sessionid",
+        "value": "66998291245%3Aok3FfItZNeROyP%3A14%3AAYhCKuKte0AEzJsE-Ez4aH8-2YY4cQqAKu3Er4V5Qg",
+        "domain": ".instagram.com",
+        "path": "/"
+    },
+    {
+        "name": "rur",
+        "value": "\"LDC\\05466998291245\\0541809865019:01fe6b120c5bfb0d60544e123c0a3e8dc7140f66037453d599e2cfa2e931bca861395676\"",
+        "domain": ".instagram.com",
+        "path": "/"
+    }
 ]
 
 # Optional: paste a UA here to override the platform-pool selection.
@@ -130,33 +215,7 @@ def _redact(proxy_url: str) -> str:
     return f"***@{proxy_url.split('@', 1)[1]}"
 
 
-# ─── Browser facade for the no-proxy path ──────────────────────────────
-class _BrowserFacade:
-    """Duck-types ``InstagramBrowser`` for the no-proxy code path.
-
-    Action handlers only ever read ``browser.page``, so this minimal
-    facade is enough. With a proxy set we use the real
-    ``InstagramBrowser`` (proxy extension and all).
-    """
-
-    def __init__(self, page: ChromiumPage, *, user_agent: str) -> None:
-        self.page = page
-        self.user_agent = user_agent
-
-    def inject_cookies(self, cookies_list: List[Dict[str, str]]) -> None:
-        self.page.get("https://www.instagram.com/robots.txt")
-        time.sleep(1.5)
-        for cookie in cookies_list:
-            self.page.set.cookies(cookie)
-        time.sleep(1.0)
-
-    def close(self) -> None:
-        try:
-            self.page.quit()
-        except Exception as exc:
-            logger.debug("[cli] page.quit() failed (%s)", exc)
-
-
+# ─── Browser launcher ──────────────────────────────────────────────────
 def _resolve_user_agent(platform: Platform) -> str:
     """Manual override > random pick from the platform pool."""
     if MANUAL_USER_AGENT.strip():
@@ -166,7 +225,25 @@ def _resolve_user_agent(platform: Platform) -> str:
 
 def _open_browser(
     proxy: Optional[str], platform: Platform, user_agent: str,
-) -> Any:
+) -> InstagramBrowser:
+    """Single launcher path — no facade, no plain ChromiumPage.
+
+    Both proxy and no-proxy modes go through ``InstagramBrowser``,
+    which handles:
+
+    * Generating the MV3 proxy extension when ``proxy`` is set.
+    * Forcing ``--no-proxy-server`` when ``proxy`` is ``None`` so
+      DrissionPage's stale INI proxy can't leak through.
+    * Clearing DrissionPage's INI-cached proxy via ``set_proxy("")``
+      regardless of branch — prevents the "no tunnel" symptom when
+      DP otherwise injects ``--proxy-server=`` from a previous run.
+    * Pinning a fresh Chromium ``user_data_dir`` per launch so the
+      browser starts against a clean profile (no cached proxy
+      decisions, no leftover ServiceWorker state, no stale cookies).
+
+    All three of those guards landing on every test run is what makes
+    the no-proxy / with-proxy cases reproducible.
+    """
     if not COOKIES:
         print(
             "\n[!] WARNING: COOKIES list is empty — IG will redirect to "
@@ -180,29 +257,22 @@ def _open_browser(
     print(f"  Platform   : {platform.value}")
     print(f"  User-Agent : {user_agent}")
     print(f"  Proxy URL  : {_redact(proxy) if proxy else '(none)'}")
+    print(f"  Profile    : fresh tempdir (per-run)")
     print("─" * 60)
 
-    if proxy:
-        print(f"[*] Launching InstagramBrowser via proxy {_redact(proxy)}…")
-        browser = InstagramBrowser(
-            proxy_string=proxy,
-            user_agent=user_agent,
-            headless=HEADLESS,
-            account_platform=platform.value,
-        )
-        browser.inject_cookies(COOKIES)
-        return browser
-
-    print("[*] No proxy — launching plain ChromiumPage…")
-    co = ChromiumOptions()
-    co.set_user_agent(user_agent)
-    co.set_pref("profile.default_content_setting_values.notifications", 2)
-    co.headless(HEADLESS)
-    page = ChromiumPage(co)
-
-    facade = _BrowserFacade(page, user_agent=user_agent)
-    facade.inject_cookies(COOKIES)
-    return facade
+    print(
+        f"[*] Launching InstagramBrowser ("
+        f"{'proxy=' + _redact(proxy) if proxy else 'no proxy'})…"
+    )
+    browser = InstagramBrowser(
+        proxy_string=proxy,                 # None → no-proxy branch
+        user_agent=user_agent,
+        headless=HEADLESS,
+        account_platform=platform.value,
+        user_data_dir="fresh",              # always start clean in tests
+    )
+    browser.inject_cookies(COOKIES)
+    return browser
 
 
 # ─── FFmpeg uniqueization (standalone, no DB) ──────────────────────────
@@ -269,6 +339,80 @@ def _run_update_avatar(
     try:
         result = execute_update_profile(browser, args={"avatar_path": avatar_path})
         print(f"[+] update avatar result: {result}")
+    finally:
+        browser.close()
+
+
+def _run_update_bio_and_avatar(
+    proxy: Optional[str], platform: Platform, user_agent: str,
+    bio: str, avatar_path: str,
+) -> None:
+    """Exercise the combined bio + avatar path (Submit + save-marker fires).
+
+    Splitting this from the single-field tests is deliberate: the
+    avatar-only branch in ``execute_update_profile`` skips the form
+    Submit entirely, while the combined branch still cancels the
+    Change-Photo dialog and THEN submits the form for the bio. The
+    two paths have completely different failure modes — keep them
+    testable separately.
+    """
+    browser = _open_browser(proxy, platform, user_agent)
+    try:
+        result = execute_update_profile(
+            browser, args={"bio": bio, "avatar_path": avatar_path},
+        )
+        print(f"[+] update bio + avatar result: {result}")
+    finally:
+        browser.close()
+
+
+def _run_modal_dismissal(
+    proxy: Optional[str], platform: Platform, user_agent: str,
+) -> None:
+    """Standalone exercise of ``dismiss_instagram_modals`` against the live feed.
+
+    Loads ``https://www.instagram.com/`` with the configured cookies/
+    proxy/UA, then runs the standalone modal sweep and reports the
+    count. Useful when QA is hunting a specific interstitial — you
+    can manually trigger it by visiting a fresh account, then run
+    this option to confirm the sweep clears it.
+
+    Several sweeps run back-to-back so you can also see whether IG
+    queues a new modal immediately after the first one closes
+    (it sometimes does — "Turn on notifications" → "Save your login
+    info?" within a single render).
+    """
+    browser = _open_browser(proxy, platform, user_agent)
+    try:
+        print("[*] navigating to https://www.instagram.com/ …")
+        browser.page.get("https://www.instagram.com/")
+        time.sleep(5)  # let the feed + any modal render
+
+        # Sweep 1 — full default budget (1.5s per selector).
+        print("[*] sweep 1 (default 1.5s/selector) …")
+        n1 = dismiss_instagram_modals(browser.page)
+        print(f"    → cleared {n1} modal(s)")
+
+        # Pause so any follow-up modal has time to mount.
+        time.sleep(3)
+
+        # Sweep 2 — short timeouts, simulating an in-loop sweep.
+        print("[*] sweep 2 (in-loop 0.5s/selector) …")
+        n2 = dismiss_instagram_modals(
+            browser.page, per_selector_timeout_s=0.5, max_dismissals=2,
+        )
+        print(f"    → cleared {n2} modal(s)")
+
+        # Sweep 3 — give it one more pass after another beat.
+        time.sleep(3)
+        print("[*] sweep 3 …")
+        n3 = dismiss_instagram_modals(browser.page)
+        print(f"    → cleared {n3} modal(s)")
+
+        print(
+            f"\n[+] modal dismissal test complete: total {n1 + n2 + n3} modal(s) "
+            f"dismissed across 3 sweeps"
+        )
     finally:
         browser.close()
 
@@ -360,11 +504,13 @@ _MENU = """
 ─────────────────────────────────────────
   IG-CRM Local Action Test CLI
 ─────────────────────────────────────────
-  [1] Test Warmup 2.0
-  [2] Test Update Profile Bio
-  [3] Test Update Avatar
-  [4] Test Upload Media
+  [1] Test Warmup 2.0                (modal sweep + 30/45/60-70 probs)
+  [2] Test Update Profile Bio        (Submit path)
+  [3] Test Update Avatar             (async, NO Submit)
+  [4] Test Upload Media              (left-rail Create)
   [5] Test FFmpeg Uniqueization
+  [6] Test Update Bio + Avatar       (combined Submit path)
+  [7] Test Modal Dismissal           (standalone sweep verification)
   [0] Exit
 ─────────────────────────────────────────
 """
@@ -415,6 +561,16 @@ def main() -> int:
                 src = _prompt_nonempty("Absolute path to source video")
                 out = _run_ffmpeg_uniqueize(src)
                 print(f"[+] uniqueized → {out}")
+
+            elif choice == "6":
+                bio = _prompt_nonempty("New bio text")
+                avatar_path = _prompt_nonempty("Absolute path to avatar image")
+                _run_update_bio_and_avatar(
+                    proxy, platform, user_agent, bio, avatar_path,
+                )
+
+            elif choice == "7":
+                _run_modal_dismissal(proxy, platform, user_agent)
 
             else:
                 print(f"[!] unknown option {choice!r}")
