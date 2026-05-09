@@ -40,8 +40,13 @@ logger = logging.getLogger(__name__)
 
 
 # ── Tunables ────────────────────────────────────────────────────────────
-_NOISE_STRENGTH_MIN: int = 1
-_NOISE_STRENGTH_MAX: int = 4
+# Noise is locked at 4: anything higher (we'd been bumping up to 12 in
+# the standalone CLI for fingerprint-strength experiments) visibly
+# degrades the output. 4 is the highest value that's still imperceptible
+# on phone playback while still moving every pixel's value enough to
+# defeat byte-level dedup. Random jitter on noise is intentionally gone
+# — keeping it deterministic makes uniqueizer regressions reproducible.
+_NOISE_STRENGTH: int = 4
 _BITRATE_MULTIPLIER_MIN: float = 0.95
 _BITRATE_MULTIPLIER_MAX: float = 1.05
 _PRESETS: list[str] = ["veryfast", "faster", "fast", "medium"]
@@ -208,7 +213,7 @@ def uniqueize_video(
 
             multiplier = random.uniform(_BITRATE_MULTIPLIER_MIN, _BITRATE_MULTIPLIER_MAX)
             jittered_bitrate = max(100_000, int(base_bitrate_bps * multiplier))
-            noise_strength = random.randint(_NOISE_STRENGTH_MIN, _NOISE_STRENGTH_MAX)
+            noise_strength = _NOISE_STRENGTH
             preset = random.choice(_PRESETS)
             fingerprint = uuid.uuid4().hex
 

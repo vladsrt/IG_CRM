@@ -229,7 +229,7 @@ def _run_ffmpeg_uniqueize(input_path: str) -> str:
         input_path=src,
         output_path=out,
         bitrate_bps=settings.FFMPEG_DEFAULT_BITRATE_BPS,
-        noise_strength=12,
+        noise_strength=4,
         preset="medium",
         fingerprint=fingerprint,
     )
