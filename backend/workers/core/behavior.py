@@ -171,6 +171,412 @@ class HumanBehaviorEngine:
             else:
                 raise
 
+    def hover_then_click(
+        self,
+        target: _HasRect,
+        *,
+        hover_dwell_range_s: Tuple[float, float] = (0.5, 1.0),
+        click_after: bool = True,
+    ) -> bool:
+        """Hover the element, wait for any React-driven hydration, then click.
+
+        Why this exists: Instagram's left navigation rail (Home, Search,
+        Explore, Reels, Messages, Notifications, Create, Profile)
+        renders each entry as a stub icon and only mounts the real
+        click handler on the first ``mouseenter`` event. A direct
+        click on the un-hydrated stub either:
+
+        * does nothing (no listener registered yet), OR
+        * hits the wrong target because the rail expands a tooltip
+          panel mid-click and the synthetic event lands on the panel
+          instead of the icon.
+
+        The fix is the human gesture pattern: move the cursor over the
+        icon, dwell briefly while the rail hydrates, *then* click. This
+        is also what real users do — nobody slams a click on a nav
+        icon at 0ms; the cursor pauses for a beat first.
+
+        Args:
+            target: The DrissionPage element to hover over.
+            hover_dwell_range_s: Min/max seconds to dwell after the
+                hover before clicking. The 0.5-1.0s default matches
+                the rail's hydration latency.
+            click_after: If False, only hover + dwell; the caller will
+                issue the click separately. Useful when the click
+                target is a different element that only appears once
+                the hover-rail expands.
+
+        Returns:
+            True iff hover + (optional) click succeeded. Hover errors
+            are logged but never raised — the caller can still try a
+            plain click as a last-ditch fallback.
+        """
+        if hover_dwell_range_s[0] < 0 or hover_dwell_range_s[1] < hover_dwell_range_s[0]:
+            raise ValueError(
+                f"Invalid hover_dwell_range_s: {hover_dwell_range_s}"
+            )
+
+        # Step 1 — bezier-trace the cursor to the element so the
+        # mouseenter event arrives along a real trajectory.
+        try:
+            self.move_to(target)
+        except Exception as exc:
+            logger.warning("[behavior] hover_then_click move_to failed (%s)", exc)
+
+        # Step 2 — fire the explicit hover event. DrissionPage's
+        # ele.hover() dispatches a real mouseenter/mouseover pair the
+        # React rail listens for.
+        try:
+            target.hover()  # type: ignore[union-attr]
+        except Exception as exc:
+            logger.debug(
+                "[behavior] target.hover() failed (%s); relying on move_to mouseenter",
+                exc,
+            )
+
+        # Step 3 — dwell for the rail to hydrate.
+        self.idle(*hover_dwell_range_s)
+
+        if not click_after:
+            return True
+
+        # Step 4 — click. Routed through actions.click() to preserve
+        # the cursor trajectory we just drew.
+        try:
+            self._page.actions.click()
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[behavior] hover_then_click actions.click failed (%s); "
+                "falling back to ele.click",
+                exc,
+            )
+            try:
+                target.click()  # type: ignore[union-attr]
+                return True
+            except Exception as exc2:
+                logger.error(
+                    "[behavior] hover_then_click ele.click also failed (%s)", exc2
+                )
+                return False
+
+    def dismiss_interruptions(
+        self,
+        *,
+        per_selector_timeout_s: float = 1.0,
+        max_dismissals: int = 3,
+        enable_corner_click_fallback: bool = True,
+        enable_escape_fallback: bool = True,
+    ) -> int:
+        """Fast soft-fail sweep for IG's random nag modals; click them away.
+
+        Instagram throws unscheduled interstitials whenever it feels
+        like it: "Turn on notifications", "Message updates", "Add
+        Instagram to your home screen", suggested-people prompts,
+        cookies banners, "Video posts are now shared as reels", etc.
+        Different copy, different DOM, but always one of a small set
+        of dismiss buttons (``Not Now``, ``Cancel``, ``OK``, or a
+        close ``X`` icon inside a ``role="dialog"``).
+
+        Strict rules this sweep follows:
+
+        * **NEVER uses class hashes** like ``_a9--``, ``_ap36``, or
+          ``_a9_1`` — IG rotates those every couple of months, so any
+          locator that depends on them is on borrowed time. Every
+          selector below is text- or aria-attribute-based.
+        * **Soft fail** — every locator and click is wrapped in
+          try/except. This method never raises. If nothing is on
+          screen the sweep just returns ``0``.
+        * **Short timeouts** — default 1s per selector means a clean
+          (no-modal) sweep costs ~7-8s of dead time at worst, but
+          also catches modals that lazy-render up to a second after
+          the page settles.
+        * **Re-sweep after success** — up to ``max_dismissals`` times,
+          since IG often stacks two modals (notification prompt
+          closes → "Save login info?" mounts in the same render).
+
+        Returns:
+            Number of modals actually dismissed.
+        """
+        if max_dismissals < 1:
+            raise ValueError(f"max_dismissals must be >= 1, got {max_dismissals}")
+        if per_selector_timeout_s <= 0:
+            raise ValueError(
+                f"per_selector_timeout_s must be > 0, got {per_selector_timeout_s}"
+            )
+
+        # Delegate to the module-level helper so the 3-layer defense
+        # (text-button sweep → backdrop click at (10, 10) → ESC key)
+        # lives in exactly one place. The engine method exists mostly
+        # to keep the inline call site (``self.dismiss_interruptions()``)
+        # ergonomic for action handlers that already have a behavior
+        # engine in scope.
+        return dismiss_instagram_modals(
+            self._page,
+            per_selector_timeout_s=per_selector_timeout_s,
+            max_dismissals=max_dismissals,
+            enable_corner_click_fallback=enable_corner_click_fallback,
+            enable_escape_fallback=enable_escape_fallback,
+        )
+
+    # ── Left-rail navigation ────────────────────────────────────────────
+    # Selector pool per target. Each target lists fallbacks in priority
+    # order. The svg[aria-label=...] form is the icon at the rail's
+    # collapsed state; the span[normalize-space()=...] form is the
+    # label that appears once the rail expands on hover. Either one
+    # matched is enough.
+    # IG's React router refuses to honor visual-only clicks on the bare
+    # ``<svg>`` icons for Reels (and increasingly other rail entries) —
+    # the click handler is bound to the wrapping ``<a>``, so clicking
+    # the SVG just hits an invisible hydration overlay. We list the
+    # parent ``<a>`` selector FIRST for every target so the resolver
+    # picks the link element, and fall back to the SVG / span only if
+    # the link isn't in the DOM yet. Combined with ``ele.click(by_js=True)``
+    # in :meth:`navigate_left_rail`, this is the only pattern that
+    # consistently survives the overlay.
+    _LEFT_RAIL_TARGETS: Dict[str, list[str]] = {
+        "create": [
+            'xpath://a[contains(@href,"/create/")]',
+            'css:svg[aria-label="New post"]',
+            'xpath://nav//span[normalize-space()="Create"]',
+            'xpath://*[@role="link" or @role="button"][.//span[normalize-space()="Create"]]',
+        ],
+        "reels": [
+            # Parent <a> first — React router only listens here.
+            'xpath://a[contains(@href,"/reels/")]',
+            'css:svg[aria-label="Reels"]',
+            'xpath://nav//span[normalize-space()="Reels"]',
+        ],
+        "home": [
+            'xpath://nav//a[@href="/"]',
+            'css:svg[aria-label="Home"]',
+            'xpath://nav//span[normalize-space()="Home"]',
+        ],
+        "profile": [
+            'xpath://nav//a[@role="link"][.//img[contains(@alt," profile picture")]]',
+            'css:nav img[alt$=" profile picture"]',
+            'xpath://nav//span[normalize-space()="Profile"]',
+        ],
+        "explore": [
+            'xpath://a[contains(@href,"/explore/")]',
+            'css:svg[aria-label="Explore"]',
+            'xpath://nav//span[normalize-space()="Explore"]',
+        ],
+        "search": [
+            'css:svg[aria-label="Search"]',
+            'xpath://nav//span[normalize-space()="Search"]',
+        ],
+    }
+
+    # Selectors for the "rail anchor" we hover first so the rail
+    # hydrates / expands. Home's icon is the single most reliable
+    # element across every IG variant — it's always present and
+    # always the same aria-label.
+    _LEFT_RAIL_ANCHORS: list[str] = [
+        'css:nav[role="navigation"]',
+        'css:svg[aria-label="Home"]',
+        'css:nav svg',
+        'xpath://nav',
+    ]
+
+    def navigate_left_rail(
+        self,
+        target: str,
+        *,
+        hover_dwell_s: float = 1.0,
+        find_timeout_s: float = 6.0,
+    ) -> bool:
+        """Navigate the left rail by hovering it open, then JS-clicking ``target``.
+
+        Why this method exists: Instagram's left navigation rail
+        renders each entry as a stub icon and only mounts the real
+        click handler on the first ``mouseenter`` event on the rail.
+        A direct click on the un-hydrated stub silently no-ops, OR
+        the rail expands a tooltip mid-click and the synthetic event
+        lands on the wrong element.
+
+        On top of that, IG's React router refuses to honor visual-only
+        clicks on the ``<svg>`` icon for Reels (and now most rail
+        entries) — the click handler is bound to the wrapping ``<a>``
+        and an invisible hydration overlay sits on top of the SVG.
+
+        The only pattern that survives both gates:
+
+            1. Hover the rail anchor (Home icon) so React mounts its
+               listeners and the rail expands.
+            2. Sleep ``hover_dwell_s`` (default 1.0s) — React needs the
+               full beat to wire up href-based navigation handlers.
+            3. Hover the *target element itself* and sleep again, so
+               the parent ``<a>`` enters its hydrated/expanded state.
+            4. Click the target via ``ele.click(by_js=True)``. JS click
+               dispatches the click directly on the element rather
+               than at a coordinate, which is what makes it bypass the
+               hydration overlay.
+
+        Supported ``target`` values: ``"create"``, ``"reels"``,
+        ``"home"``, ``"profile"``, ``"explore"``, ``"search"``
+        (case-insensitive). Unknown targets raise ``ValueError``.
+
+        Returns:
+            ``True`` iff a click was actually issued. Hover failures
+            are logged and the method still attempts the click. Click
+            failures and missing targets return ``False`` so the
+            caller (an action handler) can decide whether to abort.
+        """
+        if hover_dwell_s < 0:
+            raise ValueError(f"hover_dwell_s must be >= 0, got {hover_dwell_s}")
+
+        key = (target or "").strip().lower()
+        if key not in self._LEFT_RAIL_TARGETS:
+            raise ValueError(
+                f"unknown left-rail target {target!r}; expected one of "
+                f"{sorted(self._LEFT_RAIL_TARGETS)}"
+            )
+
+        # Step 1 — locate a rail anchor and hover it.
+        anchor: Any = None
+        for sel in self._LEFT_RAIL_ANCHORS:
+            try:
+                anchor = self._page.ele(sel, timeout=1.0)
+            except Exception as exc:
+                logger.debug(
+                    "[behavior] navigate_left_rail anchor %r raised (%s)", sel, exc,
+                )
+                continue
+            if anchor:
+                logger.debug(
+                    "[behavior] navigate_left_rail using anchor %r", sel,
+                )
+                break
+        if anchor is None:
+            logger.warning(
+                "[behavior] navigate_left_rail: no rail anchor found; the rail "
+                "may not be in the DOM yet — proceeding without hover hydration"
+            )
+        else:
+            try:
+                self.move_to(anchor)
+            except Exception as exc:
+                logger.debug(
+                    "[behavior] navigate_left_rail move_to anchor failed (%s)", exc,
+                )
+            try:
+                anchor.hover()  # explicit mouseenter for React
+            except Exception as exc:
+                logger.debug(
+                    "[behavior] navigate_left_rail anchor.hover failed (%s)", exc,
+                )
+
+        # Step 2 — dwell so the rail's React state finishes hydrating
+        # and any expansion animation completes.
+        time.sleep(max(0.0, hover_dwell_s))
+
+        # Step 3 — find the actual target button using the per-key
+        # selector pool, then safe_click it.
+        target_ele: Any = None
+        chosen_sel: Optional[str] = None
+        for sel in self._LEFT_RAIL_TARGETS[key]:
+            try:
+                target_ele = self._page.ele(sel, timeout=find_timeout_s / len(self._LEFT_RAIL_TARGETS[key]))
+            except Exception as exc:
+                logger.debug(
+                    "[behavior] navigate_left_rail target %r raised (%s)", sel, exc,
+                )
+                continue
+            if target_ele:
+                chosen_sel = sel
+                break
+
+        if target_ele is None:
+            logger.error(
+                "[behavior] navigate_left_rail %r: none of %s matched",
+                key, self._LEFT_RAIL_TARGETS[key],
+            )
+            return False
+
+        # ── CRITICAL: resolve SVG → wrapping button BEFORE any JS click.
+        # SVGs don't inherit HTMLElement.click(), so ``ele.click(by_js=True)``
+        # on a ``<svg aria-label="New post">`` throws
+        # ``TypeError: this.click is not a function``. ``_ensure_clickable``
+        # walks up the tree to the nearest ``<a>`` / ``<button>`` /
+        # ``[role="button"]`` ancestor — which is what IG's React router
+        # actually listens on anyway.
+        clickable = _ensure_clickable(target_ele)
+        if clickable is not target_ele:
+            logger.info(
+                "[behavior] navigate_left_rail %r: walked SVG → clickable parent",
+                key,
+            )
+
+        logger.info(
+            "[behavior] navigate_left_rail %r: target resolved via %r — "
+            "preparing JS click",
+            key, chosen_sel,
+        )
+
+        # Step 4a — hover the resolved clickable so the wrapping <a>'s
+        # React handler is fully wired.
+        try:
+            clickable.hover()
+        except Exception as exc:
+            logger.debug(
+                "[behavior] navigate_left_rail %r: clickable.hover() failed (%s); "
+                "proceeding to JS click anyway",
+                key, exc,
+            )
+        time.sleep(1.0)
+
+        # Step 4b — JS click on the wrapping button (NOT the SVG). This
+        # dispatches the click via element.click() in page context,
+        # bypassing the invisible hydration overlay that swallows
+        # coordinate clicks. Safe to call by_js here because
+        # _ensure_clickable guaranteed we're not pointing at an SVG.
+        clicked = False
+        try:
+            # Last-line guard: if the resolver returned the original SVG
+            # (no walkable parent existed) we MUST NOT use by_js — fall
+            # through to the coordinate-click branch instead.
+            tag = (clickable.tag or "").lower() if clickable is not None else ""
+            if tag == "svg":
+                raise TypeError(
+                    "resolved element is still an <svg> — cannot use JS click"
+                )
+            clickable.click(by_js=True)
+            clicked = True
+            logger.info(
+                "[behavior] navigate_left_rail %r: JS click dispatched", key,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[behavior] navigate_left_rail %r: ele.click(by_js=True) failed "
+                "(%s); falling back to safe_click",
+                key, exc,
+            )
+            # Fallback chain — humanized cursor click first, then the
+            # scroll-into-view variant for clipped icons.
+            clicked = self.safe_click(clickable)
+            if not clicked:
+                logger.warning(
+                    "[behavior] navigate_left_rail %r: safe_click failed; "
+                    "trying safe_click_button as last resort",
+                    key,
+                )
+                try:
+                    self.safe_click_button(clickable)
+                    clicked = True
+                except Exception as exc2:
+                    logger.error(
+                        "[behavior] navigate_left_rail %r: every click variant "
+                        "failed (last error: %s)",
+                        key, exc2,
+                    )
+
+        if clicked:
+            # Tiny dwell so any nav-induced page change has a chance to
+            # start before the caller queries the new DOM.
+            self.idle(0.6, 1.4)
+        return clicked
+
     def safe_click_button(
         self,
         target: _HasRect,
@@ -875,6 +1281,483 @@ class HumanBehaviorEngine:
                 # log once and continue. The next move_to may still land.
                 logger.debug("[behavior] mouse move to %s failed (%s)", xy, exc)
             time.sleep(_step_delay(t, base_delay, self._rng))
+
+
+# ── SVG → clickable-parent resolution ───────────────────────────────────
+# Why this exists:
+#
+# IG renders most interactive icons as decorative SVGs wrapped in a
+# clickable element. SVG elements DO NOT inherit ``HTMLElement.click()``
+# — calling ``ele.click(by_js=True)`` on an ``<svg>`` throws
+# ``TypeError: this.click is not a function``. Coordinate clicks on the
+# SVG also frequently fail because the SVG itself has
+# ``pointer-events: none`` (Reels especially) and the click passes
+# through to whatever element is below.
+#
+# The fix is the two-step lookup the QA spec demands:
+#   1. Find the SVG.
+#   2. Walk up to its clickable wrapper (``role="button"`` /
+#      ``<button>`` / ``<a>``).
+#   3. Click the wrapper, never the SVG.
+def _walk_up_to_clickable(ele: Any) -> Any | None:
+    """Walk up from ``ele`` to its nearest clickable ancestor.
+
+    Cascading lookup, in priority order:
+
+        1. ``ele.parent('@role=button', timeout=0)`` — IG's standard
+           ``<div role="button">`` wrapper.
+        2. ``ele.parent('tag:button')`` — real HTML ``<button>``.
+        3. ``ele.parent('tag:a')`` — anchor wrapper (used by most
+           left-rail entries: Home, Reels, Profile, etc.).
+        4. ``ele.parent(2)`` — second-level ancestor; on IG the
+           SVG's grandparent is usually the bounding box that
+           actually receives clicks even when no role/tag matches.
+        5. ``ele.parent(1)`` — immediate parent; near-universal
+           fallback. If the element has any ancestor at all, this
+           wins.
+
+    The numeric fallbacks (4 + 5) exist because IG's left rail
+    sometimes wraps icons in plain ``<div>`` elements with no
+    ``role`` and no link semantics — the older
+    "role=button OR tag:a only" cascade returned ``None`` for those
+    layouts and produced ``no clickable parent`` log lines that
+    blocked the upload flow.
+
+    Returns ``None`` only if every layer fails (which means the
+    element has no parent at all, i.e. it was detached).
+    """
+    if ele is None:
+        return None
+
+    cascade: tuple[tuple[Any, str], ...] = (
+        ("@role=button", "role=button ancestor"),
+        ("tag:button",   "<button> ancestor"),
+        ("tag:a",        "<a> ancestor"),
+        (2,              "parent(2) — bounding box"),
+        (1,              "parent(1) — immediate parent"),
+    )
+
+    for arg, label in cascade:
+        try:
+            # DrissionPage's .parent() takes either an int (level)
+            # OR a locator string (filter). Pass timeout=0 for the
+            # filter path so we don't wait for a parent that
+            # definitely isn't there.
+            if isinstance(arg, int):
+                parent = ele.parent(arg)
+            else:
+                try:
+                    parent = ele.parent(arg, timeout=0)
+                except TypeError:
+                    # Older DP versions don't accept timeout kwarg
+                    # on .parent(); fall back to positional call.
+                    parent = ele.parent(arg)
+        except Exception as exc:
+            logger.debug(
+                "[behavior] _walk_up_to_clickable: %s raised (%s) — trying next layer",
+                label, exc,
+            )
+            continue
+
+        if parent is not None:
+            logger.debug("[behavior] _walk_up_to_clickable matched via %s", label)
+            return parent
+
+    logger.debug("[behavior] _walk_up_to_clickable: every layer returned None")
+    return None
+
+
+def _ensure_clickable(ele: Any) -> Any:
+    """Return ``ele`` if it's already an HTMLElement; otherwise walk up.
+
+    Used immediately before any ``ele.click(by_js=True)`` to guarantee
+    the element actually supports the JS ``.click()`` method. SVGs
+    are auto-resolved to their wrapping button. If no clickable
+    ancestor exists, returns the original SVG (caller should use
+    coordinate click, not JS click).
+    """
+    if ele is None:
+        return None
+    try:
+        tag = (ele.tag or "").lower()
+    except Exception:
+        return ele
+    # Real HTMLElements that already support JS .click()
+    if tag in ("button", "a", "div", "span", "li"):
+        return ele
+    # SVG (or anything else exotic) → walk up
+    walked = _walk_up_to_clickable(ele)
+    return walked if walked is not None else ele
+
+
+# ── Standalone helpers (no HumanBehaviorEngine instance required) ───────
+# Locator pool for ``dismiss_instagram_modals`` — kept module-level so
+# both the engine method and the standalone function read from the
+# same source of truth. STRICTLY no class-hash selectors (``_a9--``,
+# etc.) — IG rotates those every few months and any locator that
+# depends on them rots fast.
+_MODAL_DISMISS_SELECTORS: Tuple[str, ...] = (
+    # "Not Now" — Turn on Notifications, Save login info?, etc.
+    't:button@text()=Not Now',
+    't:button@text()=Not now',
+    'xpath://button[normalize-space()="Not Now"]',
+    'xpath://button[normalize-space()="Not now"]',
+    'xpath://*[@role="button" and normalize-space()="Not Now"]',
+    'xpath://*[@role="button" and normalize-space()="Not now"]',
+    # Generic Cancel inside a dialog.
+    't:button@text()=Cancel',
+    'xpath://div[@role="dialog"]//button[normalize-space()="Cancel"]',
+    'xpath://div[@role="dialog"]//*[@role="button" and normalize-space()="Cancel"]',
+    # Close (X) inside a dialog.
+    'xpath://div[@role="dialog"]//*[@aria-label="Close"]',
+    'xpath://div[@role="dialog"]//svg[@aria-label="Close"]',
+    # "OK" — informational acknowledgement modals.
+    't:button@text()=OK',
+    'xpath://button[normalize-space()="OK"]',
+    'xpath://div[@role="button" and normalize-space()="OK"]',
+)
+
+
+def _modal_still_present(page: Any, *, timeout: float = 0.3) -> bool:
+    """Return True if a ``<div role="dialog">`` is still on screen."""
+    try:
+        d = page.ele('xpath://div[@role="dialog"]', timeout=timeout)
+        return d is not None
+    except Exception:
+        return False
+
+
+def _click_empty_corner(page: Any, *, x: int = 10, y: int = 10) -> bool:
+    """Layer-2 fallback: click an "empty" coordinate to dismiss overlays.
+
+    Many IG modals dismiss themselves when their backdrop is clicked.
+    Coordinate (10, 10) sits at the top-left of the viewport — typically
+    on the modal's backdrop layer (or at worst on the edge of the left
+    rail nav). The click is wrapped so it can never raise.
+    """
+    try:
+        # DP's actions API: move first, then click. Some DP versions
+        # accept a (x, y) tuple to move_to; others require keyword args.
+        try:
+            page.actions.move_to((x, y), duration=0)
+        except TypeError:
+            page.actions.move_to(x, y)  # alt signature
+        page.actions.click()
+        time.sleep(0.4)
+        return True
+    except Exception as exc:
+        logger.debug("[behavior] _click_empty_corner(%d,%d) failed (%s)", x, y, exc)
+        return False
+
+
+def _press_escape(page: Any) -> bool:
+    """Layer-3 fallback: send the ESC key to force-close any dialog.
+
+    Tries three escape mechanisms in order, since DrissionPage
+    versions differ on which sequence the ``actions.type`` API
+    accepts:
+
+        1. ``"\\x1b"`` — ASCII ESC (the form the QA spec calls for
+           explicitly: ``page.actions.type('\\x1b')``).
+        2. ``"\\ue00c"`` — W3C WebDriver ESC codepoint, used by some
+           DP versions internally.
+        3. ``page.run_js`` dispatching a synthetic ``keydown`` event
+           with ``key='Escape'`` — last resort that works in a live
+           page even when the actions API is broken (e.g. a CDP
+           session got into a weird state).
+    """
+    for esc_form, label in (("\x1b", "ASCII \\x1b ESC"), ("\ue00c", "W3C \\ue00c ESC")):
+        try:
+            page.actions.type(esc_form)
+            time.sleep(0.4)
+            logger.info("[behavior] dismissed via %s key", label)
+            return True
+        except Exception as exc:
+            logger.debug("[behavior] _press_escape via %s failed (%s)", label, exc)
+
+    # JS keyboard event dispatch — last resort.
+    try:
+        page.run_js(
+            "document.dispatchEvent(new KeyboardEvent('keydown', "
+            "{key:'Escape',code:'Escape',keyCode:27,which:27,bubbles:true}));"
+            "document.dispatchEvent(new KeyboardEvent('keyup', "
+            "{key:'Escape',code:'Escape',keyCode:27,which:27,bubbles:true}));"
+        )
+        time.sleep(0.4)
+        logger.info("[behavior] dismissed via JS-dispatched Escape event")
+        return True
+    except Exception as exc:
+        logger.debug("[behavior] _press_escape via JS dispatch failed (%s)", exc)
+        return False
+
+
+def dismiss_instagram_modals(
+    page: Any,
+    *,
+    per_selector_timeout_s: float = 1.5,
+    max_dismissals: int = 3,
+    post_click_settle_s: float = 0.6,
+    enable_corner_click_fallback: bool = True,
+    enable_escape_fallback: bool = True,
+) -> int:
+    """Three-layer soft-fail defense against IG's nag / onboarding modals.
+
+    Layered approach (each layer only runs if the previous one didn't
+    fully clear the modal):
+
+        **Layer 1 — text-button sweep.** Look for ``Not Now`` /
+        ``Cancel`` / ``OK`` / dialog-scoped ``Close`` icons via the
+        :data:`_MODAL_DISMISS_SELECTORS` pool. Click each one found,
+        re-sweeping up to ``max_dismissals`` times in case modals
+        stack. This is the path that handles 95% of cases.
+
+        **Layer 2 — backdrop click.** If a ``<div role="dialog">`` is
+        still on screen after Layer 1 (meaning React intercepted the
+        button clicks, or the button's text moved), simulate a click
+        at coordinate (10, 10). Most IG modals dismiss themselves
+        when their backdrop is clicked.
+
+        **Layer 3 — ESC key.** If a dialog is STILL present after
+        Layer 2, send the Escape key (W3C ``\\ue00c`` first, then
+        ASCII ``\\x1b``, then a JS-dispatched ``keydown`` event).
+
+    Every layer is wrapped in try/except. This function never raises.
+
+    Returns:
+        Number of modals dismissed via Layer 1's text-button clicks.
+        Layer 2 / Layer 3 dismissals are NOT counted here (they're
+        last-resort guards, not the canonical path) but ARE logged.
+    """
+    if max_dismissals < 1 or per_selector_timeout_s <= 0 or post_click_settle_s < 0:
+        logger.warning(
+            "[behavior] dismiss_instagram_modals: invalid args "
+            "(per_selector=%.2f, max=%d, settle=%.2f) — no-op",
+            per_selector_timeout_s, max_dismissals, post_click_settle_s,
+        )
+        return 0
+
+    # ── Layer 1: text-button sweep ────────────────────────────────────
+    dismissed = 0
+    for sweep_idx in range(max_dismissals):
+        clicked_this_pass = False
+        for sel in _MODAL_DISMISS_SELECTORS:
+            try:
+                ele = page.ele(sel, timeout=per_selector_timeout_s)
+            except Exception as exc:
+                logger.debug(
+                    "[behavior] L1 selector %r lookup raised (%s) — skipping",
+                    sel, exc,
+                )
+                continue
+            if not ele:
+                continue
+
+            logger.info(
+                "[behavior] L1 sweep #%d: clicking %r", sweep_idx + 1, sel,
+            )
+            try:
+                ele.click()
+            except Exception as exc:
+                logger.debug(
+                    "[behavior] L1 click on %r failed (%s) — continuing", sel, exc,
+                )
+                continue
+
+            dismissed += 1
+            clicked_this_pass = True
+            try:
+                time.sleep(post_click_settle_s)
+            except Exception:
+                pass
+            break  # restart selector sweep from the top
+
+        if not clicked_this_pass:
+            break
+
+    if dismissed:
+        logger.info("[behavior] L1 cleared %d modal(s) via text buttons", dismissed)
+
+    # ── Layer 2: backdrop click ───────────────────────────────────────
+    # Only fires if a dialog is STILL on screen after Layer 1.
+    if enable_corner_click_fallback and _modal_still_present(page):
+        logger.warning(
+            "[behavior] modal still present after L1 — engaging L2 backdrop click"
+        )
+        if _click_empty_corner(page, x=10, y=10):
+            logger.info("[behavior] L2 backdrop click dispatched at (10, 10)")
+
+    # ── Layer 3: ESC key ──────────────────────────────────────────────
+    if enable_escape_fallback and _modal_still_present(page):
+        logger.warning(
+            "[behavior] modal still present after L2 — engaging L3 ESC key"
+        )
+        _press_escape(page)
+
+    if not dismissed:
+        logger.debug("[behavior] dismiss_instagram_modals: nothing to dismiss via L1")
+    return dismissed
+
+
+# ── Verified coordinate click (module-level, importable) ────────────────
+
+class ClickVerificationError(RuntimeError):
+    """Raised when safe_coordinate_click exhausts all retries without
+    the verify_locator confirming the click took effect."""
+
+
+def safe_coordinate_click(
+    page: Any,
+    locator_string: str,
+    timeout: float = 2,
+    *,
+    verify_locator: Optional[str] = None,
+    verify_disappear: bool = False,
+    max_retries: int = 3,
+    verify_timeout: float = 3.0,
+) -> bool:
+    """Find element, scroll into viewport center, click at physical midpoint.
+
+    This is the MANDATORY interaction pattern for Instagram's React SPA.
+    Standard DOM clicks fail because IG uses invisible overlays,
+    pointer-events:none SVGs, and React state-locked buttons.
+
+    **Paranoid State Checking** — if ``verify_locator`` is provided, the
+    click is retried up to ``max_retries`` times. After each click
+    attempt the helper waits up to ``verify_timeout`` seconds for the
+    verification element to appear (or disappear, if
+    ``verify_disappear=True``). Only when verification succeeds does the
+    helper return ``True``.
+
+    Args:
+        page: DrissionPage ``ChromiumPage`` instance.
+        locator_string: Selector for the element to click.
+        timeout: Seconds to wait for the click-target element.
+        verify_locator: Optional selector that MUST appear (or disappear)
+            after the click for it to count as successful.
+        verify_disappear: If ``True``, verification succeeds when
+            ``verify_locator`` is NOT found (element disappeared).
+        max_retries: Number of click attempts before giving up.
+        verify_timeout: Seconds to wait for the verification check.
+
+    Returns:
+        ``True`` if the click (and optional verification) succeeded.
+
+    Raises:
+        ClickVerificationError: If ``verify_locator`` was provided and
+            all retries failed verification.
+    """
+    # Step 1 — locate the target element once.
+    try:
+        ele = page.ele(locator_string, timeout=timeout)
+        if not ele:
+            logger.debug(
+                "[behavior] safe_coordinate_click: element not found for %r",
+                locator_string,
+            )
+            return False
+    except Exception as exc:
+        logger.debug(
+            "[behavior] safe_coordinate_click: locate failed for %r: %s",
+            locator_string, exc,
+        )
+        return False
+
+    # Step 2 — retry loop.
+    for attempt in range(1, max_retries + 1):
+        try:
+            ele.scroll.to_see(center=True)
+            time.sleep(0.5)  # Let React render after scroll
+
+            x, y = ele.rect.midpoint
+            page.actions.move_to((x, y)).click()
+            logger.debug(
+                "[behavior] safe_coordinate_click: click #%d at (%d, %d) for %r",
+                attempt, x, y, locator_string,
+            )
+        except Exception as exc:
+            logger.debug(
+                "[behavior] safe_coordinate_click: click #%d failed for %r: %s",
+                attempt, locator_string, exc,
+            )
+            if attempt < max_retries:
+                time.sleep(1.0)
+                # Re-locate in case the element shifted.
+                try:
+                    ele = page.ele(locator_string, timeout=timeout)
+                    if not ele:
+                        continue
+                except Exception:
+                    continue
+            continue
+
+        # Step 3 — verify (if requested).
+        if verify_locator is None:
+            return True  # No verification needed — assume success.
+
+        verified = _check_verification(
+            page, verify_locator, verify_disappear, verify_timeout,
+        )
+        if verified:
+            logger.info(
+                "[behavior] safe_coordinate_click: verified on attempt #%d "
+                "(verify=%r, disappear=%s)",
+                attempt, verify_locator, verify_disappear,
+            )
+            return True
+
+        logger.warning(
+            "[behavior] safe_coordinate_click: verification FAILED on attempt "
+            "#%d/%d (verify=%r, disappear=%s)",
+            attempt, max_retries, verify_locator, verify_disappear,
+        )
+        if attempt < max_retries:
+            time.sleep(1.0)
+            # Re-locate in case React re-rendered the target.
+            try:
+                ele = page.ele(locator_string, timeout=timeout)
+                if not ele:
+                    logger.debug(
+                        "[behavior] safe_coordinate_click: target vanished "
+                        "before retry #%d",
+                        attempt + 1,
+                    )
+            except Exception:
+                pass
+
+    # All retries exhausted.
+    if verify_locator is not None:
+        raise ClickVerificationError(
+            f"Click verification failed after {max_retries} attempts: "
+            f"target={locator_string!r}, verify={verify_locator!r}, "
+            f"disappear={verify_disappear}"
+        )
+    return False
+
+
+def _check_verification(
+    page: Any,
+    verify_locator: str,
+    verify_disappear: bool,
+    verify_timeout: float,
+) -> bool:
+    """Poll for the verify_locator to appear or disappear."""
+    deadline = time.monotonic() + verify_timeout
+    while time.monotonic() < deadline:
+        try:
+            found = page.ele(verify_locator, timeout=0.5)
+        except Exception:
+            found = None
+
+        if verify_disappear:
+            if not found:
+                return True  # Element is gone — success.
+        else:
+            if found:
+                return True  # Element appeared — success.
+
+        time.sleep(0.3)
+
+    return False
 
 
 # ── Pure functions (easy to unit-test, no side effects) ─────────────────
