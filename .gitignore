@@ -234,3 +234,4 @@ backend/browser_profiles/
 # System files for Mac/Windows (just in case)
 .DS_Store
 Thumbs.dbmedia/
+media/
