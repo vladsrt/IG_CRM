@@ -63,6 +63,7 @@ _DEFAULT_STEP_TIMEOUT_S: float = 20.0
 _AVATAR_PROCESS_WAIT_RANGE_S: tuple[float, float] = (3.0, 4.5)
 _SAVE_MARKER_TIMEOUT_S: float = 30.0
 _SAVE_POLL_INTERVAL_S: float = 1.5
+_AVATAR_CROP_MODAL_TIMEOUT_S: float = 15.0
 
 
 # ── Errors ──────────────────────────────────────────────────────────────
@@ -209,6 +210,89 @@ def _set_avatar(
     # the form; give it a beat that scales like a human "did it work?" wait.
     behavior.idle(*_AVATAR_PROCESS_WAIT_RANGE_S)
 
+    # ── Crop / adjust modal ─────────────────────────────────────────────
+    # Recent IG rollouts always interrupt the avatar flow with a
+    # crop/zoom/preview modal. The "Profile saved" toast NEVER fires
+    # while that modal is open — the script used to hang waiting for
+    # the toast and time out. We now wait for the modal and click its
+    # commit button (Save / Done / Apply) before letting the caller
+    # proceed to the main /accounts/edit/ Submit + toast wait.
+    _confirm_avatar_crop_modal(browser, behavior)
+
+
+def _confirm_avatar_crop_modal(
+    browser: InstagramBrowser, behavior: HumanBehaviorEngine
+) -> bool:
+    """Click Save/Done inside the avatar crop modal if present.
+
+    The modal label has flipped between "Save", "Done", and "Apply" in
+    different IG variants — we hunt for any of them inside a
+    ``role="dialog"``. Absence of the modal is NOT a failure: some
+    accounts (especially fresh ones) skip the crop step entirely and
+    go straight to a saved avatar. So this returns ``bool`` and never
+    raises.
+
+    Returns:
+        ``True`` iff a commit button was found and clicked.
+    """
+    deadline = time.monotonic() + _AVATAR_CROP_MODAL_TIMEOUT_S
+    commit_selectors: list[str] = [
+        # Prefer scoped-to-dialog matches so we don't mis-click the
+        # main edit-profile Submit while it's also on screen.
+        'xpath://div[@role="dialog"]//button[normalize-space()="Save"]',
+        'xpath://div[@role="dialog"]//button[normalize-space()="Done"]',
+        'xpath://div[@role="dialog"]//button[normalize-space()="Apply"]',
+        'xpath://div[@role="dialog"]//*[@role="button" and normalize-space()="Save"]',
+        'xpath://div[@role="dialog"]//*[@role="button" and normalize-space()="Done"]',
+        'xpath://div[@role="dialog"]//*[@role="button" and normalize-space()="Apply"]',
+        # Last-ditch global match (covers IG variants where the crop
+        # surface isn't role="dialog").
+        'xpath://button[normalize-space()="Save"]',
+        'xpath://*[@role="button" and normalize-space()="Done"]',
+    ]
+
+    modal_btn = None
+    while time.monotonic() < deadline:
+        modal_btn = _find_first(browser.page, commit_selectors, timeout=2.0)
+        if modal_btn is not None:
+            break
+        time.sleep(0.5)
+
+    if modal_btn is None:
+        # No modal — that's fine. Most accounts hit it, but some don't,
+        # and we don't want a missing modal to fail the whole action.
+        logger.info(
+            "[update_profile] no avatar crop modal appeared within %ds — "
+            "assuming IG skipped the crop step",
+            int(_AVATAR_CROP_MODAL_TIMEOUT_S),
+        )
+        return False
+
+    logger.info("[update_profile] avatar crop modal detected; clicking commit")
+    try:
+        behavior.safe_click_button(modal_btn)
+    except Exception as exc:
+        # Don't propagate — fall back to a plain click. If THAT also
+        # fails the toast wait will surface it as a clear timeout.
+        logger.warning(
+            "[update_profile] safe_click_button on crop modal failed (%s); "
+            "trying plain click",
+            exc,
+        )
+        try:
+            modal_btn.click()
+        except Exception as exc2:
+            logger.error(
+                "[update_profile] avatar crop modal commit click failed entirely (%s)",
+                exc2,
+            )
+            return False
+
+    # Give IG a beat to dismiss the modal and re-render the form before
+    # the next step (which is the main Submit click).
+    behavior.idle(1.0, 2.0)
+    return True
+
 
 def _set_bio(
     browser: InstagramBrowser,
@@ -229,9 +313,18 @@ def _set_bio(
 
     # Robust clear: DrissionPage's `.clear()` silently no-ops on the
     # contenteditable bio variant, which causes typed text to append.
-    # `behavior.clear_input_field` does focus → Ctrl+A → Backspace with
-    # human-like delays, which works across input/textarea/contenteditable.
-    behavior.clear_input_field(bio_field, backspace_passes=2)
+    # `behavior.clear_input_field` now wipes the field via JS (the only
+    # reliable path through React's controlled-input gate) and falls
+    # back to keystrokes if React owns the value. Returns False iff the
+    # field is still non-empty after both attempts — in that case
+    # typing the new bio would *append*, which is the bug we want
+    # to surface, not paper over.
+    cleared = behavior.clear_input_field(bio_field, backspace_passes=2)
+    if not cleared:
+        raise ProfileActionError(
+            "bio field could not be cleared (JS + Ctrl+A/Backspace both failed) — "
+            "typing the new bio would append to existing text; aborting"
+        )
 
     # Re-focus before typing — clear_input_field already focuses, but a
     # fresh click ensures the caret is at the start on stubborn fields.
