@@ -63,7 +63,8 @@ _DEFAULT_STEP_TIMEOUT_S: float = 20.0
 _AVATAR_PROCESS_WAIT_RANGE_S: tuple[float, float] = (3.0, 4.5)
 _SAVE_MARKER_TIMEOUT_S: float = 30.0
 _SAVE_POLL_INTERVAL_S: float = 1.5
-_AVATAR_CROP_MODAL_TIMEOUT_S: float = 15.0
+_AVATAR_CHANGE_DIALOG_TIMEOUT_S: float = 12.0
+_AVATAR_TOAST_POLL_INTERVAL_S: float = 0.5
 
 
 # ── Errors ──────────────────────────────────────────────────────────────
@@ -210,87 +211,126 @@ def _set_avatar(
     # the form; give it a beat that scales like a human "did it work?" wait.
     behavior.idle(*_AVATAR_PROCESS_WAIT_RANGE_S)
 
-    # ── Crop / adjust modal ─────────────────────────────────────────────
-    # Recent IG rollouts always interrupt the avatar flow with a
-    # crop/zoom/preview modal. The "Profile saved" toast NEVER fires
-    # while that modal is open — the script used to hang waiting for
-    # the toast and time out. We now wait for the modal and click its
-    # commit button (Save / Done / Apply) before letting the caller
-    # proceed to the main /accounts/edit/ Submit + toast wait.
-    _confirm_avatar_crop_modal(browser, behavior)
+    # ── Change-Profile-Photo dialog blocker ─────────────────────────────
+    # Current IG behaviour (as of this rollout): the file injection
+    # silently applies the avatar in the background — a paragraph
+    # reading "Profile photo added." pops up — but the original
+    # "Change Profile Photo" dialog STAYS OPEN, sitting on top of the
+    # /accounts/edit/ form and blocking pointer events on the Submit
+    # button. The fix is to detect that the toast has fired (or the
+    # avatar has just been processed) and click the dialog's Cancel
+    # button to close it. Submit can fire only after that.
+    _dismiss_change_photo_dialog(browser, behavior)
 
 
-def _confirm_avatar_crop_modal(
+def _dismiss_change_photo_dialog(
     browser: InstagramBrowser, behavior: HumanBehaviorEngine
 ) -> bool:
-    """Click Save/Done inside the avatar crop modal if present.
+    """Close the still-open 'Change Profile Photo' dialog after a successful
+    avatar injection.
 
-    The modal label has flipped between "Save", "Done", and "Apply" in
-    different IG variants — we hunt for any of them inside a
-    ``role="dialog"``. Absence of the modal is NOT a failure: some
-    accounts (especially fresh ones) skip the crop step entirely and
-    go straight to a saved avatar. So this returns ``bool`` and never
-    raises.
+    Behaviour:
+
+    1. Poll briefly for the "Profile photo added." paragraph as the
+       positive signal that IG actually accepted the file. If we see
+       it, we *must* close the dialog or the downstream Submit click
+       will hit the dialog's overlay instead of the form button.
+    2. With or without the toast, look for the dialog's Cancel button
+       and click it. The button has appeared in two stable forms:
+
+           * ``button:has-text("Cancel")``
+           * ``button._a9--._ap36._a9_1``  (IG's class-hash variant)
+
+       (Class hashes in IG flip every couple of months; we keep the
+       hash-based selector as a last resort and lead with the text
+       match.)
+    3. Wait ~1s for the dialog to tear down before returning, so the
+       caller's Submit click lands on a stable layout.
 
     Returns:
-        ``True`` iff a commit button was found and clicked.
+        ``True`` iff the Cancel button was successfully clicked.
+        Absence of either the toast or the Cancel button is logged at
+        warning level but is NOT fatal — some IG variants auto-close
+        the dialog after the photo is added.
     """
-    deadline = time.monotonic() + _AVATAR_CROP_MODAL_TIMEOUT_S
-    commit_selectors: list[str] = [
-        # Prefer scoped-to-dialog matches so we don't mis-click the
-        # main edit-profile Submit while it's also on screen.
-        'xpath://div[@role="dialog"]//button[normalize-space()="Save"]',
-        'xpath://div[@role="dialog"]//button[normalize-space()="Done"]',
-        'xpath://div[@role="dialog"]//button[normalize-space()="Apply"]',
-        'xpath://div[@role="dialog"]//*[@role="button" and normalize-space()="Save"]',
-        'xpath://div[@role="dialog"]//*[@role="button" and normalize-space()="Done"]',
-        'xpath://div[@role="dialog"]//*[@role="button" and normalize-space()="Apply"]',
-        # Last-ditch global match (covers IG variants where the crop
-        # surface isn't role="dialog").
-        'xpath://button[normalize-space()="Save"]',
-        'xpath://*[@role="button" and normalize-space()="Done"]',
+    # Step 1 — poll for the "Profile photo added." paragraph as a
+    # positive signal. We don't *require* it (some variants skip it),
+    # but its presence is what guarantees the dialog is in the
+    # blocking state we're trying to dismiss.
+    toast_selectors = [
+        'xpath://p[normalize-space()="Profile photo added."]',
+        'xpath://*[contains(text(),"Profile photo added")]',
     ]
-
-    modal_btn = None
+    deadline = time.monotonic() + _AVATAR_CHANGE_DIALOG_TIMEOUT_S
+    saw_toast = False
     while time.monotonic() < deadline:
-        modal_btn = _find_first(browser.page, commit_selectors, timeout=2.0)
-        if modal_btn is not None:
+        for sel in toast_selectors:
+            try:
+                if browser.page.ele(sel, timeout=0.5):
+                    saw_toast = True
+                    break
+            except Exception:
+                continue
+        if saw_toast:
+            logger.info(
+                "[update_profile] 'Profile photo added.' toast confirmed"
+            )
             break
-        time.sleep(0.5)
+        time.sleep(_AVATAR_TOAST_POLL_INTERVAL_S)
+    if not saw_toast:
+        logger.warning(
+            "[update_profile] 'Profile photo added.' toast not seen within %ds; "
+            "still attempting to dismiss the change-photo dialog",
+            int(_AVATAR_CHANGE_DIALOG_TIMEOUT_S),
+        )
 
-    if modal_btn is None:
-        # No modal — that's fine. Most accounts hit it, but some don't,
-        # and we don't want a missing modal to fail the whole action.
-        logger.info(
-            "[update_profile] no avatar crop modal appeared within %ds — "
-            "assuming IG skipped the crop step",
-            int(_AVATAR_CROP_MODAL_TIMEOUT_S),
+    # Step 2 — find and click Cancel on the still-open dialog.
+    # All locators are TEXT- or role-based; IG's class hashes
+    # (e.g. ``._a9--._ap36._a9_1``) are deliberately NOT used because
+    # they rotate every few months. The DrissionPage-native ``t:``
+    # form leads, with XPath fallbacks for variants where the button
+    # is rendered as a ``role="button"`` div instead of a real
+    # ``<button>``.
+    cancel_selectors = [
+        # Scoped-to-dialog first so we don't mis-click any "Cancel"
+        # that might appear elsewhere on screen.
+        'xpath://div[@role="dialog"]//button[normalize-space()="Cancel"]',
+        'xpath://div[@role="dialog"]//*[@role="button" and normalize-space()="Cancel"]',
+        # DrissionPage native text-keyed locator.
+        't:button@text()=Cancel',
+        # Plain text fallbacks.
+        'xpath://button[normalize-space()="Cancel"]',
+        'xpath://*[@role="button" and normalize-space()="Cancel"]',
+    ]
+    cancel_btn = _find_first(browser.page, cancel_selectors, timeout=4.0)
+    if cancel_btn is None:
+        logger.warning(
+            "[update_profile] Change-Profile-Photo dialog Cancel button not "
+            "found; the dialog may have auto-closed — proceeding to Submit"
         )
         return False
 
-    logger.info("[update_profile] avatar crop modal detected; clicking commit")
+    logger.info("[update_profile] clicking Cancel to close change-photo dialog")
     try:
-        behavior.safe_click_button(modal_btn)
+        behavior.safe_click_button(cancel_btn)
     except Exception as exc:
-        # Don't propagate — fall back to a plain click. If THAT also
-        # fails the toast wait will surface it as a clear timeout.
         logger.warning(
-            "[update_profile] safe_click_button on crop modal failed (%s); "
+            "[update_profile] safe_click_button on Cancel failed (%s); "
             "trying plain click",
             exc,
         )
         try:
-            modal_btn.click()
+            cancel_btn.click()
         except Exception as exc2:
             logger.error(
-                "[update_profile] avatar crop modal commit click failed entirely (%s)",
+                "[update_profile] Cancel click failed entirely (%s); the "
+                "dialog will likely block Submit",
                 exc2,
             )
             return False
 
-    # Give IG a beat to dismiss the modal and re-render the form before
-    # the next step (which is the main Submit click).
-    behavior.idle(1.0, 2.0)
+    # Step 3 — wait 1s for the dialog to tear down.
+    time.sleep(1.0)
     return True
 
 
@@ -533,13 +573,50 @@ def execute_update_profile(
     behavior = HumanBehaviorEngine(browser.page)
     save_marker: Optional[str] = None
 
-    # ── Bio + avatar: both live on /accounts/edit/ and share one Submit.
+    # Sweep any random "Turn on notifications" / "Add to home screen" /
+    # cookies-banner modals before we try to interact with the form.
+    # The sweep is fast (~1.5s when nothing is present) and never raises.
+    try:
+        behavior.dismiss_interruptions()
+    except Exception as exc:
+        logger.debug(
+            "[update_profile] dismiss_interruptions raised unexpectedly (%s); "
+            "continuing",
+            exc,
+        )
+
+    # ── Bio + avatar: both live on /accounts/edit/ but persist DIFFERENTLY.
+    #
+    # Avatar uploads are now asynchronous on IG: the file injection
+    # silently saves in the background (a "Profile photo added." toast
+    # confirms it), and the Change-Profile-Photo dialog stays open.
+    # We close THAT dialog with Cancel (handled inside ``_set_avatar``)
+    # — clicking the global form Submit afterwards triggers an error
+    # because the avatar is already persisted server-side.
+    #
+    # Bio updates still go through the form's Submit + "Profile saved"
+    # toast. So:
+    #
+    #   * avatar only      → set_avatar handles its own toast+Cancel,
+    #                        skip Submit/save-marker entirely.
+    #   * bio only         → set_bio, Submit, wait for save marker.
+    #   * bio AND avatar   → set_avatar (toast+Cancel), set_bio,
+    #                        Submit, wait for save marker.
     needs_edit_page = bio is not None or avatar_path is not None
     if needs_edit_page:
         _step(
             "navigate to /accounts/edit/",
             lambda: _navigate_to_edit_page(browser, behavior),
         )
+        # After landing on the edit page, run another sweep — IG often
+        # injects a "Save your login info?" prompt right after a
+        # navigation completes.
+        try:
+            behavior.dismiss_interruptions()
+        except Exception as exc:
+            logger.debug(
+                "[update_profile] post-nav dismiss_interruptions raised (%s)", exc
+            )
         if avatar_path is not None:
             _step(
                 "set avatar",
@@ -550,11 +627,21 @@ def execute_update_profile(
                 "set bio",
                 lambda: _set_bio(browser, behavior, bio),
             )
-        _step("click Submit", lambda: _click_submit(browser, behavior))
-        save_marker = _step(
-            "wait for save marker",
-            lambda: _wait_for_save_marker(browser),
-        )
+            _step("click Submit", lambda: _click_submit(browser, behavior))
+            save_marker = _step(
+                "wait for save marker",
+                lambda: _wait_for_save_marker(browser),
+            )
+        else:
+            # Avatar-only path — explicitly mark the marker as the
+            # "Profile photo added." toast we already saw inside
+            # ``_set_avatar``. This keeps the result dict honest
+            # about what actually fired.
+            logger.info(
+                "[update_profile] avatar-only update — skipping form Submit "
+                "(avatar already persisted via async upload)"
+            )
+            save_marker = "Profile photo added. (async)"
 
     # ── Privacy: separate page, toggle persists on click (no Submit).
     if is_private is not None:

@@ -42,12 +42,11 @@ Supported ``args``
 * ``file_path``         (required, str)  — absolute path to image or video
                                            UNDER ``settings.MEDIA_ROOT``
 * ``caption``           (optional, str)  — caption text. Defaults to ``""``.
+* ``location``          (optional, str)  — location name to search/select.
+* ``hide_likes``        (optional, bool) — toggle “Hide like and view counts”.
+* ``disable_comments``  (optional, bool) — toggle “Turn off commenting”.
 * ``upload_timeout_s``  (optional, int)  — overall ceiling on the share→done wait
                                            (default 180s; raise for big videos)
-
-Note: ``location``, ``alt_text``, ``hide_likes``, ``disable_comments``
-have been removed in this rewrite — IG's new flow no longer exposes
-those controls inline. Add them back when/if they reappear.
 """
 
 from __future__ import annotations
@@ -62,11 +61,18 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
 from app.core.config import settings
-from workers.core.behavior import HumanBehaviorEngine
+from workers.core.behavior import (
+    HumanBehaviorEngine,
+    ClickVerificationError,
+    safe_coordinate_click,
+)
 from workers.core.browser_core import InstagramBrowser
 from workers.core.safety import UnsafePathError, resolve_within_media_root
 
 logger = logging.getLogger(__name__)
+
+
+# safe_coordinate_click is imported from workers.core.behavior
 
 
 # ── URLs & tunables ─────────────────────────────────────────────────────
@@ -188,38 +194,57 @@ def _navigate_home(browser: InstagramBrowser, behavior: HumanBehaviorEngine) -> 
     if landed is None:
         raise UploadActionError("Home feed did not render — session may be invalid")
 
-    # Skim the feed briefly before doing anything (real users don't load
-    # IG and instantly hit Create).
+    # Skim the feed briefly before doing anything (real users don't
+    # load IG and instantly hit Create).
     behavior.read_pause(content_length=None)
     behavior.micro_scroll()
 
 
-def _open_create_dialog_from_home(
-    browser: InstagramBrowser, behavior: HumanBehaviorEngine
+def _wait_for_create_modal(
+    browser: InstagramBrowser, *, timeout_s: float = 10.0
 ) -> bool:
-    """Click the home-page New-post button and verify the create modal.
+    """Verify the 'Create new post' modal is open. Returns ``bool``, never raises."""
+    deadline = time.monotonic() + timeout_s
+    selectors: list[str] = [
+        'xpath://div[@role="heading" and @aria-level="1" and contains(.,"Create new post")]',
+        'xpath://*[@aria-level="1" and @role="heading" and contains(.,"Create new")]',
+        'xpath://h1[contains(.,"Create new post")]',
+        'xpath://button[normalize-space()="Select from computer"]',
+    ]
+    while time.monotonic() < deadline:
+        if _find_first(browser.page, selectors, timeout=1.5) is not None:
+            return True
+    return False
 
-    Returns True iff the "Create new post" heading is visible after
-    the click. Returns False (instead of raising) so the caller can
-    decide whether to try the profile-page fallback.
+
+def _open_create_dialog_via_left_rail(
+    browser: InstagramBrowser, behavior: HumanBehaviorEngine
+) -> None:
+    """Open IG's Create-new-post modal via the left rail.
+
+    Uses :meth:`HumanBehaviorEngine.navigate_left_rail` which hovers
+    the rail anchor (Home icon) for 0.8s to hydrate React listeners,
+    then clicks the ``Create`` entry by ``svg[aria-label="New post"]``
+    (with a ``span:has-text("Create")`` fallback the engine resolves
+    internally).
+
+    After the rail click, IG sometimes presents a Post / Reel / Story
+    submenu — we click ``Post`` if present and otherwise proceed
+    directly. The empty-state profile-Reels fallback that lived here
+    in the previous revision has been intentionally removed: the
+    spec wants a single, guaranteed path, and silently falling back
+    to a different upload type is worse than failing loudly.
+
+    Raises ``UploadActionError`` if the create modal does not open.
     """
-    try:
-        _humanized_click_first(
-            browser.page,
-            behavior,
-            ['css:svg[aria-label="New post"]'],
-            label="New post (home page)",
-            timeout=8.0,
-            safe=False,
+    logger.info("[upload] opening Create modal via left-rail")
+
+    if not behavior.navigate_left_rail("create"):
+        raise UploadActionError(
+            "left-rail Create click failed — rail may not have hydrated"
         )
-    except UploadActionError as exc:
-        logger.warning("[upload] home-page New-post button not clickable: %s", exc)
-        return False
 
-    behavior.idle(0.6, 1.4)
-
-    # Some accounts get a Post / Reel / Story submenu; click "Post" if it
-    # appears. This is an optional step — absence is fine.
+    # Optional Post / Reel / Story submenu — click "Post" if it shows.
     submenu_post = _find_first(
         browser.page,
         [
@@ -230,121 +255,14 @@ def _open_create_dialog_from_home(
     )
     if submenu_post is not None:
         try:
-            behavior.click(submenu_post)
+            behavior.safe_click(submenu_post)
             behavior.idle(0.5, 1.1)
         except Exception as exc:
             logger.debug("[upload] submenu Post click failed (%s); ignoring", exc)
 
-    return _wait_for_create_modal(browser, timeout_s=8.0)
-
-
-def _wait_for_create_modal(
-    browser: InstagramBrowser, *, timeout_s: float = 8.0
-) -> bool:
-    """Verify the 'Create new post' modal is open. Returns ``bool``, never raises."""
-    deadline = time.monotonic() + timeout_s
-    selectors: list[str] = [
-        'xpath://div[@role="heading" and @aria-level="1" and contains(.,"Create new post")]',
-        'xpath://*[@aria-level="1" and @role="heading" and contains(.,"Create new")]',
-        'xpath://h1[contains(.,"Create new post")]',
-        'css:button:has-text("Select from computer")',
-        'xpath://button[normalize-space()="Select from computer"]',
-    ]
-    while time.monotonic() < deadline:
-        if _find_first(browser.page, selectors, timeout=1.5) is not None:
-            return True
-    return False
-
-
-def _open_create_dialog_via_profile(
-    browser: InstagramBrowser, behavior: HumanBehaviorEngine
-) -> None:
-    """Fallback: navigate to the user's own profile and trigger the Create flow.
-
-    Used when the home-page ``svg[aria-label="New post"]`` is missing —
-    happens on accounts where IG has reshuffled the left-rail icons or
-    on first-load before client-side hydration finishes.
-
-    The flow is:
-
-        1. Click profile avatar in left rail (or directly hit the
-           profile URL — same effect, fewer flakes).
-        2. Click the Reels tab on the profile.
-        3. Click the empty-state "Share your first photo" /
-           "Create" button that IG renders inside the empty Reels grid.
-
-    Raises ``UploadActionError`` if the create modal still doesn't open.
-    """
-    logger.info("[upload] falling back via own-profile Create flow")
-
-    # Going straight to /accounts/edit/'s redirect target works, but the
-    # cleanest URL is the navigation to one's own profile via the avatar
-    # nav. We can't compute it without a username; navigate the page
-    # there via the avatar locator.
-    try:
-        _humanized_click_first(
-            browser.page,
-            behavior,
-            [
-                'css:a[href^="/"][role="link"] img[alt$=" profile picture"]',
-                'css:nav a[href^="/"][role="link"]:has(img)',
-                'xpath://nav//a[@role="link" and starts-with(@href,"/")][.//img]',
-            ],
-            label="Own-profile nav avatar",
-            timeout=6.0,
-            safe=False,
-        )
-    except UploadActionError as exc:
+    if not _wait_for_create_modal(browser, timeout_s=10.0):
         raise UploadActionError(
-            f"fallback: could not click profile avatar — {exc}"
-        ) from exc
-
-    behavior.idle(1.5, 2.6)
-
-    # Click the Reels tab on the profile page.
-    try:
-        _humanized_click_first(
-            browser.page,
-            behavior,
-            ['css:svg[aria-label="Reels"]'],
-            label="Profile Reels tab",
-            timeout=6.0,
-            safe=True,
-        )
-    except UploadActionError as exc:
-        raise UploadActionError(
-            f"fallback: Reels tab not found on profile — {exc}"
-        ) from exc
-
-    behavior.idle(1.0, 2.2)
-
-    # Click the empty-state "Share your first photo" / "Create" button.
-    create_btn = _find_first(
-        browser.page,
-        [
-            'xpath://div[@role="button"][contains(.,"Share your first photo")]',
-            'xpath://div[@role="button"][contains(.,"Share your first reel")]',
-            'xpath://*[@role="button" and contains(.,"Create")]',
-            'xpath://button[normalize-space()="Create"]',
-        ],
-        timeout=8.0,
-    )
-    if create_btn is None:
-        raise UploadActionError(
-            "fallback: no empty-state Create / 'Share your first photo' button found"
-        )
-    try:
-        behavior.safe_click_button(create_btn)
-    except Exception as exc:
-        raise UploadActionError(
-            f"fallback: empty-state Create click failed — {exc}"
-        ) from exc
-
-    behavior.idle(1.0, 2.0)
-
-    if not _wait_for_create_modal(browser, timeout_s=8.0):
-        raise UploadActionError(
-            "fallback: 'Create new post' modal did not appear after profile-Reels create click"
+            "'Create new post' modal did not appear after left-rail Create click"
         )
 
 
@@ -472,20 +390,74 @@ def _write_caption(
 def _click_share(
     browser: InstagramBrowser, behavior: HumanBehaviorEngine
 ) -> None:
-    """Click Share, scrolling it into view first."""
-    _humanized_click_first(
-        browser.page,
-        behavior,
-        [
-            'xpath://div[@role="button" and normalize-space()="Share"]',
-            'xpath://button[normalize-space()="Share"]',
-            'css:div[role="button"]:has-text("Share")',
-            'text:Share',
-        ],
-        label="Share button",
-        timeout=_DEFAULT_STEP_TIMEOUT_S,
-        safe=True,
+    """Click Share with belt-and-braces overlay handling.
+
+    The "Video posts are now shared as reels" informational modal
+    sometimes pops up at this exact moment — overlapping the Share
+    button — so we sweep for it IMMEDIATELY before the click. If the
+    standard ``safe_click_button`` then fails (typical symptom: the
+    coordinate-click is intercepted by an invisible overlay), we
+    fall back to ``ele.click(by_js=True)`` which dispatches the
+    click directly on the element in the page context and bypasses
+    overlay layers entirely.
+    """
+    share_selectors = [
+        'xpath://div[@role="button" and normalize-space()="Share"]',
+        'xpath://button[normalize-space()="Share"]',
+        'css:div[role="button"]:has-text("Share")',
+        'text:Share',
+    ]
+
+    # ── Sweep IMMEDIATELY before the click. Anything that lands here
+    # (notably the OK on the reels-sharing modal) overlaps the Share
+    # button, and a stale sweep from earlier in the flow won't catch a
+    # modal that just appeared.
+    try:
+        behavior.dismiss_interruptions()
+    except Exception as exc:
+        logger.debug(
+            "[upload] in-share dismiss_interruptions raised (%s); proceeding", exc,
+        )
+
+    share_btn = _find_first(
+        browser.page, share_selectors, timeout=_DEFAULT_STEP_TIMEOUT_S,
     )
+    if share_btn is None:
+        raise UploadActionError(
+            f"Could not locate 'Share button' (tried {share_selectors})"
+        )
+
+    # ── Primary: humanized scroll-to-see + bezier click.
+    try:
+        behavior.safe_click_button(share_btn)
+        logger.info("[upload] Share clicked via safe_click_button")
+        return
+    except Exception as exc:
+        logger.warning(
+            "[upload] safe_click_button on Share failed (%s); falling back to "
+            "ele.click(by_js=True) — assuming overlay interception",
+            exc,
+        )
+
+    # ── Fallback: JS click bypasses any overlay sitting on top of the
+    # button. We sweep one more time on the way in — the failed
+    # coordinate click sometimes shifts focus and a previously-hidden
+    # nag modal mounts in the same beat.
+    try:
+        behavior.dismiss_interruptions()
+    except Exception as exc:
+        logger.debug(
+            "[upload] pre-JS-click dismiss_interruptions raised (%s); proceeding",
+            exc,
+        )
+
+    try:
+        share_btn.click(by_js=True)
+        logger.info("[upload] Share clicked via JS click fallback")
+    except Exception as exc:
+        raise UploadActionError(
+            f"Share click failed via both safe_click_button and JS click: {exc}"
+        ) from exc
 
 
 def _wait_for_completion(browser: InstagramBrowser, timeout_s: float) -> str:
@@ -571,13 +543,26 @@ def _click_done(
 def execute_upload(
     browser: InstagramBrowser, args: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
-    """Drive Instagram's Create-Post flow end-to-end with humanized inputs
-    and native OS-dialog file interception.
+    """Drive Instagram's Create-Post flow end-to-end using the
+    safe_coordinate_click paradigm for ALL interactions.
 
     The browser is owned by the caller (``TaskExecutor``); this function
     never instantiates a new one and never calls ``browser.close()``.
     Step failures propagate as ``UploadActionError`` so the executor
     can mark the parent Task FAILED with a useful message.
+
+    Implements the exact 11-step flow:
+      1. Click Create (svg[aria-label="New post"])
+      2. File injection via DrissionPage
+      3. Click Crop icon
+      4. Select Original
+      5. Click Next
+      6. Handle optional cover/sound
+      7. Click Next again
+      8. Write Caption
+      9. Add Location (optional)
+     10. Advanced Settings (optional)
+     11. Click Share (with 2s pre-wait for React state)
     """
     args = args or {}
 
@@ -593,29 +578,68 @@ def execute_upload(
         raise UploadActionError(f"unsafe upload file_path: {exc}") from exc
 
     caption = str(args.get("caption") or "")
+    location = str(args.get("location") or "")
+    hide_likes = bool(args.get("hide_likes", False))
+    disable_comments = bool(args.get("disable_comments", False))
     upload_timeout_s = float(args.get("upload_timeout_s", _DEFAULT_UPLOAD_TIMEOUT_S))
 
     logger.info(
-        "[upload] starting file=%s caption_len=%d", abs_path, len(caption),
+        "[upload] starting file=%s caption_len=%d location=%r",
+        abs_path, len(caption), location or "(none)",
     )
 
-    # One engine per upload session — holds the cursor position across steps.
-    behavior = HumanBehaviorEngine(browser.page)
+    page = browser.page
+    # One engine per upload session — used for idle pauses and typing only.
+    behavior = HumanBehaviorEngine(page)
 
-    # ── Phase 1: navigate + open the create modal ──────────────────────
+    # ── Phase 0: clear any interruption modals before we touch anything.
+    try:
+        behavior.dismiss_interruptions()
+    except Exception as exc:
+        logger.debug(
+            "[upload] dismiss_interruptions raised unexpectedly (%s); continuing",
+            exc,
+        )
+
+    # ── Navigate to home feed first.
     _step("navigate to home feed",
           lambda: _navigate_home(browser, behavior))
 
-    used_fallback = False
-    if not _open_create_dialog_from_home(browser, behavior):
-        logger.warning(
-            "[upload] primary 'New post' flow failed; trying profile-Reels fallback"
+    # Sweep again — the home feed render itself often triggers a modal.
+    try:
+        behavior.dismiss_interruptions()
+    except Exception as exc:
+        logger.debug(
+            "[upload] post-home dismiss_interruptions raised (%s); continuing", exc
         )
-        used_fallback = True
-        _step("open create modal via profile fallback",
-              lambda: _open_create_dialog_via_profile(browser, behavior))
 
-    # ── Phase 2: arm the file dialog, click Select, wait for processing ─
+    # ══════════════════════════════════════════════════════════════════
+    # STEP 1: Click Create — verify "Create new post" modal appears
+    # ══════════════════════════════════════════════════════════════════
+    logger.info("[upload] step 1: Click Create (verified)")
+    _VERIFY_CREATE_MODAL = (
+        'xpath://div[@role="heading" and contains(.,"Create new post")]'
+    )
+    try:
+        safe_coordinate_click(
+            page,
+            'css:svg[aria-label="New post"]',
+            timeout=10,
+            verify_locator=_VERIFY_CREATE_MODAL,
+            max_retries=3,
+            verify_timeout=5.0,
+        )
+    except ClickVerificationError:
+        raise UploadActionError(
+            "Step 1 FAILED: clicked 'New post' but 'Create new post' modal "
+            "never appeared after 3 retries"
+        )
+    behavior.idle(1.0, 2.0)
+
+    # ══════════════════════════════════════════════════════════════════
+    # STEP 2: File injection via DrissionPage's upload handler
+    # ══════════════════════════════════════════════════════════════════
+    logger.info("[upload] step 2: File injection")
     _step("arm DrissionPage native file-dialog interception",
           lambda: _arm_file_upload(browser, abs_path))
 
@@ -625,53 +649,225 @@ def execute_upload(
     # IG processes the upload client-side before the crop UI appears.
     behavior.idle(*_FILE_UPLOAD_PROCESSING_S)
 
-    # ── Phase 3: crop step (set Original aspect ratio) ─────────────────
-    _step("set crop to Original",
-          lambda: _set_crop_to_original(browser, behavior))
+    # Sweep — fresh accounts hit a "Video posts are now shared as
+    # reels" informational modal right after upload processing.
+    try:
+        behavior.dismiss_interruptions()
+    except Exception as exc:
+        logger.debug(
+            "[upload] post-processing dismiss raised (%s); continuing", exc,
+        )
 
-    _step("click Next (post-crop)",
-          lambda: _click_next(browser, behavior, label="Next button (crop step)"))
-
-    # ── Phase 4: optional cover-photo / audio panel ────────────────────
-    # IG inserts a second 'Next' page for some media types (cover image
-    # for reels, audio toggle for posts with sound). Click Next if a
-    # second Next button is still present; if it's not, we're already
-    # on the caption step.
-    second_next = _find_first(
-        browser.page,
-        [
-            'xpath://div[@role="button" and normalize-space()="Next"]',
-            'xpath://button[normalize-space()="Next"]',
-        ],
-        timeout=4.0,
-    )
-    if second_next is not None:
-        _step("click Next (cover/audio step)",
-              lambda: _click_next(browser, behavior, label="Next button (cover/audio step)"))
+    # ══════════════════════════════════════════════════════════════════
+    # STEP 3 + 4: Crop → Original (non-critical — skip if absent)
+    # ══════════════════════════════════════════════════════════════════
+    logger.info("[upload] step 3: Click Crop icon")
+    if not safe_coordinate_click(page, 'css:svg[aria-label="Select crop"]', timeout=6):
+        logger.info("[upload] no 'Select crop' icon — skipping")
     else:
-        logger.info("[upload] no second Next button — skipping cover/audio step")
+        behavior.idle(0.6, 1.2)
+        logger.info("[upload] step 4: Select Original")
+        if not safe_coordinate_click(page, 't:span@text()=Original', timeout=4):
+            logger.warning("[upload] 'Original' not found — leaving default AR")
+        behavior.idle(0.5, 1.0)
 
-    # ── Phase 5: caption ───────────────────────────────────────────────
-    _step("write caption",
-          lambda: _write_caption(browser, behavior, caption))
+    # ══════════════════════════════════════════════════════════════════
+    # STEP 5: Click Next → VERIFY header changes (Edit / Filters /
+    #         Cover photo — anything that is NOT the crop screen)
+    # ══════════════════════════════════════════════════════════════════
+    logger.info("[upload] step 5: Click Next (post-crop, verified)")
+    _VERIFY_POST_CROP = (
+        'xpath://div[@role="heading" and ('
+        'contains(.,"Edit") or contains(.,"Filter") or '
+        'contains(.,"Cover photo") or contains(.,"Adjustments")'
+        ')]'
+    )
+    try:
+        safe_coordinate_click(
+            page,
+            't:div@text()=Next',
+            timeout=10,
+            verify_locator=_VERIFY_POST_CROP,
+            max_retries=3,
+            verify_timeout=5.0,
+        )
+    except ClickVerificationError:
+        raise UploadActionError(
+            "Step 5 FAILED: clicked 'Next' but did not advance past crop "
+            "screen (no Edit/Filter/Cover heading found)"
+        )
+    behavior.idle(*_AFTER_NEXT_PAUSE_S)
 
-    # ── Phase 6: share + wait for confirmation + dismiss ───────────────
-    _step("click Share",
-          lambda: _click_share(browser, behavior))
+    # ══════════════════════════════════════════════════════════════════
+    # STEP 6 + 7: Handle optional cover/sound → Click Next again
+    #             VERIFY the caption textarea appears
+    # ══════════════════════════════════════════════════════════════════
+    logger.info("[upload] step 6-7: Click Next to caption (verified)")
+    _VERIFY_CAPTION_SCREEN = 'css:div[aria-label="Write a caption..."]'
+    page.wait(2.0)  # Let React render the optional panel
 
+    # Try clicking Next — if it's there, we need it. If not, we might
+    # already be on the caption screen.
+    try:
+        safe_coordinate_click(
+            page,
+            't:div@text()=Next',
+            timeout=6,
+            verify_locator=_VERIFY_CAPTION_SCREEN,
+            max_retries=3,
+            verify_timeout=5.0,
+        )
+    except ClickVerificationError:
+        # Next was clicked but caption didn't appear — fatal desync.
+        raise UploadActionError(
+            "Step 7 FAILED: clicked 'Next' but caption textarea never appeared"
+        )
+
+    # Double-check: even if we didn't click Next (it wasn't there),
+    # the caption box MUST be visible before we proceed.
+    caption_box = _find_first(page, [_VERIFY_CAPTION_SCREEN], timeout=5.0)
+    if caption_box is None:
+        raise UploadActionError(
+            "Step 7 GUARD FAILED: caption textarea not visible — UI is desynchronized"
+        )
+    logger.info("[upload] caption screen confirmed visible")
+    behavior.idle(*_AFTER_NEXT_PAUSE_S)
+
+    # ══════════════════════════════════════════════════════════════════
+    # STEP 8: Write Caption (only if caption box is confirmed)
+    # ══════════════════════════════════════════════════════════════════
+    logger.info("[upload] step 8: Write Caption")
+    if caption:
+        if not safe_coordinate_click(page, _VERIFY_CAPTION_SCREEN, timeout=5):
+            raise UploadActionError("Caption editor click failed")
+        behavior.idle(0.3, 0.7)
+        page.actions.type(caption)
+        behavior.read_pause(content_length=len(caption))
+
+    # ══════════════════════════════════════════════════════════════════
+    # STEP 9: Add Location (non-critical — skip if missing)
+    # ══════════════════════════════════════════════════════════════════
+    if location:
+        logger.info("[upload] step 9: Add Location (%r)", location)
+        if safe_coordinate_click(page, 'css:input[placeholder="Add location"]', timeout=6):
+            behavior.idle(0.3, 0.6)
+            page.actions.type(location)
+            behavior.idle(1.5, 2.5)
+            try:
+                first_suggestion = page.ele('css:div[role="listbox"] button', timeout=3)
+                if first_suggestion:
+                    first_suggestion.scroll.to_see(center=True)
+                    page.wait(0.3)
+                    x, y = first_suggestion.rect.midpoint
+                    page.actions.move_to((x, y)).click()
+                    behavior.idle(0.5, 1.0)
+            except Exception as exc:
+                logger.debug("[upload] location suggestion click failed (%s)", exc)
+        else:
+            logger.info("[upload] location input not found — skipping")
+    else:
+        logger.info("[upload] step 9: no location — skipping")
+
+    # ══════════════════════════════════════════════════════════════════
+    # STEP 10: Advanced Settings (non-critical)
+    # ══════════════════════════════════════════════════════════════════
+    if hide_likes or disable_comments:
+        logger.info("[upload] step 10: Advanced settings")
+        if safe_coordinate_click(page, 't:span@text()=Advanced settings', timeout=4):
+            behavior.idle(0.8, 1.4)
+            if hide_likes:
+                try:
+                    switches = page.eles('css:input[role="switch"]', timeout=3)
+                    if switches and len(switches) >= 1:
+                        sw = switches[0]
+                        sw.scroll.to_see(center=True)
+                        page.wait(0.3)
+                        x, y = sw.rect.midpoint
+                        page.actions.move_to((x, y)).click()
+                        logger.info("[upload] toggled hide likes")
+                        behavior.idle(0.4, 0.8)
+                except Exception as exc:
+                    logger.debug("[upload] hide_likes toggle failed: %s", exc)
+            if disable_comments:
+                try:
+                    switches = page.eles('css:input[role="switch"]', timeout=3)
+                    if switches and len(switches) >= 2:
+                        sw = switches[1]
+                        sw.scroll.to_see(center=True)
+                        page.wait(0.3)
+                        x, y = sw.rect.midpoint
+                        page.actions.move_to((x, y)).click()
+                        logger.info("[upload] toggled disable comments")
+                        behavior.idle(0.4, 0.8)
+                except Exception as exc:
+                    logger.debug("[upload] disable_comments toggle failed: %s", exc)
+        else:
+            logger.info("[upload] 'Advanced settings' not found — skipping")
+    else:
+        logger.info("[upload] step 10: no advanced settings — skipping")
+
+    # ══════════════════════════════════════════════════════════════════
+    # STEP 11: Click Share → VERIFY completion marker appears
+    # ══════════════════════════════════════════════════════════════════
+    logger.info("[upload] step 11: Click Share (verified)")
+    page.wait(2.0)  # Mandatory pre-wait for React state
+
+    try:
+        behavior.dismiss_interruptions()
+    except Exception as exc:
+        logger.debug("[upload] pre-Share dismiss raised (%s); continuing", exc)
+
+    # Verification: the post/reel shared confirmation or the Share
+    # button disappearing (which means IG accepted and is processing).
+    _VERIFY_SHARE_DONE = (
+        'xpath://*[contains(text(),"has been shared") or '
+        'contains(text(),"Post shared") or '
+        'contains(text(),"Reel shared")]'
+    )
+    try:
+        safe_coordinate_click(
+            page,
+            't:div@text()=Share',
+            timeout=15,
+            verify_locator='t:div@text()=Share',
+            verify_disappear=True,  # Share button should vanish on success
+            max_retries=3,
+            verify_timeout=10.0,
+        )
+    except ClickVerificationError:
+        # Fallback: try button variant with same verification.
+        try:
+            safe_coordinate_click(
+                page,
+                'xpath://button[normalize-space()="Share"]',
+                timeout=5,
+                verify_locator='xpath://button[normalize-space()="Share"]',
+                verify_disappear=True,
+                max_retries=2,
+                verify_timeout=10.0,
+            )
+        except ClickVerificationError:
+            raise UploadActionError(
+                "Step 11 FAILED: Share button clicked but never disappeared "
+                "— post was NOT submitted"
+            )
+
+    logger.info("[upload] Share clicked and verified")
+
+    # ── Wait for completion + dismiss ──────────────────────────────────
     marker = _step("wait for completion",
                    lambda: _wait_for_completion(browser, upload_timeout_s))
 
     _step("click Done",
           lambda: _click_done(browser, behavior))
 
-    logger.info("[upload] success file=%s used_fallback=%s", abs_path, used_fallback)
+    logger.info("[upload] success file=%s", abs_path)
     return {
         "action": "upload",
         "status": "success",
         "file": file_path,
         "caption_length": len(caption),
-        "used_fallback_flow": used_fallback,
+        "location": location or None,
         "completion_marker": marker,
     }
 

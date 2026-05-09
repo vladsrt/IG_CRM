@@ -57,7 +57,12 @@ from typing import Any, Callable, Dict, List, Optional
 # Allow `python action_warmup.py` from the actions/ dir for the smoke-test.
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
-from workers.core.behavior import HumanBehaviorEngine
+from workers.core.behavior import (
+    HumanBehaviorEngine,
+    ClickVerificationError,
+    dismiss_instagram_modals,
+    safe_coordinate_click,
+)
 from workers.core.browser_core import InstagramBrowser
 
 logger = logging.getLogger(__name__)
@@ -95,16 +100,75 @@ COMMENT_LIKE_LOCATORS: List[str] = [
     'css:svg[aria-label="Like"][height="16"]',
 ]
 
+# ── Parent-button locators ─────────────────────────────────────────────
+# CRITICAL: in Reels (and on the feed too, increasingly) the SVG icons
+# themselves either have ``pointer-events: none`` or are positioned in a
+# container that doesn't receive clicks. A coordinate click on the SVG
+# passes THROUGH to whatever element is underneath — for Reels that's
+# the video, so the click toggles play/pause instead of liking. The
+# React click handler lives on the wrapping ``<div role="button">``
+# (or sometimes ``<button>`` / ``<a>``). We walk up from the SVG to
+# the nearest interactive ancestor and click THAT.
+#
+# Each list is searched in order — most specific (height-pinned) first,
+# generic fallbacks after, in case Reels renders the icon at a
+# different size or via a slightly different DOM path.
+POST_LIKE_BUTTON_LOCATORS: List[str] = [
+    'xpath://*[(@role="button" or self::button) '
+    'and .//svg[@aria-label="Like" and @height="24"]]',
+    'xpath://*[(@role="button" or self::button) '
+    'and .//svg[@aria-label="Like"]]',
+    'xpath://*[@role="button" and @aria-label="Like"]',
+]
+COMMENT_BUTTON_LOCATORS: List[str] = [
+    'xpath://*[(@role="button" or self::button) '
+    'and .//svg[@aria-label="Comment" and @height="24"]]',
+    'xpath://*[(@role="button" or self::button) '
+    'and .//svg[@aria-label="Comment"]]',
+    'xpath://*[@role="button" and @aria-label="Comment"]',
+]
+COMMENT_LIKE_BUTTON_LOCATORS: List[str] = [
+    'xpath://*[(@role="button" or self::button) '
+    'and .//svg[@aria-label="Like" and (@height="12" or @height="16")]]',
+    'xpath://ul//*[(@role="button" or self::button) '
+    'and .//svg[@aria-label="Like"]]',
+    'xpath://div[@role="dialog"]//*[(@role="button" or self::button) '
+    'and .//svg[@aria-label="Like"]]',
+]
+
 # Per-tick budgets — the loop stops cleanly between ticks so a long Reel
 # watch can't blow the overall duration_minutes budget by more than ~30s.
 _REEL_WATCH_S_RANGE: tuple[float, float] = (5.0, 30.0)
 _REELS_PER_VISIT_RANGE: tuple[int, int] = (2, 7)
-_COMMENT_LIKES_RANGE: tuple[int, int] = (1, 3)
 _PROFILE_DWELL_S_RANGE: tuple[float, float] = (3.0, 9.0)
 _POST_MODAL_DWELL_S_RANGE: tuple[float, float] = (4.0, 12.0)
 
+# ── Engagement probabilities (hardcoded per QA spec) ───────────────────
+# Each post / reel rolls these INDEPENDENTLY:
+#   * 30% chance to like.
+#   * 45% chance to open the comments modal and engage.
+# When the comments modal IS opened (either via these per-element rolls
+# or because the dispatcher picked the open_comments action directly):
+#   * Try to like 3-4 different unliked comments.
+#   * Each attempt has a 60-70% chance of actually clicking — the
+#     specific threshold is drawn fresh per session via rng.uniform
+#     so two warmup runs don't have identical comment-like cadence.
+_LIKE_POST_PROBABILITY: float = 0.30
+_OPEN_COMMENTS_PROBABILITY: float = 0.45
+_COMMENT_LIKE_CHANCE_RANGE: tuple[float, float] = (0.60, 0.70)
+_COMMENT_ATTEMPTS_RANGE: tuple[int, int] = (3, 4)
+
+# Short-timeout sweep used when a per-tick lookup fails — the regular
+# defaults (1.5s × 14 selectors) are too slow for in-loop usage. With
+# 0.5s × 14 the worst case is ~7s and most sweeps short-circuit on the
+# first or second match.
+_INLOOP_DISMISS_TIMEOUT_S: float = 0.5
+
 
 # ── Helpers ────────────────────────────────────────────────────────────
+# safe_coordinate_click is imported from workers.core.behavior
+
+
 def _safe_find(page: Any, selector: str, *, timeout: float = 2.5) -> Any | None:
     """Return the first matching element or ``None`` — never raises."""
     try:
@@ -123,19 +187,221 @@ def _safe_find_all(page: Any, selector: str, *, timeout: float = 2.5) -> List[An
         return []
 
 
-def _is_already_liked(svg_ele: Any) -> bool:
-    """Return True iff the heart icon is in the 'Unlike' state.
+def _is_already_liked(ele: Any) -> bool:
+    """Return True iff the Like control is in the 'Unlike' state.
 
-    The post-like SVG flips its ``aria-label`` between ``Like`` and
-    ``Unlike`` — we only ever click on a ``Like`` heart. This guard is
-    paranoid because mis-toggling the user's real activity is the one
-    thing a warmup must NEVER do.
+    Accepts EITHER the SVG icon directly OR a wrapping element
+    (``<div role="button">`` / ``<button>``) that contains the SVG.
+    The state-of-truth is the SVG's ``aria-label`` (it flips between
+    ``Like`` ↔ ``Unlike``); the wrapping button's ``aria-label``,
+    when present, often stays pinned to ``"Like"`` regardless of
+    state — which would falsely report "not liked" and let us
+    toggle the user's real like off.
+
+    Resolution order:
+
+        1. **Always look for an inner SVG first.** If found, its
+           ``aria-label`` is authoritative — even if our caller
+           passed a button whose own ``aria-label`` says something
+           else.
+        2. Only if no inner SVG exists do we read the element's own
+           ``aria-label`` (the case where the caller passed an SVG
+           directly).
+
+    Fail-closed: if we can't determine state we return ``True``
+    (treat as already liked) so the warmup never UN-likes a real
+    post.
+    """
+    if ele is None:
+        return True
+    try:
+        # 1. Authoritative: the inner SVG (if any).
+        try:
+            svg = ele.ele(
+                'xpath:.//svg[@aria-label="Like" or @aria-label="Unlike"]',
+                timeout=1,
+            )
+        except Exception:
+            svg = None
+        if svg is not None:
+            inner_label = (svg.attr("aria-label") or "").strip().lower()
+            if inner_label in ("like", "unlike"):
+                return inner_label == "unlike"
+
+        # 2. Fallback: caller passed the SVG itself, or any other
+        # element whose own aria-label encodes state.
+        label = (ele.attr("aria-label") or "").strip().lower()
+        if label in ("like", "unlike"):
+            return label == "unlike"
+
+        # Unknown — fail closed.
+        return True
+    except Exception:
+        return True
+
+
+
+def _sweep_modals_safely(browser: InstagramBrowser, *, label: str) -> int:
+    """In-loop modal sweep — short timeout, soft-fail, never propagates.
+
+    Used inside per-tick action handlers when a lookup that *should*
+    have succeeded comes back empty (typical cause: a "Turn on
+    notifications" interstitial mounted between ticks and is now
+    overlaying the feed). Always wrapped in try/except so a sweep
+    failure can never end the warmup session.
     """
     try:
-        label = (svg_ele.attr("aria-label") or "").strip().lower()
-    except Exception:
-        return True  # fail closed — don't click if we can't tell
-    return label == "unlike"
+        n = dismiss_instagram_modals(
+            browser.page,
+            per_selector_timeout_s=_INLOOP_DISMISS_TIMEOUT_S,
+            max_dismissals=2,
+        )
+        if n:
+            logger.info("[warmup] %s: dismissed %d modal(s)", label, n)
+        return n
+    except Exception as exc:
+        logger.debug("[warmup] %s: dismiss_instagram_modals raised (%s)", label, exc)
+        return 0
+
+
+def _try_like_visible_post(
+    browser: InstagramBrowser,
+    behavior: HumanBehaviorEngine,
+    counters: Dict[str, int],
+    *,
+    counter_key: str,
+) -> bool:
+    """Find the visible Like SVG and coordinate-click it directly.
+
+    Uses ``safe_coordinate_click`` on the SVG icon itself — the raw
+    hardware click at physical coordinates bypasses pointer-events:none
+    and React overlay interception that killed the old parent-walk
+    pattern.
+
+    If the SVG isn't found the first time, run a short modal sweep
+    and retry once. The state check inspects the SVG's aria-label
+    so we never re-click an already-liked control.
+
+    Returns True iff a like was actually issued.
+    """
+    # Check if the Like SVG is present and not already in Unlike state.
+    like_svg = _safe_find(browser.page, 'css:svg[aria-label="Like"]', timeout=2.0)
+    if like_svg is None:
+        _sweep_modals_safely(browser, label="like-button lookup miss")
+        like_svg = _safe_find(browser.page, 'css:svg[aria-label="Like"]', timeout=1.5)
+    if like_svg is None:
+        logger.debug("[warmup] no visible Like SVG — skipping")
+        return False
+    if _is_already_liked(like_svg):
+        logger.debug("[warmup] post already liked — skipping")
+        return False
+
+    if not safe_coordinate_click(browser.page, 'css:svg[aria-label="Like"]'):
+        logger.debug("[warmup] coordinate click on Like SVG failed")
+        return False
+
+    counters[counter_key] = counters.get(counter_key, 0) + 1
+    logger.info("[warmup] liked a %s (counter=%s now %d)",
+                counter_key.removesuffix("_liked") or "post",
+                counter_key, counters[counter_key])
+    behavior.idle(0.7, 1.6)
+    return True
+
+
+def _engage_with_comments(
+    browser: InstagramBrowser,
+    behavior: HumanBehaviorEngine,
+    rng: random.Random,
+    counters: Dict[str, int],
+    *,
+    modal_counter_key: str = "comment_modals_opened",
+    likes_counter_key: str = "comments_liked",
+) -> bool:
+    """Open the comment modal via coordinate click on the Comment SVG,
+    attempt 3-4 comment likes at 60-70% per-comment chance, then close.
+
+    Uses ``safe_coordinate_click`` for all interactions — the raw
+    hardware click at physical coordinates bypasses pointer-events:none
+    and React overlay interception.
+
+    The per-comment threshold is drawn ONCE per call via
+    ``rng.uniform(0.60, 0.70)`` so all comments in a single modal
+    share the same chance.
+
+    Returns:
+        ``True`` iff the comment modal was successfully opened.
+    """
+    # Open comments via direct SVG coordinate click.
+    if not safe_coordinate_click(browser.page, 'css:svg[aria-label="Comment"]'):
+        _sweep_modals_safely(browser, label="comment-button lookup miss")
+        if not safe_coordinate_click(browser.page, 'css:svg[aria-label="Comment"]'):
+            logger.debug("[warmup] no visible Comment SVG — skipping engagement")
+            return False
+
+    counters[modal_counter_key] = counters.get(modal_counter_key, 0) + 1
+    logger.info("[warmup] opened comment modal (%s now %d)",
+                modal_counter_key, counters[modal_counter_key])
+    behavior.idle(1.4, 2.6)
+
+    # Read through — incremental scrolls inside the dialog.
+    for _ in range(rng.randint(2, 6)):
+        try:
+            browser.page.scroll.down(300)
+        except Exception:
+            pass
+        time.sleep(rng.uniform(0.9, 2.4))
+
+    # Per QA spec: 3-4 attempts at 60-70% per-comment chance.
+    target_attempts = rng.randint(*_COMMENT_ATTEMPTS_RANGE)
+    per_comment_chance = rng.uniform(*_COMMENT_LIKE_CHANCE_RANGE)
+    logger.info(
+        "[warmup] comments engaged: target_attempts=%d, per_comment_chance=%.2f",
+        target_attempts, per_comment_chance,
+    )
+
+    # Collect comment-like SVGs — the small hearts (12px / 16px).
+    candidates: List[Any] = []
+    for sel in COMMENT_LIKE_LOCATORS:
+        candidates.extend(_safe_find_all(browser.page, sel, timeout=2.0))
+    # Filter out already-liked hearts.
+    candidates = [c for c in candidates if not _is_already_liked(c)]
+    rng.shuffle(candidates)
+    logger.debug(
+        "[warmup] comment-like candidate pool: %d unliked SVG(s)",
+        len(candidates),
+    )
+
+    attempts = 0
+    for heart_svg in candidates:
+        if attempts >= target_attempts:
+            break
+        attempts += 1
+        if rng.random() >= per_comment_chance:
+            logger.debug(
+                "[warmup] comment attempt %d/%d: chance roll missed — skip",
+                attempts, target_attempts,
+            )
+            continue
+        # Coordinate click directly on the comment heart SVG.
+        try:
+            heart_svg.scroll.to_see(center=True)
+            browser.page.wait(0.3)
+            x, y = heart_svg.rect.midpoint
+            browser.page.actions.move_to((x, y)).click()
+            counters[likes_counter_key] = counters.get(likes_counter_key, 0) + 1
+            logger.info(
+                "[warmup] liked a comment (attempt %d/%d, %s now %d)",
+                attempts, target_attempts, likes_counter_key,
+                counters[likes_counter_key],
+            )
+            behavior.idle(0.7, 1.7)
+        except Exception as exc:
+            logger.debug("[warmup] comment-like coordinate click failed: %s", exc)
+
+    # Close the modal — best effort via coordinate click on Close SVG.
+    safe_coordinate_click(browser.page, 'css:svg[aria-label="Close"]', timeout=2)
+    behavior.idle(0.6, 1.3)
+    return True
 
 
 # ── Action: scroll the feed ────────────────────────────────────────────
@@ -145,17 +411,33 @@ def _action_scroll_feed(
     rng: random.Random,
     counters: Dict[str, int],
 ) -> None:
-    # 2-5 smooth scrolls in a row, with one optional "like the post under
-    # me right now" sprinkled in.
-    for _ in range(rng.randint(2, 5)):
-        behavior.smooth_scroll(min_y=300, max_y=900, upward_probability=0.18)
+    # Pre-scroll modal sweep — IG sometimes mounts the "Turn on
+    # notifications" interstitial between ticks.
+    posts_visible = _safe_find(browser.page, "css:article", timeout=1.0)
+    if posts_visible is None:
+        _sweep_modals_safely(browser, label="scroll_feed pre-tick")
 
-    if rng.random() < 0.35:
-        like_btn = _safe_find(browser.page, POST_LIKE_ICON_LOCATOR, timeout=2.0)
-        if like_btn is not None and not _is_already_liked(like_btn):
-            if behavior.safe_click(like_btn):
-                counters["posts_liked"] += 1
-                behavior.idle(0.8, 1.8)
+    # INCREMENTAL SCROLLING: scroll down by 500px, wait 1-2s, scan for
+    # elements in the current viewport. No bulk smooth_scroll — that
+    # teleports the viewport and misses lazy-loaded content.
+    for _ in range(rng.randint(2, 5)):
+        try:
+            browser.page.scroll.down(500)
+        except Exception as exc:
+            logger.debug("[warmup] scroll.down(500) failed: %s", exc)
+        time.sleep(rng.uniform(1.0, 2.0))
+
+    # Per-spec: 30% chance to like the visible post.
+    if rng.random() < _LIKE_POST_PROBABILITY:
+        _try_like_visible_post(
+            browser, behavior, counters, counter_key="posts_liked",
+        )
+
+    # Per-spec: 45% chance to open the comments modal and engage
+    # (3-4 attempts at 60-70% per-comment chance, handled inside the
+    # helper). Independent of the like roll above — both can fire.
+    if rng.random() < _OPEN_COMMENTS_PROBABILITY:
+        _engage_with_comments(browser, behavior, rng, counters)
 
 
 # ── Action: open comment thread on the visible post ────────────────────
@@ -165,41 +447,10 @@ def _action_open_comments(
     rng: random.Random,
     counters: Dict[str, int],
 ) -> None:
-    icon = _safe_find(browser.page, COMMENT_ICON_LOCATOR, timeout=3.0)
-    if icon is None or not behavior.safe_click(icon):
-        return
-    counters["comment_modals_opened"] += 1
-    behavior.idle(1.4, 2.6)
-
-    # Read through — smooth scrolls inside the dialog.
-    for _ in range(rng.randint(2, 6)):
-        behavior.smooth_scroll(
-            min_y=180, max_y=420,
-            upward_probability=0.10,
-            post_scroll_pause_range_s=(0.9, 2.4),
-        )
-
-    # Like 1-3 random comments, but never re-toggle an already-liked one.
-    target_likes = rng.randint(*_COMMENT_LIKES_RANGE)
-    candidates: List[Any] = []
-    for sel in COMMENT_LIKE_LOCATORS:
-        candidates.extend(_safe_find_all(browser.page, sel, timeout=2.0))
-    rng.shuffle(candidates)
-
-    for heart in candidates:
-        if target_likes <= 0:
-            break
-        if _is_already_liked(heart):
-            continue
-        if behavior.safe_click(heart):
-            counters["comments_liked"] += 1
-            target_likes -= 1
-            behavior.idle(0.7, 1.7)
-
-    # Close the modal.
-    close_btn = _safe_find(browser.page, CLOSE_ICON_LOCATOR, timeout=2.0)
-    behavior.safe_click(close_btn)
-    behavior.idle(0.6, 1.3)
+    """Top-level dispatcher action — always engages with comments
+    (no per-tick gate; the dispatcher already rolled to pick this).
+    """
+    _engage_with_comments(browser, behavior, rng, counters)
 
 
 # ── Action: hop into Reels and watch a few ─────────────────────────────
@@ -209,8 +460,11 @@ def _action_watch_reels(
     rng: random.Random,
     counters: Dict[str, int],
 ) -> None:
-    reels_tab = _safe_find(browser.page, REELS_TAB_LOCATOR, timeout=3.0)
-    if reels_tab is None or not behavior.safe_click(reels_tab):
+    # Use navigate_left_rail so the Reels tab gets the React-mandated
+    # hover hydration before the click — direct clicks on the
+    # un-hydrated icon silently no-op or hit the wrong target.
+    if not behavior.navigate_left_rail("reels"):
+        logger.debug("[warmup] navigate_left_rail('reels') failed; skipping tick")
         return
     behavior.idle(2.0, 4.0)
     counters["reels_sessions"] += 1
@@ -225,28 +479,31 @@ def _action_watch_reels(
             counters.get("reels_watch_seconds", 0) + watch_s
         )
 
-        # Maybe like or open comments while watching.
-        roll = rng.random()
-        if roll < 0.25:
-            heart = _safe_find(browser.page, POST_LIKE_ICON_LOCATOR, timeout=1.5)
-            if heart is not None and not _is_already_liked(heart):
-                if behavior.safe_click(heart):
-                    counters["reels_liked"] += 1
-                    behavior.idle(0.6, 1.4)
-        elif roll < 0.40:
-            icon = _safe_find(browser.page, COMMENT_ICON_LOCATOR, timeout=1.5)
-            if icon is not None and behavior.safe_click(icon):
-                counters["reels_comment_modals"] += 1
-                behavior.idle(2.0, 5.0)
-                close_btn = _safe_find(browser.page, CLOSE_ICON_LOCATOR, timeout=2.0)
-                behavior.safe_click(close_btn)
+        # Per-spec: like and open-comments are now INDEPENDENT rolls,
+        # not exclusive branches of a single uniform draw.
+        #   * 30% chance to like the reel.
+        #   * 45% chance to open the comments modal and engage
+        #     (3-4 attempts at 60-70% per-comment chance).
+        if rng.random() < _LIKE_POST_PROBABILITY:
+            _try_like_visible_post(
+                browser, behavior, counters, counter_key="reels_liked",
+            )
 
-        # Next reel.
-        next_btn = _safe_find(browser.page, NEXT_REEL_LOCATOR, timeout=2.0)
-        if next_btn is None or not behavior.safe_click(next_btn):
-            # If we can't advance via the button, a smooth downward scroll
+        if rng.random() < _OPEN_COMMENTS_PROBABILITY:
+            _engage_with_comments(
+                browser, behavior, rng, counters,
+                modal_counter_key="reels_comment_modals",
+                likes_counter_key="comments_liked",
+            )
+
+        # Next reel — coordinate click on the navigation arrow.
+        if not safe_coordinate_click(browser.page, NEXT_REEL_LOCATOR, timeout=2):
+            # If we can't advance via the button, an incremental scroll
             # is the keyboard-less native gesture.
-            behavior.smooth_scroll(min_y=600, max_y=1100, upward_probability=0.0)
+            try:
+                browser.page.scroll.down(800)
+            except Exception:
+                pass
         behavior.idle(0.4, 1.2)
 
 
@@ -266,9 +523,13 @@ def _action_visit_profile(
     counters["profiles_visited"] += 1
     behavior.idle(*_PROFILE_DWELL_S_RANGE)
 
-    # Skim the grid briefly.
+    # Skim the grid briefly — incremental scrolling.
     for _ in range(rng.randint(1, 3)):
-        behavior.smooth_scroll(min_y=300, max_y=800, upward_probability=0.10)
+        try:
+            browser.page.scroll.down(500)
+        except Exception:
+            pass
+        time.sleep(rng.uniform(1.0, 2.0))
 
     # Maybe open the first post / reel and look at it.
     if rng.random() < 0.55:
@@ -279,10 +540,13 @@ def _action_visit_profile(
 
             # Scroll inside the modal a bit.
             for _ in range(rng.randint(1, 3)):
-                behavior.smooth_scroll(min_y=120, max_y=360, upward_probability=0.10)
+                try:
+                    browser.page.scroll.down(300)
+                except Exception:
+                    pass
+                time.sleep(rng.uniform(0.8, 1.5))
 
-            close_btn = _safe_find(browser.page, CLOSE_ICON_LOCATOR, timeout=2.0)
-            behavior.safe_click(close_btn)
+            safe_coordinate_click(browser.page, 'css:svg[aria-label="Close"]', timeout=2)
             behavior.idle(0.7, 1.6)
 
     # Browser-Back to the feed.
@@ -355,6 +619,28 @@ def execute_warmup(
     browser.page.get(feed_url)
     time.sleep(page_load_wait_s)
 
+    # ── AGGRESSIVE MODAL DISMISSAL ─────────────────────────────────────
+    # The very first thing IG often shows after the feed renders is the
+    # "Turn on notifications" interstitial. If we don't clear it BEFORE
+    # the warmup loop starts, every per-tick lookup (like buttons,
+    # comment icons, the Reels rail) fires against a blocked viewport
+    # and silently no-ops. This is a FULL sweep with the standalone
+    # helper's default 1.5s/selector budget — we want to be thorough
+    # here, not fast.
+    initial_dismissals = 0
+    try:
+        initial_dismissals = dismiss_instagram_modals(browser.page)
+    except Exception as exc:
+        logger.warning(
+            "[warmup] initial dismiss_instagram_modals raised (%s); continuing",
+            exc,
+        )
+    if initial_dismissals:
+        logger.info(
+            "[warmup] cleared %d pre-loop modal(s) (e.g. 'Turn on notifications')",
+            initial_dismissals,
+        )
+
     behavior = HumanBehaviorEngine(browser.page)
     # Initial "I just opened the app" beat — humans don't engage instantly.
     behavior.idle(2.0, 4.0)
@@ -375,6 +661,28 @@ def execute_warmup(
     action_log: List[Dict[str, Any]] = []
 
     while time.monotonic() < end_time:
+        # ── ROBOTS.TXT GUARD ───────────────────────────────────────────
+        # If a prior tick crashed and somehow re-navigated to the
+        # cookie-injection domain (/robots.txt), force recovery to the
+        # feed. Without this the entire remaining session runs against
+        # the wrong page and every locator silently fails.
+        try:
+            current_url = browser.page.url or ""
+            if "robots.txt" in current_url or not current_url.startswith("https://www.instagram.com"):
+                logger.warning(
+                    "[warmup] URL guard triggered (url=%r) — navigating back to feed",
+                    current_url,
+                )
+                browser.page.get(feed_url)
+                time.sleep(page_load_wait_s)
+                # Re-sweep modals after forced navigation.
+                try:
+                    dismiss_instagram_modals(browser.page)
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.debug("[warmup] URL guard check failed (%s); continuing", exc)
+
         action_name = _pick_action(weights, rng)
         action_fn = _ACTIONS[action_name]
         tick_started_at = time.monotonic()
