@@ -1,4 +1,4 @@
-"""Password hashing utilities (PBKDF2-HMAC-SHA256, stdlib-only)."""
+"""Password hashing helpers. PBKDF2-HMAC-SHA256, stdlib only."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ _SALT_BYTES = 16
 _HASH_BYTES = 32
 
 def hash_password(password: str) -> str:
-    """Return a self-describing hash string of the form
-    ``pbkdf2_sha256$<iterations>$<salt_hex>$<hash_hex>``.
+    """Return a self-describing hash string:
+    pbkdf2_sha256$<iterations>$<salt_hex>$<hash_hex>.
     """
     if not password:
         raise ValueError("password must not be empty")
@@ -25,7 +25,7 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(password: str, stored: str) -> bool:
-    """Constant-time verification of ``password`` against the stored hash."""
+    """Constant-time check of password against the stored hash."""
     try:
         algo, iter_str, salt_hex, hash_hex = stored.split("$")
     except ValueError:
