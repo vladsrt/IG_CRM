@@ -1,4 +1,4 @@
-"""CRUD operations for ``Task``."""
+"""CRUD for Task."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ class TaskUpdate(BaseModel):
     error_log: str | None = None
 
 
-# ── Read ────────────────────────────────────────────────────────────────
+# read
 def get_task(db: Session, task_id: uuid.UUID) -> Task | None:
     return db.get(Task, task_id)
 
@@ -45,7 +45,7 @@ def list_tasks(
     return db.execute(stmt).scalars().all()
 
 
-# ── Create ──────────────────────────────────────────────────────────────
+# create
 def create_task(db: Session, task_in: TaskCreate) -> Task:
     if db.get(InstagramAccount, task_in.account_id) is None:
         raise ValueError(f"InstagramAccount {task_in.account_id} does not exist")
@@ -65,7 +65,7 @@ def create_task(db: Session, task_in: TaskCreate) -> Task:
     return task
 
 
-# ── Update ──────────────────────────────────────────────────────────────
+# update
 def update_task(
     db: Session, task_id: uuid.UUID, task_in: TaskUpdate
 ) -> Task | None:
@@ -89,7 +89,7 @@ def update_task(
     return task
 
 
-# ── Delete ──────────────────────────────────────────────────────────────
+# delete
 def delete_task(db: Session, task_id: uuid.UUID) -> bool:
     task = get_task(db, task_id)
     if task is None:
