@@ -1,13 +1,13 @@
-"""Application configuration loaded from environment variables."""
+"""App config, loaded from env vars."""
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Central application settings.
+    """Main app settings.
 
-    Values are loaded from the `.env` file located in `backend/`
-    and can be overridden by real environment variables at runtime.
+    Values come from the .env file in backend/, real env vars override them
+    at runtime.
     """
 
     model_config = SettingsConfigDict(
@@ -16,31 +16,31 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    # ── Database ────────────────────────────────────────────────────────
+    # database
     DATABASE_URL: str = "postgresql+psycopg://ig_user:ig_password123@localhost:5433/ig_crm"
 
-    # ── Redis / Celery ──────────────────────────────────────────────────
+    # redis and celery
     REDIS_URL: str = "redis://localhost:6379/0"
     CELERY_BROKER_URL: str = "redis://localhost:6379/1"
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/2"
     CELERY_TASK_DEFAULT_QUEUE: str = "ig_crm.default"
     CELERY_TASK_TIME_LIMIT: int = 60 * 30        # hard kill after 30 min
-    CELERY_TASK_SOFT_TIME_LIMIT: int = 60 * 25   # raise SoftTimeLimitExceeded at 25 min
+    CELERY_TASK_SOFT_TIME_LIMIT: int = 60 * 25   # SoftTimeLimitExceeded after 25 min
 
-    # ── OpenAI ──────────────────────────────────────────────────────────
+    # openai
     OPENAI_API_KEY: str = ""
     OPENAI_MODEL: str = "gpt-4o-mini"
     OPENAI_TIMEOUT_SECONDS: float = 60.0
     OPENAI_MAX_RETRIES: int = 2
 
-    # ── Media storage / FFmpeg ──────────────────────────────────────────
-    MEDIA_ROOT: str = "./media"                 # base dir for uploaded + processed assets
-    MEDIA_MAX_UPLOAD_BYTES: int = 500 * 1024 * 1024   # 500 MB hard cap per upload
+    # media storage and ffmpeg
+    MEDIA_ROOT: str = "./media"                 # base dir for uploaded and processed assets
+    MEDIA_MAX_UPLOAD_BYTES: int = 500 * 1024 * 1024   # 500 MB per upload, hard cap
     FFMPEG_BIN: str = "ffmpeg"
     FFPROBE_BIN: str = "ffprobe"
-    FFMPEG_TIMEOUT_SECONDS: int = 60 * 15       # 15 min per uniqueization pass
-    FFMPEG_DEFAULT_BITRATE_BPS: int = 3_000_000  # fallback if ffprobe can't read input
+    FFMPEG_TIMEOUT_SECONDS: int = 60 * 15       # 15 min per uniqueize pass
+    FFMPEG_DEFAULT_BITRATE_BPS: int = 3_000_000  # used if ffprobe can not read the input
 
 
-# Singleton – import `settings` everywhere instead of re-instantiating.
+# singleton, import `settings` instead of building a new one
 settings = Settings()
