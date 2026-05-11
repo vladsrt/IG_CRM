@@ -1,4 +1,4 @@
-"""CRUD operations for ``Subscription``."""
+"""CRUD for Subscription."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from app.models.user import User
 from app.schemas.billing import SubscriptionCreate, SubscriptionUpdate
 
 
-# ── Read ────────────────────────────────────────────────────────────────
+# read
 def get_subscription(db: Session, sub_id: uuid.UUID) -> Subscription | None:
     return db.get(Subscription, sub_id)
 
@@ -33,7 +33,7 @@ def list_subscriptions(
     return db.execute(stmt).scalars().all()
 
 
-# ── Create ──────────────────────────────────────────────────────────────
+# create
 def create_subscription(db: Session, sub_in: SubscriptionCreate) -> Subscription:
     if db.get(User, sub_in.user_id) is None:
         raise ValueError(f"User {sub_in.user_id} does not exist")
@@ -51,7 +51,7 @@ def create_subscription(db: Session, sub_in: SubscriptionCreate) -> Subscription
     return sub
 
 
-# ── Update ──────────────────────────────────────────────────────────────
+# update
 def update_subscription(
     db: Session, sub_id: uuid.UUID, sub_in: SubscriptionUpdate
 ) -> Subscription | None:
@@ -67,7 +67,7 @@ def update_subscription(
     return sub
 
 
-# ── Delete ──────────────────────────────────────────────────────────────
+# delete
 def delete_subscription(db: Session, sub_id: uuid.UUID) -> bool:
     sub = get_subscription(db, sub_id)
     if sub is None:
