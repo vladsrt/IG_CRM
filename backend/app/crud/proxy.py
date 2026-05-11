@@ -1,4 +1,4 @@
-"""CRUD operations for ``Proxy``."""
+"""CRUD for Proxy."""
 
 from __future__ import annotations
 
@@ -12,8 +12,7 @@ from sqlalchemy.orm import Session
 from app.models.proxy import Proxy
 from app.schemas.proxy import ProxyCreate, ProxyUpdate
 
-# Backwards-compat re-export — ``ProxyUpdate`` now lives in
-# ``app.schemas.proxy`` (canonical home), but legacy imports keep working.
+# re-export for old imports. ProxyUpdate is now in app.schemas.proxy.
 __all__ = [
     "ProxyUpdate",
     "create_proxy",
@@ -24,7 +23,7 @@ __all__ = [
 ]
 
 
-# ── Read ────────────────────────────────────────────────────────────────
+# read
 def get_proxy(db: Session, proxy_id: uuid.UUID) -> Proxy | None:
     return db.get(Proxy, proxy_id)
 
@@ -33,7 +32,7 @@ def list_proxies(db: Session, skip: int = 0, limit: int = 100) -> Sequence[Proxy
     return db.execute(stmt).scalars().all()
 
 
-# ── Create ──────────────────────────────────────────────────────────────
+# create
 def create_proxy(db: Session, proxy_in: ProxyCreate) -> Proxy:
     proxy = Proxy(**proxy_in.model_dump(mode="json"))
     db.add(proxy)
@@ -46,7 +45,7 @@ def create_proxy(db: Session, proxy_in: ProxyCreate) -> Proxy:
     return proxy
 
 
-# ── Update ──────────────────────────────────────────────────────────────
+# update
 def update_proxy(
     db: Session, proxy_id: uuid.UUID, proxy_in: ProxyUpdate
 ) -> Proxy | None:
@@ -67,7 +66,7 @@ def update_proxy(
     return proxy
 
 
-# ── Delete ──────────────────────────────────────────────────────────────
+# delete
 def delete_proxy(db: Session, proxy_id: uuid.UUID) -> bool:
     proxy = get_proxy(db, proxy_id)
     if proxy is None:
