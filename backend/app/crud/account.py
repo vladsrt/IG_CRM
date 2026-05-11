@@ -1,4 +1,4 @@
-"""CRUD operations for ``InstagramAccount``."""
+"""CRUD for InstagramAccount."""
 
 from __future__ import annotations
 
@@ -15,9 +15,8 @@ from app.models.user import User
 from app.schemas.account import InstagramAccountCreate, InstagramAccountUpdate
 from workers.utils.ua_generator import get_random_user_agent
 
-# Backwards-compat re-export so legacy imports (`from app.crud.account import
-# InstagramAccountUpdate`) keep resolving — the canonical home is now
-# ``app.schemas.account``.
+# re-export for old imports. The real home is now app.schemas.account, but
+# some old code still does: from app.crud.account import InstagramAccountUpdate.
 __all__ = [
     "InstagramAccountUpdate",
     "create_account",
@@ -30,7 +29,7 @@ __all__ = [
 
 
 def _normalize_tags(tags: list[str] | None) -> list[str]:
-    """Lowercase, strip, dedupe — keeps the JSONB column tidy."""
+    """Lowercase, strip and dedupe tags so the jsonb column stays clean."""
     if not tags:
         return []
     seen: dict[str, None] = {}
@@ -43,7 +42,7 @@ def _normalize_tags(tags: list[str] | None) -> list[str]:
     return list(seen.keys())
 
 
-# ── Read ────────────────────────────────────────────────────────────────
+# read
 def get_account(db: Session, account_id: uuid.UUID) -> InstagramAccount | None:
     return db.get(InstagramAccount, account_id)
 
@@ -60,7 +59,7 @@ def list_accounts(
     if user_id is not None:
         stmt = stmt.where(InstagramAccount.user_id == user_id)
     if tags:
-        # JSONB containment: row.tags must contain every requested tag.
+        # jsonb contains: row.tags must include every requested tag.
         wanted = _normalize_tags(tags)
         if wanted:
             stmt = stmt.where(InstagramAccount.tags.contains(wanted))
@@ -74,11 +73,11 @@ def list_accounts_by_tags(
     *,
     user_id: uuid.UUID | None = None,
 ) -> Sequence[InstagramAccount]:
-    """Convenience helper used by the AI orchestrator (Sprint 5)."""
+    """Shortcut used by the AI orchestrator."""
     return list_accounts(db, user_id=user_id, tags=tags, limit=10_000)
 
 
-# ── Create ──────────────────────────────────────────────────────────────
+# create
 def create_account(
     db: Session, account_in: InstagramAccountCreate
 ) -> InstagramAccount:
@@ -95,10 +94,10 @@ def create_account(
     )
     payload["tags"] = _normalize_tags(payload.get("tags"))
 
-    # Pin a UA at creation time. If the operator did not supply one,
-    # pick from the pool that matches the chosen platform — and persist
-    # it. Once stored, the UA is NEVER auto-rotated; rotating mid-life
-    # is a stronger bot signal than picking an unfortunate string.
+    # pick and save a UA at create time. if the user gave none, take one
+    # from the pool that matches the chosen platform. once saved, the UA is
+    # not rotated. swapping the UA later is a bigger bot signal than just
+    # ending up with a not-so-great string.
     platform_raw = payload.get("platform") or Platform.WINDOWS.value
     payload["platform"] = (
         platform_raw.value if isinstance(platform_raw, Platform) else platform_raw
@@ -116,7 +115,7 @@ def create_account(
     db.refresh(account)
     return account
 
-# ── Update ──────────────────────────────────────────────────────────────
+# update
 def update_account(
     db: Session,
     account_id: uuid.UUID,
@@ -149,7 +148,7 @@ def update_account(
     return account
 
 
-# ── Delete ──────────────────────────────────────────────────────────────
+# delete
 def delete_account(db: Session, account_id: uuid.UUID) -> bool:
     account = get_account(db, account_id)
     if account is None:
