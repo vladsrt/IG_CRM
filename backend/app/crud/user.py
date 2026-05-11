@@ -1,4 +1,4 @@
-"""CRUD operations for ``User`` (with auto-provisioned free Subscription)."""
+"""CRUD for User. Also makes a free Subscription on create."""
 
 from __future__ import annotations
 
@@ -16,13 +16,13 @@ from app.models.user import User
 from app.schemas.user import UserCreate
 
 class UserUpdate(BaseModel):
-    """Fields that may be patched on an existing user."""
+    """Fields that PATCH can change on a user."""
 
     email: EmailStr | None = None
     password: str | None = Field(default=None, min_length=8)
 
 
-# ── Read ────────────────────────────────────────────────────────────────
+# read
 def get_user(db: Session, user_id: uuid.UUID) -> User | None:
     return db.get(User, user_id)
 
@@ -37,9 +37,9 @@ def list_users(db: Session, skip: int = 0, limit: int = 100) -> Sequence[User]:
     return db.execute(stmt).scalars().all()
 
 
-# ── Create ──────────────────────────────────────────────────────────────
+# create
 def create_user(db: Session, user_in: UserCreate) -> User:
-    """Create a user and atomically attach a default ``free`` Subscription."""
+    """Create the user and attach a default `free` Subscription in one tx."""
     if get_user_by_email(db, user_in.email) is not None:
         raise ValueError(f"User with email {user_in.email!r} already exists")
 
@@ -59,7 +59,7 @@ def create_user(db: Session, user_in: UserCreate) -> User:
     return user
 
 
-# ── Update ──────────────────────────────────────────────────────────────
+# update
 def update_user(
     db: Session, user_id: uuid.UUID, user_in: UserUpdate
 ) -> User | None:
@@ -82,7 +82,7 @@ def update_user(
     return user
 
 
-# ── Delete ──────────────────────────────────────────────────────────────
+# delete
 def delete_user(db: Session, user_id: uuid.UUID) -> bool:
     user = get_user(db, user_id)
     if user is None:
