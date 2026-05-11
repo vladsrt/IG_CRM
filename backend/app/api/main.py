@@ -1,4 +1,4 @@
-"""FastAPI application entrypoint — aggregates all routers."""
+"""FastAPI app, plugs all routers together."""
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ from app.api.routers import account, ai, media, orchestrator, proxy, task, user
 app = FastAPI(
     title="Instagram CRM API",
     description=(
-        "Sprint 1 — Core API & CRUD (Subscription SaaS billing model). "
-        "Sprint 2 — Task Orchestrator & Celery dispatch. "
-        "Sprint 3 — AI prompt → Task plan. "
-        "Sprint 5 — Media Manager, FFmpeg uniqueization, account tagging."
+        "Sprint 1: core API and CRUD with subscription billing. "
+        "Sprint 2: task orchestrator and Celery dispatch. "
+        "Sprint 3: AI prompt to task plan. "
+        "Sprint 5: media manager, ffmpeg uniqueization, account tagging."
     ),
     version="0.5.0",
 )
@@ -23,7 +23,7 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-# ── Router aggregation ──────────────────────────────────────────────────
+# routers
 app.include_router(user.router)
 app.include_router(proxy.router)
 app.include_router(account.router)
