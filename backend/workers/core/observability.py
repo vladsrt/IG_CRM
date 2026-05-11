@@ -1,24 +1,23 @@
-"""
-Observability for browser-side execution
-----------------------------------------
-Two cooperating background watchers attach to the live ``ChromiumPage``
-while ``TaskExecutor`` is running commands:
+"""Observability for the browser side.
 
-1. **Network interceptor** (Task 6.1)
-   Listens for IG GraphQL / private-API JSON responses. Pulls
-   ``follower_count``, ``reach``, and reel ``view_count`` / ``play_count``
-   out of the body and queues them as ``MetricSample`` records. The
-   executor flushes the queue to ``account_metrics`` after the run.
+Two background watchers attach to the live ChromiumPage while TaskExecutor
+runs commands:
 
-2. **Checkpoint detector** (Task 6.2)
-   Polls ``page.url`` on a short cadence. If IG redirects to
-   ``/challenge/`` or ``/accounts/suspended/`` the watcher trips a flag;
-   the executor calls :py:meth:`ObservabilityMonitor.check_checkpoint`
-   between commands and raises :class:`CheckpointException` so the Celery
-   wrapper can mark the Task FAILED and the account ``checkpoint_required``.
+1. Network interceptor.
+   Listens for IG graphql / private-api json responses. Reads
+   follower_count, reach, and reel view_count / play_count out of the
+   body and queues them as MetricSample rows. The executor flushes the
+   queue into account_metrics after the run.
 
-Both watchers are daemon threads — they cannot keep the worker process
-alive on their own and they tear down idempotently on ``stop()``.
+2. Checkpoint detector.
+   Polls page.url every second or so. If IG redirects to /challenge/ or
+   /accounts/suspended/, the watcher sets a flag. The executor calls
+   ObservabilityMonitor.check_checkpoint between commands. That raises
+   CheckpointException so the Celery wrapper can mark the Task FAILED
+   and the account checkpoint_required.
+
+Both watchers are daemon threads. They can not keep the worker process
+alive on their own and they shut down safely if stop() is called twice.
 """
 
 from __future__ import annotations
@@ -34,14 +33,14 @@ from typing import Any, Iterable, List, Optional
 logger = logging.getLogger(__name__)
 
 
-# ── Public errors ───────────────────────────────────────────────────────
+# public errors
 class CheckpointException(Exception):
-    """Raised when IG redirects the session to a challenge / suspension page.
+    """Raised when IG sends the session to a challenge or suspended page.
 
-    The catching layer (``run_instagram_task``) is expected to:
-      * mark the Task ``FAILED``
-      * mark the InstagramAccount ``status='checkpoint_required'``
-      * persist the offending URL to ``Task.error_log``
+    The catching layer (run_instagram_task) should:
+      - mark the Task FAILED
+      - set InstagramAccount.status='checkpoint_required'
+      - write the offending URL to Task.error_log
     """
 
     def __init__(self, url: str) -> None:
@@ -49,10 +48,10 @@ class CheckpointException(Exception):
         self.url = url
 
 
-# ── Public data records ─────────────────────────────────────────────────
+# public data records
 @dataclass(slots=True)
 class MetricSample:
-    """One in-memory metric data-point produced by the network listener."""
+    """One in-memory metric data point produced by the network listener."""
 
     metric_type: str  # 'followers' | 'reach' | 'reel_views'
     value: int
@@ -60,7 +59,7 @@ class MetricSample:
     raw_payload: Optional[dict[str, Any]] = None
 
 
-# ── Tunables ────────────────────────────────────────────────────────────
+# knobs
 _DEFAULT_URL_POLL_INTERVAL_S: float = 1.0
 _DEFAULT_LISTEN_TIMEOUT_S: float = 2.0
 _CHECKPOINT_URL_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -89,9 +88,9 @@ _RAW_PAYLOAD_TRIM_KEYS: tuple[str, ...] = (
 )
 
 
-# ── Monitor ─────────────────────────────────────────────────────────────
+# monitor
 class ObservabilityMonitor:
-    """Owns the URL-poller and network-listener threads for one task run."""
+    """Owns the url poller and network listener threads for one task run."""
 
     def __init__(
         self,
@@ -119,9 +118,9 @@ class ObservabilityMonitor:
         self._started = False
         self._stopped = False
 
-    # ── Lifecycle ──────────────────────────────────────────────────────
+    # lifecycle
     def start(self) -> None:
-        """Begin background watchers. Idempotent."""
+        """Start the background watchers. Safe to call twice."""
         if self._started:
             return
         self._started = True
@@ -147,7 +146,7 @@ class ObservabilityMonitor:
         )
 
     def stop(self, *, join_timeout_s: float = 3.0) -> None:
-        """Signal both threads to exit and wait briefly. Idempotent."""
+        """Tell both threads to exit and wait a bit. Safe to call twice."""
         if self._stopped:
             return
         self._stopped = True
@@ -156,27 +155,27 @@ class ObservabilityMonitor:
         try:
             self._page.listen.stop()
         except Exception as exc:
-            logger.debug("[observability] page.listen.stop raised (%s); ignoring", exc)
+            logger.debug("[observability] page.listen.stop raised (%s), ignoring", exc)
 
         for thread in (self._url_thread, self._listen_thread):
             if thread is not None and thread.is_alive():
                 thread.join(timeout=join_timeout_s)
         logger.info(
-            "[observability] stopped for account_id=%s; collected %d sample(s)",
+            "[observability] stopped for account_id=%s, collected %d sample(s)",
             self._account_id,
             len(self._samples),
         )
 
-    # ── Public probes (called from TaskExecutor) ───────────────────────
+    # public probes, called from TaskExecutor
     def check_checkpoint(self) -> None:
-        """Raise :class:`CheckpointException` if the URL poller flagged one."""
+        """Raise CheckpointException if the URL poller flagged one."""
         with self._checkpoint_lock:
             url = self._checkpoint_url
         if url is not None:
             raise CheckpointException(url)
 
     def drain_samples(self) -> List[MetricSample]:
-        """Atomically take all buffered samples and reset the buffer."""
+        """Grab every buffered sample at once and clear the buffer."""
         with self._samples_lock:
             out = list(self._samples)
             self._samples.clear()
@@ -186,7 +185,7 @@ class ObservabilityMonitor:
     def account_id(self) -> uuid.UUID:
         return self._account_id
 
-    # ── URL-change watcher (Task 6.2) ──────────────────────────────────
+    # url-change watcher
     def _url_loop(self) -> None:
         last_seen: str = ""
         while not self._stop_event.is_set():
@@ -205,16 +204,16 @@ class ObservabilityMonitor:
                     logger.warning(
                         "[observability] checkpoint URL detected: %s", current
                     )
-                    # Keep the loop alive so subsequent checks still raise — the
-                    # executor will catch the exception on its next tick.
+                    # keep the loop alive so later checks still raise, the
+                    # executor catches the exception on its next tick.
             self._stop_event.wait(self._url_poll_interval_s)
 
-    # ── Network listener (Task 6.1) ────────────────────────────────────
+    # network listener
     def _listen_loop(self) -> None:
         try:
             self._page.listen.start(self._intercept_targets)
         except Exception:
-            logger.exception("[observability] page.listen.start failed; aborting listener")
+            logger.exception("[observability] page.listen.start failed, listener exits")
             return
 
         while not self._stop_event.is_set():
@@ -250,26 +249,26 @@ class ObservabilityMonitor:
             )
 
 
-# ── Pure extraction helpers (unit-testable, no I/O) ─────────────────────
+# pure extract helpers, no I/O, easy to unit test
 def _extract_samples(url: str, body: Any) -> List[MetricSample]:
-    """Walk a JSON response and yield ``MetricSample``s for known shapes."""
+    """Walk a json response and yield MetricSample for known shapes."""
     out: List[MetricSample] = []
     _walk(body, url, out)
     return out
 
 
 def _walk(node: Any, url: str, out: List[MetricSample], _depth: int = 0) -> None:
-    """Recursively walk a JSON document looking for known metric keys.
+    """Walk a json doc and look for known metric keys.
 
-    Bounded recursion (`_depth`) keeps a hostile / cyclic payload from
-    blowing the stack. IG bodies are well-behaved, but the listener runs
-    on whatever the wire delivers.
+    `_depth` bounds the recursion so a hostile or cyclic payload can not
+    blow the stack. IG payloads are usually fine, but the listener takes
+    whatever the wire gives it.
     """
     if _depth > 12:
         return
 
     if isinstance(node, dict):
-        # Account-scoped: follower_count
+        # account level: follower_count
         follower_count = node.get("follower_count")
         if isinstance(follower_count, int):
             out.append(MetricSample(
@@ -278,7 +277,7 @@ def _walk(node: Any, url: str, out: List[MetricSample], _depth: int = 0) -> None
                 raw_payload=_trim(node),
             ))
 
-        # Account-scoped: reach (insights endpoint variants)
+        # account level: reach (insights endpoints have a few variants)
         for reach_key in ("reach", "reach_count"):
             reach = node.get(reach_key)
             if isinstance(reach, int):
@@ -289,7 +288,7 @@ def _walk(node: Any, url: str, out: List[MetricSample], _depth: int = 0) -> None
                 ))
                 break
 
-        # Reel-scoped: play_count / view_count
+        # reel level: play_count / view_count
         media_type = node.get("media_type")
         product_type = node.get("product_type")
         is_reel = (
@@ -317,7 +316,7 @@ def _walk(node: Any, url: str, out: List[MetricSample], _depth: int = 0) -> None
 
 
 def _trim(node: dict[str, Any]) -> dict[str, Any]:
-    """Keep only diagnostically useful keys from a node before persisting."""
+    """Keep only the useful keys from a node before we save it."""
     return {k: node[k] for k in _RAW_PAYLOAD_TRIM_KEYS if k in node}
 
 

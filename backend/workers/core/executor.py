@@ -1,13 +1,8 @@
-"""
-Task Executor
--------------
-Consumes a payload dict (built by ``app.workers.celery_tasks.run_instagram_task``),
-spins up an ``InstagramBrowser``, injects cookies, dispatches each command to
-its registered handler, and *guarantees* browser teardown.
+"""Task executor.
 
-The strict requirement of Story 4.4 — no zombie Chrome processes, no
-leaked proxy-plugin folders — is enforced by the ``try/finally`` block in
-``execute()``.
+Takes a payload dict, starts an InstagramBrowser, injects cookies, runs
+each command through its handler, and always closes the browser at the
+end so we do not leave zombie Chrome processes around.
 """
 
 from __future__ import annotations
@@ -29,7 +24,7 @@ from workers.core.observability import (
 logger = logging.getLogger(__name__)
 
 
-# ── Defaults ────────────────────────────────────────────────────────────
+# defaults
 DEFAULT_USER_AGENT: str = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -40,39 +35,33 @@ DEFAULT_COOKIE_DOMAIN: str = ".instagram.com"
 DEFAULT_COOKIE_PATH: str = "/"
 
 
-# ── Action registry ─────────────────────────────────────────────────────
-# Each handler signature: (browser: InstagramBrowser, args: dict) -> dict
+# action registry
+# handler signature: (browser: InstagramBrowser, args: dict) -> dict
 ActionHandler = Callable[[InstagramBrowser, Dict[str, Any]], Dict[str, Any]]
 
 ACTION_REGISTRY: Dict[str, ActionHandler] = {
     "warmup":         execute_warmup,
-    # All three upload variants share one handler — IG decides server-side
-    # whether a video becomes a Reel based on duration/aspect ratio.
+    # all upload kinds share one handler
     "upload_reels":   execute_upload,
     "upload_post":    execute_upload,
     "upload_story":   execute_upload,
-    # Profile / privacy edits (Epic 9). One handler covers bio, avatar,
-    # and the is_private toggle — the args dict drives which fields run.
+    # profile and privacy edits
     "update_profile": execute_update_profile,
-    # Wire additional handlers here as they are implemented:
-    # "send_dm":      execute_send_dm,
-    # "like_post":    execute_like_post,
-    # ...
 }
 
 
-# ── Errors ──────────────────────────────────────────────────────────────
+# errors
 class ExecutorError(RuntimeError):
     """Raised when the executor cannot start or dispatch a command."""
 
 
 class UnknownActionError(ExecutorError):
-    """The payload referenced an action that has no registered handler."""
+    """Payload references an action with no handler registered."""
 
 
-# ── Executor ────────────────────────────────────────────────────────────
+# executor
 class TaskExecutor:
-    """Owns the lifecycle of a single browser session for one Task."""
+    """Owns the lifecycle of one browser session for one Task."""
 
     def __init__(self, payload: Dict[str, Any]) -> None:
         if not isinstance(payload, dict):
@@ -99,9 +88,9 @@ class TaskExecutor:
             payload.get("commands")
         )
 
-    # ── Public entrypoint ──────────────────────────────────────────────
+    # public entrypoint
     def execute(self) -> Dict[str, Any]:
-        """Run every command in order. Always tears the browser down."""
+        """Run every command in order. Always close the browser at the end."""
         logger.info(
             "[TaskExecutor] starting task_id=%s account_id=%s commands=%d",
             self.task_id,
@@ -125,7 +114,7 @@ class TaskExecutor:
         results: List[Dict[str, Any]] = []
         captured_samples: List[MetricSample] = []
 
-        # ── Story 4.4: guaranteed teardown ─────────────────────────────
+        # make sure the browser is closed no matter what
         try:
             browser = InstagramBrowser(
                 proxy_string=self.proxy_string,
@@ -134,7 +123,7 @@ class TaskExecutor:
                 task_id=self.task_id,
             )
 
-            # Story 4.5: cookie injection
+            # inject cookies if we have any
             if self.cookies:
                 browser.inject_cookies(self.cookies)
             else:
@@ -143,8 +132,7 @@ class TaskExecutor:
                     self.task_id,
                 )
 
-            # Epic 6: kick off network + URL watchers BEFORE any command runs.
-            # Started here (not in __init__) so the browser/page exists.
+            # start the network and URL watchers before any command runs
             account_uuid = self._account_uuid()
             if account_uuid is not None:
                 monitor = ObservabilityMonitor(
@@ -153,12 +141,11 @@ class TaskExecutor:
                 monitor.start()
             else:
                 logger.warning(
-                    "[TaskExecutor] payload missing account_id — observability disabled"
+                    "[TaskExecutor] payload has no account_id, observability is off"
                 )
 
             for index, command in enumerate(self.commands):
-                # Epic 6.2: between every command, abort if IG redirected
-                # the session to a challenge / suspended page.
+                # bail out if IG sent us to a challenge or suspended page
                 if monitor is not None:
                     monitor.check_checkpoint()
 
@@ -186,14 +173,13 @@ class TaskExecutor:
                     {"index": index, "action": action, "result": command_result}
                 )
 
-            # Final post-loop checkpoint sweep: a redirect after the last
-            # command should still be surfaced as a CheckpointException.
+            # one more check to catch a redirect that happened after the
+            # last command
             if monitor is not None:
                 monitor.check_checkpoint()
 
         finally:
-            # Stop the watchers + drain whatever they captured BEFORE the
-            # browser teardown — once the page is gone, samples are gone too.
+            # stop the watchers before the page is gone
             if monitor is not None:
                 try:
                     monitor.stop()
@@ -204,19 +190,18 @@ class TaskExecutor:
                         self.task_id,
                     )
 
-            # Crucial: zombie-process / proxy-folder cleanup.
+            # close the browser, clean folders
             if browser is not None:
                 try:
                     browser.close()
                 except Exception:
                     logger.exception(
-                        "[TaskExecutor] browser.close() raised during teardown — "
-                        "task_id=%s. Continuing.",
+                        "[TaskExecutor] browser.close() raised during shutdown, "
+                        "task_id=%s. Going on.",
                         self.task_id,
                     )
 
-        # ── Persist metrics + run analytics OUTSIDE the browser try/finally
-        # so a metric-write hiccup can never leak Chrome processes. ──────
+        # save metrics and run analytics outside the browser try/finally
         metrics_summary = self._persist_and_analyze(captured_samples)
 
         return {
@@ -238,19 +223,19 @@ class TaskExecutor:
     def _persist_and_analyze(
         self, samples: List[MetricSample]
     ) -> Dict[str, Any]:
-        """Flush captured metrics + invoke shadowban detector. Best-effort."""
+        """Save the captured metrics and run the shadowban check."""
         account_uuid = self._account_uuid()
         if account_uuid is None or not samples:
             return {"persisted": 0, "shadowban": None}
 
-        # Local imports keep `workers.core` free of `app.*` import-time deps.
+        # local imports so the module does not pull these at import time
         try:
             from app.core.database import SessionLocal
             from app.services import shadowban as shadowban_service
             from app.services.metrics import persist_samples
         except Exception:
             logger.exception(
-                "[TaskExecutor] could not import metric/shadowban services — "
+                "[TaskExecutor] could not import metric/shadowban services, "
                 "skipping persistence for task_id=%s",
                 self.task_id,
             )
@@ -271,10 +256,10 @@ class TaskExecutor:
 
         return {"persisted": persisted, "shadowban": shadowban_result}
 
-    # ── Normalization helpers ──────────────────────────────────────────
+    # normalization helpers
     @staticmethod
     def _normalize_commands(raw: Any) -> List[Dict[str, Any]]:
-        """Accept either a list of commands or a full plan dict and flatten."""
+        """Pull the commands list out of the payload."""
         if raw is None:
             return []
         if isinstance(raw, list):
@@ -289,15 +274,12 @@ class TaskExecutor:
 
     @staticmethod
     def _normalize_cookies(raw: Any) -> List[Dict[str, str]]:
-        """
-        Coerce the stored cookie blob into the list-of-dicts shape that
-        ``InstagramBrowser.inject_cookies`` expects.
+        """Turn the stored cookies blob into the list-of-dicts shape we use.
 
         Accepts:
-            * ``None`` or ``{}`` → no cookies
-            * ``list[dict]``     → passed through (Instagram-export format)
-            * ``dict[str, str]`` → treated as flat ``name → value`` map and
-              expanded into a cookie list with the default IG domain/path
+            None or {}  -> []
+            list[dict]  -> pass through
+            dict[str, str] -> flat map, expanded with default IG domain and path.
         """
         if not raw:
             return []
@@ -314,5 +296,5 @@ class TaskExecutor:
                 for name, value in raw.items()
             ]
         raise ExecutorError(
-            f"payload['cookies'] must be list, dict, or None — got {type(raw).__name__}"
+            f"payload['cookies'] must be list, dict or None, got {type(raw).__name__}"
         )

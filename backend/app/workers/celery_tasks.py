@@ -1,20 +1,19 @@
-"""Celery task definitions — thin wrappers around the browser-automation core.
+"""Celery tasks. Thin wrappers around the browser automation core.
 
-The browser logic itself (DrissionPage) lives in ``backend/workers/`` and is
-invoked from these tasks. These wrappers are responsible for:
+The real browser code (DrissionPage) lives in backend/workers/ and is called
+from here. The job of these wrappers:
 
-* loading ORM state (Task / Account / Proxy) inside a fresh DB session
-* mutating the Task lifecycle status (PENDING → RUNNING → COMPLETED/FAILED)
-* building the immutable payload that the browser worker consumes
-* funneling failures into ``Task.error_log``
+- load orm state (Task / Account / Proxy) in a fresh db session
+- move the Task through statuses (PENDING -> RUNNING -> COMPLETED/FAILED)
+- build the payload the browser worker reads
+- send errors to Task.error_log
 
-Reliability fixes implemented (Security & Reliability Audit)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-* CRITICAL-1 — orphan recovery at the start of every ``run_instagram_task``
-  invocation, plus a periodic ``reap_stale_tasks`` janitor task.
-* CRITICAL-2 — ``SELECT … FOR UPDATE NOWAIT`` on the InstagramAccount row
-  before state transition, and a sibling-RUNNING refusal so two workers
-  never drive the same account in parallel.
+Reliability fixes from the audit:
+- orphan recovery at the start of every run_instagram_task, plus a periodic
+  reap_stale_tasks janitor.
+- SELECT ... FOR UPDATE NOWAIT on the InstagramAccount row before state
+  transition, and a sibling-RUNNING check so two workers never drive the
+  same account at once.
 """
 
 from __future__ import annotations
@@ -41,36 +40,35 @@ from workers.core.observability import CheckpointException
 logger = logging.getLogger(__name__)
 
 
-# ── Constants ───────────────────────────────────────────────────────────
+# constants
 CHECKPOINT_ACCOUNT_STATUS: str = "checkpoint_required"
 
-# Statuses that signal a previous worker died mid-execution. If a task
-# arrives in any of these states, refuse to re-run.
+# statuses that mean a previous worker died mid-run. if a task arrives in one
+# of these, do not re-run it.
 _ORPHAN_STATUSES: frozenset[str] = frozenset({TaskStatus.RUNNING.value})
 
-# Statuses from which we will dispatch to the browser. PENDING is the
-# normal entry; DRAFT is allowed for the manual ``/orchestrator/tasks/{id}/start``
-# path.
+# statuses we will dispatch to the browser. PENDING is the normal entry,
+# DRAFT is allowed for the manual /orchestrator/tasks/{id}/start path.
 _RUNNABLE_STATUSES: frozenset[str] = frozenset(
     {TaskStatus.PENDING.value, TaskStatus.DRAFT.value}
 )
 
-# CRITICAL-1 reaper threshold — Tasks stuck in RUNNING for longer than
-# this are presumed dead and force-failed by the periodic janitor.
-# 1 hour matches the spec; tunable via the task's ``stale_after_seconds``.
+# reaper threshold. tasks stuck in RUNNING longer than this are treated as
+# dead and force-failed by the periodic janitor. 1h matches the spec, can be
+# tuned per call with stale_after_seconds.
 _REAP_AFTER_SECONDS: int = 60 * 60
 
-# CRITICAL-2 retry budget for the FOR UPDATE NOWAIT contention path.
+# retry budget for the FOR UPDATE NOWAIT contention path.
 _LOCK_RETRY_MAX_ATTEMPTS: int = 5
-_LOCK_RETRY_BASE_BACKOFF_S: int = 30  # exponential: 30, 60, 120, 240, 480
+_LOCK_RETRY_BASE_BACKOFF_S: int = 30  # 30, 60, 120, 240, 480 seconds
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────
+# helpers
 def _build_proxy_string(proxy: Proxy | None) -> str | None:
-    """Render a proxy ORM row as a ``user:pass@host:port`` string.
+    """Turn a proxy orm row into a user:pass@host:port string.
 
-    Note: ``InstagramBrowser`` / ``proxy_builder.create_proxy_extension``
-    parse this format directly — no scheme prefix.
+    Note: InstagramBrowser and proxy_builder.create_proxy_extension parse
+    this format directly, no scheme prefix.
     """
     if proxy is None:
         return None
@@ -83,7 +81,7 @@ def _set_task_status(
     *,
     error_log: str | None = None,
 ) -> None:
-    """Atomically transition a Task to ``new_status`` (and optionally log error)."""
+    """Switch a Task to new_status in one tx, optionally write an error log."""
     with SessionLocal() as db:
         task = db.get(Task, task_id)
         if task is None:
@@ -96,7 +94,7 @@ def _set_task_status(
 
 
 def _mark_account_checkpoint(account_id: uuid.UUID, checkpoint_url: str) -> None:
-    """Flag an account as needing manual challenge resolution (Epic 6.2)."""
+    """Mark the account so the user has to resolve an IG challenge by hand."""
     with SessionLocal() as db:
         account = db.get(InstagramAccount, account_id)
         if account is None:
@@ -117,34 +115,33 @@ def _mark_account_checkpoint(account_id: uuid.UUID, checkpoint_url: str) -> None
 def _recover_orphan_if_needed(task_uuid: uuid.UUID) -> bool:
     """If the task is in an orphan state, mark it FAILED and return True.
 
-    The combination of ``acks_late=True`` and a hard worker death
-    (OOM kill, SIGKILL, host eviction) can deliver the same task message
-    to a fresh worker while the DB row still says RUNNING. Re-running
-    would cause a duplicate Instagram side-effect (double post, double
-    DM, etc). We refuse the re-execution and leave the row in FAILED so
-    the operator can decide whether to manually re-dispatch.
+    With acks_late=True and a hard worker death (OOM, SIGKILL, host eviction)
+    the same task message can be sent to a new worker while the db row still
+    says RUNNING. Running it again would cause a duplicate IG side effect
+    (double post, double DM, etc). So we refuse the re-run and leave the
+    row in FAILED. The user can then decide to dispatch again by hand.
     """
     with SessionLocal() as db:
         task = db.get(Task, task_uuid)
         if task is None:
-            return False  # caller will handle the "task not found" path
+            return False  # caller deals with the not-found case
         if task.status not in _ORPHAN_STATUSES:
             return False
         task.status = TaskStatus.FAILED.value
         task.error_log = (
-            "Orphan recovery: previous worker died with status RUNNING. "
-            "Refusing automatic re-execution to prevent duplicate Instagram "
-            "side-effects. Re-dispatch manually if intended."
+            "Orphan recovery: previous worker died while RUNNING. We do not "
+            "auto re-run, that would cause duplicate IG side effects. "
+            "Dispatch again by hand if you want this to run."
         )
         db.commit()
         logger.warning(
-            "[run_instagram_task] orphan-recovered task=%s — marked FAILED",
+            "[run_instagram_task] orphan-recovered task=%s, marked FAILED",
             task_uuid,
         )
         return True
 
 
-# ── Task: validate_account_session ──────────────────────────────────────
+# task: validate_account_session
 @celery_app.task(
     bind=True,
     name="ig_crm.validate_account_session",
@@ -155,10 +152,11 @@ def _recover_orphan_if_needed(task_uuid: uuid.UUID) -> bool:
     max_retries=3,
 )
 def validate_account_session(self: CeleryTask, account_id: str) -> dict[str, Any]:
-    """Verify an Instagram account's stored cookies are still authenticated.
+    """Check if stored cookies for the IG account are still logged in.
 
-    The actual browser check (DrissionPage) is delegated to the worker layer;
-    this wrapper only loads the row, marks the account, and persists results.
+    The real browser check (DrissionPage) is done by the worker layer.
+    This wrapper just loads the row, updates the account and saves the
+    result.
     """
     acct_uuid = uuid.UUID(account_id)
     logger.info("[validate_account_session] account_id=%s", acct_uuid)
@@ -171,10 +169,10 @@ def validate_account_session(self: CeleryTask, account_id: str) -> dict[str, Any
         proxy_string = _build_proxy_string(account.proxy)
         cookies = account.cookies or {}
 
-        # ── Browser logic placeholder ───────────────────────────────────
-        # TODO: hand `proxy_string` and `cookies` to a dedicated validator
-        # action via TaskExecutor once a `validate_session` action handler
-        # is registered. For now we optimistically mark the account.
+        # browser logic stub.
+        # TODO: pass proxy_string and cookies to a real validator action via
+        # TaskExecutor once we have a validate_session handler. For now we
+        # just mark the account as valid.
         is_valid: bool = True
         error_message: str | None = None
 
@@ -190,38 +188,35 @@ def validate_account_session(self: CeleryTask, account_id: str) -> dict[str, Any
         }
 
 
-# ── Task: run_instagram_task ────────────────────────────────────────────
+# task: run_instagram_task
 @celery_app.task(
     bind=True,
     name="ig_crm.run_instagram_task",
     acks_late=True,
 )
 def run_instagram_task(self: CeleryTask, task_id: str) -> dict[str, Any]:
-    """Main browser-automation entrypoint.
+    """Main entry point for browser automation.
 
-    Pipeline:
-        0. CRITICAL-1 — orphan recovery: refuse + mark FAILED if the task
-           is already RUNNING (previous worker died).
-        1. CRITICAL-2 — pessimistic lock on the InstagramAccount row,
-           sibling-RUNNING check, payload build, and RUNNING transition,
-           ALL inside a single transaction so concurrent workers cannot
-           race past each other.
-        2. Hand the payload to ``TaskExecutor`` (which guarantees
-           browser teardown via Story 4.4).
-        3. On success → COMPLETED. On error → FAILED + traceback.
+    Steps:
+        0. orphan recovery. if the task is already RUNNING, mark it FAILED
+           and stop (previous worker died).
+        1. row lock on the InstagramAccount, sibling RUNNING check, build
+           payload and switch to RUNNING. All in one tx so concurrent
+           workers can not race past each other.
+        2. hand the payload to TaskExecutor (it closes the browser when done).
+        3. success -> COMPLETED. error -> FAILED plus traceback.
     """
     task_uuid = uuid.UUID(task_id)
     logger.info("[run_instagram_task] task_id=%s", task_uuid)
 
-    # ── 0. CRITICAL-1: orphan recovery ─────────────────────────────────
+    # 0. orphan recovery
     if _recover_orphan_if_needed(task_uuid):
         return {"task_id": str(task_uuid), "status": "orphan_recovered"}
 
-    # ── 1. CRITICAL-2: locked load + sibling check + RUNNING transition ─
-    # Everything in this block runs inside one transaction. The row lock
-    # is released only at db.commit(). We mark the Task RUNNING BEFORE
-    # commit so a concurrent worker's sibling-check sees us as RUNNING
-    # the instant the lock releases.
+    # 1. locked load, sibling check, switch to RUNNING.
+    # everything in this block is one transaction. the row lock is released
+    # only at db.commit(). we set RUNNING BEFORE commit, so a concurrent
+    # worker's sibling check sees us as RUNNING the moment the lock drops.
     account_uuid: uuid.UUID
     payload: dict[str, Any]
     with SessionLocal() as db:
@@ -231,7 +226,7 @@ def run_instagram_task(self: CeleryTask, task_id: str) -> dict[str, Any]:
 
         if task.status not in _RUNNABLE_STATUSES:
             logger.warning(
-                "[run_instagram_task] task=%s in non-runnable status %r — refusing",
+                "[run_instagram_task] task=%s status %r is not runnable, skip",
                 task_uuid, task.status,
             )
             return {
@@ -240,9 +235,9 @@ def run_instagram_task(self: CeleryTask, task_id: str) -> dict[str, Any]:
                 "task_status": task.status,
             }
 
-        # Pessimistic lock on the account row. NOWAIT raises immediately
-        # if another worker holds the row — exactly the signal we want,
-        # since IG flags overlapping sessions as account compromise.
+        # row-level lock on the account. NOWAIT raises right away if another
+        # worker holds the row, which is what we want, because IG treats
+        # overlapping sessions as a compromised account.
         try:
             account = db.execute(
                 select(InstagramAccount)
@@ -254,7 +249,7 @@ def run_instagram_task(self: CeleryTask, task_id: str) -> dict[str, Any]:
                 2 ** self.request.retries
             )
             logger.info(
-                "[run_instagram_task] account=%s locked by sibling — retry in %ds",
+                "[run_instagram_task] account=%s locked by sibling, retry in %ds",
                 task.account_id, backoff,
             )
             raise self.retry(
@@ -270,11 +265,10 @@ def run_instagram_task(self: CeleryTask, task_id: str) -> dict[str, Any]:
                 f"InstagramAccount {task.account_id} not found for task {task_uuid}"
             )
 
-        # Belt-and-braces: even with the row lock, refuse if a sibling
-        # Task for this account is already RUNNING (covers the case where
-        # the sibling's Postgres connection died without releasing the
-        # FOR UPDATE lock — the row appears unlocked but a stale Task
-        # row is still in RUNNING state).
+        # extra safety: even with the row lock, skip if a sibling Task for
+        # this account is already RUNNING. covers the case where the sibling
+        # postgres connection died without releasing the FOR UPDATE lock,
+        # so the row looks free but a stale Task row is still RUNNING.
         sibling_running = db.execute(
             select(Task.id)
             .where(
@@ -289,7 +283,7 @@ def run_instagram_task(self: CeleryTask, task_id: str) -> dict[str, Any]:
                 2 ** self.request.retries
             )
             logger.info(
-                "[run_instagram_task] sibling task %s RUNNING for account=%s — retry in %ds",
+                "[run_instagram_task] sibling task %s still RUNNING for account=%s, retry in %ds",
                 sibling_running, account.id, backoff,
             )
             raise self.retry(
@@ -301,13 +295,14 @@ def run_instagram_task(self: CeleryTask, task_id: str) -> dict[str, Any]:
                 max_retries=_LOCK_RETRY_MAX_ATTEMPTS,
             )
 
-        # Snapshot fields we'll need outside the session.
+        # save the fields we need to use after the session closes
         proxy = account.proxy
         account_uuid = account.id
 
-        # The AI parser stores the full plan dict on Task.payload:
+        # the AI parser saves the whole plan dict on Task.payload:
         #   {"summary": ..., "priority": ..., "commands": [{action, args}, ...]}
-        # The executor expects payload["commands"] to be the *list* — flatten here.
+        # the executor wants payload["commands"] to be just the list, so we
+        # flatten it here.
         plan: dict[str, Any] = task.payload or {}
         commands_list: list[dict[str, Any]] = plan.get("commands") or []
 
@@ -326,20 +321,20 @@ def run_instagram_task(self: CeleryTask, task_id: str) -> dict[str, Any]:
             "priority": task.priority,
         }
 
-        # Mark RUNNING within the locked transaction so a concurrent
-        # worker's sibling check sees us the moment the lock releases.
+        # set RUNNING inside the locked tx, so a concurrent worker's sibling
+        # check sees us the second the lock is released.
         task.status = TaskStatus.RUNNING.value
         task.error_log = None
         db.commit()
 
-    # ── 2. Execute via TaskExecutor ────────────────────────────────────
+    # 2. run via TaskExecutor
     try:
         result: dict[str, Any] = TaskExecutor(payload).execute()
 
     except CheckpointException as exc:
-        # Epic 6.2 — IG redirected the session to a challenge / suspended
-        # page. Mark the Task FAILED and the account checkpoint_required so
-        # the operator can resolve it manually before any further dispatch.
+        # IG sent the session to a challenge or suspended page. Mark the
+        # Task FAILED and the account checkpoint_required, so the user can
+        # fix it by hand before any new dispatch.
         logger.warning(
             "[run_instagram_task] checkpoint hit for task=%s account=%s url=%s",
             task_uuid, account_uuid, exc.url,
@@ -360,9 +355,9 @@ def run_instagram_task(self: CeleryTask, task_id: str) -> dict[str, Any]:
         raise
 
     except Retry:
-        # Defensive: if anything inside the executor calls self.retry()
-        # via a nested Celery primitive, the resulting Retry exception
-        # must reach Celery's runtime untouched — never marked FAILED.
+        # safety net: if anything inside the executor calls self.retry()
+        # through a nested Celery primitive, the Retry must reach Celery
+        # as is. do not mark it FAILED.
         raise
 
     except Exception as exc:
@@ -383,21 +378,19 @@ def run_instagram_task(self: CeleryTask, task_id: str) -> dict[str, Any]:
         logger.info("[run_instagram_task] finished task_id=%s", task_uuid)
 
 
-# ── Task: reap_stale_tasks (CRITICAL-1 janitor) ────────────────────────
+# task: reap_stale_tasks (janitor)
 @celery_app.task(name="ig_crm.reap_stale_tasks")
 def reap_stale_tasks(stale_after_seconds: int | None = None) -> dict[str, Any]:
-    """Force-fail any Tasks stuck in RUNNING for more than the threshold.
+    """Force-fail any Task stuck in RUNNING longer than the threshold.
 
-    Companion to the at-task-start orphan recovery. Catches the case
-    where a worker died WITHOUT a requeue (broker reconnect failure,
-    host hard reboot, etc.) so the row would otherwise stay RUNNING
-    forever. Schedule via Celery Beat at ~5 min intervals; default
-    threshold is one hour to match the spec.
+    Pair to the at-start orphan recovery. Covers the case where a worker
+    died but the message was NOT requeued (broker reconnect failure, host
+    hard reboot...), so the row would otherwise stay RUNNING forever.
+    Run via Celery Beat every ~5 minutes. Default threshold is one hour.
 
-    NOTE on the timestamp choice: the Task model has ``created_at`` but
-    not ``updated_at`` / ``started_at``. We use ``created_at`` as a
-    safe upper bound — a Task that was created over an hour ago AND is
-    still RUNNING is, at minimum, pathological and worth reaping.
+    On the timestamp: the Task model has created_at but no updated_at or
+    started_at. We use created_at as a safe upper bound. A Task that was
+    created over an hour ago AND is still RUNNING is broken enough to reap.
     """
     threshold = (
         stale_after_seconds
@@ -418,7 +411,7 @@ def reap_stale_tasks(stale_after_seconds: int | None = None) -> dict[str, Any]:
             timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
             reap_line = (
                 f"[{timestamp}] reap_stale_tasks: stuck in RUNNING for "
-                f">{threshold}s — presumed dead worker."
+                f">{threshold}s, worker treated as dead."
             )
             task.error_log = (
                 f"{task.error_log}\n{reap_line}" if task.error_log else reap_line

@@ -1,4 +1,4 @@
-"""Instagram account endpoints."""
+"""Instagram account routes."""
 
 from __future__ import annotations
 

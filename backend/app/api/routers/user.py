@@ -1,4 +1,4 @@
-"""User & Subscription endpoints."""
+"""User and subscription routes."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ router = APIRouter(prefix="/users", tags=["users"])
     "/",
     response_model=UserRead,
     status_code=status.HTTP_201_CREATED,
-    summary="Create a new user (auto-provisions a free Subscription)",
+    summary="Create a new user, also makes a free subscription",
 )
 def create_user(
     user_in: UserCreate,
@@ -90,11 +90,11 @@ def delete_user(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-# ── Nested subscription endpoints ───────────────────────────────────────
+# nested subscription routes
 @router.get(
     "/{user_id}/subscription",
     response_model=SubscriptionRead,
-    summary="Get the user's current subscription",
+    summary="Get current subscription of the user",
 )
 def get_user_subscription(
     user_id: uuid.UUID,
@@ -112,7 +112,7 @@ def get_user_subscription(
 @router.patch(
     "/{user_id}/subscription",
     response_model=SubscriptionRead,
-    summary="Update the user's subscription (e.g. tier upgrade)",
+    summary="Update user subscription, like a tier upgrade",
 )
 def update_user_subscription(
     user_id: uuid.UUID,

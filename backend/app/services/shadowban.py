@@ -1,19 +1,18 @@
-"""Baseline-aware shadowban detector (Epic 6, Task 6.3).
+"""Shadowban detector that compares the latest reel views to a baseline.
 
-Heuristic:
-    1. Pull the most recent ``MIN_BASELINE_SAMPLES + 1`` reel-view rows for
-       the account from ``account_metrics``.
-    2. The first row is the *current* signal; the rest form the baseline.
-    3. Compute the median of the baseline. If it's too small (account is
-       new / barely-active) the check is skipped — we'd produce only false
-       positives.
-    4. If the current value is below ``ABSOLUTE_THRESHOLD_VIEWS`` AND below
-       ``BASELINE_DROP_RATIO * baseline_median``, flag the account:
-         * add ``"possible_shadowban"`` to ``tags`` (deduped, lowercase)
-         * set ``status="possible_shadowban"``
-         * append a warning line to ``error_log``
+How it works:
+    1. Read the last MIN_BASELINE_SAMPLES + 1 reel_views rows for the
+       account from account_metrics.
+    2. The first row is the current value, the rest is the baseline.
+    3. Take the median of the baseline. If it is too small (new or quiet
+       account), skip the check, otherwise we just get false positives.
+    4. If the current value is below ABSOLUTE_THRESHOLD_VIEWS and below
+       BASELINE_DROP_RATIO * baseline_median, mark the account:
+         - add "possible_shadowban" to tags (lowercase, deduped)
+         - set status="possible_shadowban"
+         - append one line to error_log
 
-Returns a small dict for the caller's diagnostics.
+Returns a small dict with the details for the caller.
 """
 
 from __future__ import annotations
@@ -33,28 +32,28 @@ from app.models.metric import AccountMetric, MetricType
 logger = logging.getLogger(__name__)
 
 
-# ── Tunables ────────────────────────────────────────────────────────────
+# knobs
 MIN_BASELINE_SAMPLES: int = 10
-"""Minimum number of historical reel samples required to evaluate."""
+"""How many old reel samples we need to even run the check."""
 
 MIN_BASELINE_MEDIAN_VIEWS: int = 100
-"""Median below this means the account is too quiet to have a baseline."""
+"""If the median is below this, the account is too quiet for a real baseline."""
 
 ABSOLUTE_THRESHOLD_VIEWS: int = 50
-"""Current views must be under this *and* under the ratio to flag."""
+"""Current views must be below this AND below the ratio to flag."""
 
 BASELINE_DROP_RATIO: float = 0.20
-"""Current views must be < 20% of baseline median to flag."""
+"""Current views must be under 20% of baseline median to flag."""
 
 SHADOWBAN_TAG: str = "possible_shadowban"
 SHADOWBAN_STATUS: str = "possible_shadowban"
 
 
 def evaluate(db: Session, account_id: uuid.UUID) -> dict[str, Any]:
-    """Inspect the account's reel-view history and mutate state on a hit.
+    """Look at the account's reel views history and update state on a hit.
 
-    The caller is responsible for the surrounding transaction; we ``commit``
-    only when we actually mutate the account row, so a no-op call is free.
+    The caller owns the outer transaction. We only commit when we actually
+    change the account row, so a no-op call costs nothing.
     """
     account = db.get(InstagramAccount, account_id)
     if account is None:
@@ -64,7 +63,7 @@ def evaluate(db: Session, account_id: uuid.UUID) -> dict[str, Any]:
 
     if len(samples) < MIN_BASELINE_SAMPLES + 1:
         logger.info(
-            "[shadowban] account=%s only %d reel sample(s) — skipping (need %d)",
+            "[shadowban] account=%s only %d reel sample(s), skipping (need %d)",
             account_id, len(samples), MIN_BASELINE_SAMPLES + 1,
         )
         return {
@@ -79,7 +78,7 @@ def evaluate(db: Session, account_id: uuid.UUID) -> dict[str, Any]:
 
     if baseline_median < MIN_BASELINE_MEDIAN_VIEWS:
         logger.info(
-            "[shadowban] account=%s baseline median %d below threshold %d — skipping",
+            "[shadowban] account=%s baseline median %d below threshold %d, skipping",
             account_id, baseline_median, MIN_BASELINE_MEDIAN_VIEWS,
         )
         return {
@@ -105,25 +104,25 @@ def evaluate(db: Session, account_id: uuid.UUID) -> dict[str, Any]:
     if flagged:
         _mark_shadowban(db, account, diagnostics)
         logger.warning(
-            "[shadowban] account=%s FLAGGED — current=%d, baseline_median=%d "
-            "(<%d absolute AND <%.0f%% baseline)",
+            "[shadowban] account=%s FLAGGED, current=%d, baseline_median=%d "
+            "(<%d absolute and <%.0f%% baseline)",
             account_id, current_views, baseline_median,
             ABSOLUTE_THRESHOLD_VIEWS, BASELINE_DROP_RATIO * 100,
         )
     else:
         logger.info(
-            "[shadowban] account=%s OK — current=%d, baseline_median=%d",
+            "[shadowban] account=%s OK, current=%d, baseline_median=%d",
             account_id, current_views, baseline_median,
         )
 
     return diagnostics
 
 
-# ── Internals ───────────────────────────────────────────────────────────
+# internals
 def _recent_reel_view_samples(
     db: Session, account_id: uuid.UUID, limit: int
 ) -> list[int]:
-    """Return up to ``limit`` most-recent reel_views values, newest first."""
+    """Return up to `limit` newest reel_views values, newest first."""
     stmt = (
         select(AccountMetric.value)
         .where(
@@ -141,7 +140,7 @@ def _mark_shadowban(
     account: InstagramAccount,
     diagnostics: dict[str, Any],
 ) -> None:
-    """Add the tag, flip the status, append a log line. Single commit."""
+    """Add the tag, change status, append a log line. One commit."""
     tags = list(account.tags or [])
     if SHADOWBAN_TAG not in tags:
         tags.append(SHADOWBAN_TAG)

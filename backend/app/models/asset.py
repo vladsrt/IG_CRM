@@ -21,13 +21,13 @@ from app.core.database import Base
 if TYPE_CHECKING:
     from app.models.user import User
 
-# ── Enums ───────────────────────────────────────────────────────────────
+# enums
 class AssetStatus(str, enum.Enum):
-    """Lifecycle of an Asset row.
+    """Asset row states.
 
-    raw         → just uploaded, no variants generated yet
-    processing  → currently being uniqueized by an FFmpeg worker
-    ready       → either the original (with variants attached) or a child variant
+    raw: file is uploaded, no variants yet
+    processing: an ffmpeg worker is making variants right now
+    ready: the original (with variants attached) or one of the variants
     """
 
     RAW = "raw"
@@ -35,9 +35,9 @@ class AssetStatus(str, enum.Enum):
     READY = "ready"
 
 
-# ── MediaFolder ─────────────────────────────────────────────────────────
+# media folder
 class MediaFolder(Base):
-    """User-owned folder grouping related media assets."""
+    """User folder that groups media assets together."""
 
     __tablename__ = "media_folders"
 
@@ -58,7 +58,7 @@ class MediaFolder(Base):
         nullable=False,
     )
 
-    # ── Relationships ───────────────────────────────────────────────────
+    # relations
     assets: Mapped[list[Asset]] = relationship(
         back_populates="folder",
         cascade="all, delete-orphan",
@@ -69,13 +69,13 @@ class MediaFolder(Base):
         return f"<MediaFolder {self.name}>"
 
 
-# ── Asset ───────────────────────────────────────────────────────────────
+# asset
 class Asset(Base):
-    """A user-uploaded media file (image, video, etc.).
+    """A media file uploaded by the user (image, video, etc).
 
-    Assets form a parent → children tree: a freshly uploaded video is the
-    "parent" (raw original) and FFmpeg-uniqueized clones are its children
-    (each linked back through ``parent_id``).
+    Assets are a parent-children tree. The fresh upload is the "parent" (raw
+    original). The ffmpeg-made unique clones are children, each one linked
+    back through parent_id.
     """
 
     __tablename__ = "assets"
@@ -131,7 +131,7 @@ class Asset(Base):
         nullable=False,
     )
 
-    # ── Relationships ───────────────────────────────────────────────────
+    # relations
     user: Mapped[User] = relationship(
         back_populates="assets",
     )

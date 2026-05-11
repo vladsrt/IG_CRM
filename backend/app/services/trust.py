@@ -1,26 +1,17 @@
-"""Trust Score — pre-flight safety gate for fan-out dispatch (Epic 8.1).
+"""Trust score, the pre-flight gate before fan-out dispatch.
 
-For every account about to receive a Task we compute a 0-100 score by
-combining three signals:
+For every account that is about to get a Task we build a 0-100 score from
+three signals:
 
-    +-----------+---------+-------------------------------------------------+
-    | Signal    | Weight  | Notes                                           |
-    +===========+=========+=================================================+
-    | Proxy     |   60    | Authenticated CONNECT to a low-cost target;     |
-    |           |         | hard-fail (score=0) on connection error so a    |
-    |           |         | dead proxy never dispatches anywhere.           |
-    +-----------+---------+-------------------------------------------------+
-    | UA        |   25    | Non-empty, plausible-shape user agent           |
-    +-----------+---------+-------------------------------------------------+
-    | Hygiene   |   15    | Penalize accounts already flagged with a known  |
-    |           |         | risk tag (possible_shadowban, checkpoint_*) or  |
-    |           |         | a non-OK status                                 |
-    +-----------+---------+-------------------------------------------------+
+    proxy    (60): authed CONNECT to a cheap target. Hard-fail (score=0)
+                   on a connection error so a dead proxy never dispatches.
+    ua       (25): user agent must be set and look like a real browser.
+    hygiene  (15): drop the score if the account already has a risk tag
+                   (possible_shadowban, checkpoint_*) or a non-OK status.
 
-The score is **mocked** in the sense that the proxy-ping uses a single
-HEAD request to a static endpoint rather than a multi-region latency
-probe — but the function shape, the weighting, and the structured result
-(:class:`TrustReport`) are production-real.
+The score is a bit "mocked": the proxy ping is a single HEAD to a static
+endpoint, not a multi-region latency probe. But the function shape, the
+weights and the TrustReport result are the real thing for production.
 """
 
 from __future__ import annotations
@@ -39,7 +30,7 @@ from app.models.proxy import Proxy
 logger = logging.getLogger(__name__)
 
 
-# ── Tunables ────────────────────────────────────────────────────────────
+# knobs
 PROXY_PROBE_URL: str = "https://www.instagram.com/robots.txt"
 PROXY_PROBE_TIMEOUT_S: float = 8.0
 
@@ -48,7 +39,7 @@ USER_AGENT_WEIGHT: int = 25
 HYGIENE_WEIGHT: int = 15
 
 DEFAULT_MIN_TRUST_SCORE: int = 50
-"""Below this, the fan-out endpoint refuses to dispatch the task."""
+"""Below this the fan-out route will not dispatch the task."""
 
 _RISK_TAGS: frozenset[str] = frozenset(
     {"possible_shadowban", "checkpoint", "banned", "frozen"}
@@ -62,10 +53,10 @@ _USER_AGENT_PATTERN = re.compile(
 )
 
 
-# ── Public records ──────────────────────────────────────────────────────
+# public records
 @dataclass(slots=True)
 class TrustReport:
-    """Structured outcome of a single trust evaluation."""
+    """One trust check result, structured."""
 
     score: int
     proxy_ok: bool
@@ -76,18 +67,18 @@ class TrustReport:
 
     @property
     def passed(self) -> bool:
-        """Convenience: True iff score is at or above the configured threshold."""
+        """True if the score is at or above the threshold."""
         return self.score >= DEFAULT_MIN_TRUST_SCORE
 
     def to_skip_reason(self) -> str:
-        """One-line summary suitable for ``FanOutSkippedAccount.reason``."""
+        """One-line summary that fits FanOutSkippedAccount.reason."""
         head = f"low_trust_score (score={self.score}/100)"
         if self.reasons:
             return f"{head}: {'; '.join(self.reasons)}"
         return head
 
 
-# ── Public API ──────────────────────────────────────────────────────────
+# public api
 def evaluate_trust(
     account: InstagramAccount,
     *,
@@ -95,10 +86,10 @@ def evaluate_trust(
     proxy: Optional[Proxy] = None,
     skip_proxy_probe: bool = False,
 ) -> TrustReport:
-    """Return a :class:`TrustReport` for ``account``.
+    """Build a TrustReport for the account.
 
-    ``proxy`` defaults to ``account.proxy`` when omitted. Pass
-    ``skip_proxy_probe=True`` in unit tests to avoid the network round-trip.
+    If `proxy` is not given, falls back to account.proxy. Pass
+    skip_proxy_probe=True in unit tests so we do not hit the network.
     """
     proxy = proxy if proxy is not None else account.proxy
 
@@ -133,11 +124,11 @@ def evaluate_trust(
     )
 
 
-# ── Probes ──────────────────────────────────────────────────────────────
+# probes
 def _evaluate_proxy(
     proxy: Optional[Proxy], *, skip_probe: bool
 ) -> tuple[bool, Optional[int], Optional[str]]:
-    """Verify the proxy answers a HEAD against a low-cost endpoint."""
+    """Check the proxy can answer a HEAD on a cheap endpoint."""
     if proxy is None:
         return False, None, "no proxy attached"
 
@@ -150,15 +141,15 @@ def _evaluate_proxy(
     parsed = urlparse(PROXY_PROBE_URL)
     host_port = (parsed.hostname or "", parsed.port or 443)
 
-    # Step 1 — DNS-level liveness on the proxy host itself. Catches a dead
-    # provider before we waste the HTTPS round-trip budget.
+    # step 1: DNS check on the proxy host. catches a dead provider before
+    # we spend the https round-trip budget.
     try:
         socket.getaddrinfo(proxy.host, proxy.port)
     except socket.gaierror as exc:
         return False, None, f"proxy DNS failed: {exc}"
 
-    # Step 2 — actual HEAD via the proxy. Uses urllib so we keep zero
-    # third-party deps in the trust path.
+    # step 2: HEAD through the proxy. uses urllib so the trust path has
+    # zero third-party deps.
     handler = ProxyHandler({"http": proxy_url, "https": proxy_url})
     opener = build_opener(handler)
     req = Request(PROXY_PROBE_URL, method="HEAD")
@@ -187,7 +178,7 @@ def _evaluate_user_agent(user_agent: str) -> tuple[bool, Optional[str]]:
 
 
 def _evaluate_hygiene(account: InstagramAccount) -> tuple[bool, Optional[str]]:
-    """Penalize accounts already flagged by upstream signals (Epic 6, etc.)."""
+    """Drop the score if upstream signals already flagged the account."""
     if account.status and account.status.lower() in _BAD_STATUSES:
         return False, f"account.status={account.status!r}"
     risky_tags = [t for t in (account.tags or []) if t in _RISK_TAGS]

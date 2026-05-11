@@ -1,4 +1,4 @@
-"""Natural-language → ``ParsedTaskPlan`` translator backed by OpenAI."""
+"""Turn a text prompt into a ParsedTaskPlan using OpenAI."""
 
 from __future__ import annotations
 
@@ -72,15 +72,15 @@ Rules:
 
 
 class AIParserError(RuntimeError):
-    """Wraps any OpenAI-side failure so callers don't need to import the SDK."""
+    """Wraps any OpenAI side error so callers do not import the SDK."""
 
 
 @lru_cache(maxsize=1)
 def get_openai_client() -> OpenAI:
-    """Return a lazily-instantiated, process-wide OpenAI client."""
+    """Build the OpenAI client on first use and reuse it across the process."""
     if not settings.OPENAI_API_KEY:
         raise AIParserError(
-            "OPENAI_API_KEY is not configured — cannot reach the AI parser."
+            "OPENAI_API_KEY is not set, cannot reach the AI parser."
         )
     return OpenAI(
         api_key=settings.OPENAI_API_KEY,
@@ -90,7 +90,7 @@ def get_openai_client() -> OpenAI:
 
 
 class AIParser:
-    """Thin wrapper around ``client.beta.chat.completions.parse``."""
+    """Small wrapper over client.beta.chat.completions.parse."""
 
     def __init__(
         self,
@@ -101,7 +101,7 @@ class AIParser:
         self._model = model or settings.OPENAI_MODEL
 
     def parse(self, user_prompt: str) -> ParsedTaskPlan:
-        """Translate ``user_prompt`` into a strictly-validated ``ParsedTaskPlan``."""
+        """Turn user_prompt into a validated ParsedTaskPlan."""
         if not user_prompt or not user_prompt.strip():
             raise AIParserError("user_prompt must not be empty")
 
@@ -117,7 +117,7 @@ class AIParser:
             )
         except LengthFinishReasonError as exc:
             raise AIParserError(
-                "LLM truncated the response before producing valid JSON."
+                "LLM cut the response short before valid json was produced."
             ) from exc
         except APITimeoutError as exc:
             raise AIParserError("OpenAI request timed out") from exc
@@ -142,6 +142,6 @@ class AIParser:
         return plan
 
 
-# Module-level convenience function — handy in tests and one-off scripts.
+# shortcut for tests and small scripts
 def parse_user_prompt(user_prompt: str) -> ParsedTaskPlan:
     return AIParser().parse(user_prompt)

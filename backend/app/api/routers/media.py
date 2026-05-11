@@ -1,4 +1,4 @@
-"""Media-management endpoints — folders, raw uploads, FFmpeg uniqueize trigger."""
+"""Media routes: folders, raw uploads, ffmpeg uniqueize trigger."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/media", tags=["media"])
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────
+# helpers
 _ALLOWED_VIDEO_SUFFIXES: frozenset[str] = frozenset(
     {".mp4", ".mov", ".m4v", ".mkv", ".webm"}
 )
@@ -58,7 +58,7 @@ def _media_root() -> Path:
 
 
 def _save_upload_to_disk(upload: UploadFile, dest: Path) -> int:
-    """Stream ``upload`` to ``dest``. Returns total bytes written."""
+    """Stream upload into dest. Returns how many bytes we wrote."""
     written = 0
     cap = settings.MEDIA_MAX_UPLOAD_BYTES
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -79,7 +79,7 @@ def _save_upload_to_disk(upload: UploadFile, dest: Path) -> int:
     return written
 
 
-# ── Folder endpoints ────────────────────────────────────────────────────
+# folder routes
 @router.post(
     "/folders",
     response_model=MediaFolderRead,
@@ -121,7 +121,7 @@ def delete_folder(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-# ── Asset endpoints ─────────────────────────────────────────────────────
+# asset routes
 @router.get("/assets", response_model=list[AssetRead])
 def list_assets(
     user_id: uuid.UUID | None = Query(default=None),
@@ -161,7 +161,7 @@ def get_asset(
     "/upload",
     response_model=AssetRead,
     status_code=status.HTTP_201_CREATED,
-    summary="Upload a raw video and create the parent Asset row",
+    summary="Upload raw video and create parent Asset row",
 )
 def upload_video(
     user_id: uuid.UUID = Form(...),
@@ -206,7 +206,7 @@ def upload_video(
             },
         )
     except ValueError as exc:
-        # FK violation, unknown user/folder etc. — purge the orphan file.
+        # bad user or folder fk, drop the orphan file
         dest.unlink(missing_ok=True)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
@@ -219,7 +219,7 @@ def upload_video(
     "/{asset_id}/uniqueize",
     response_model=UniqueizeDispatchResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    summary="Queue an FFmpeg job that produces N byte-distinct variants",
+    summary="Queue ffmpeg job that makes N byte different variants",
 )
 def trigger_uniqueize(
     asset_id: uuid.UUID,
@@ -227,7 +227,7 @@ def trigger_uniqueize(
     body: UniqueizeRequest | None = None,
     db: Session = Depends(get_db),
 ) -> UniqueizeDispatchResponse:
-    # Body wins over query param if both are present (explicit POST wins).
+    # if body is sent, it wins over query param
     if body is not None and body.copies:
         copies = body.copies
 
@@ -239,7 +239,7 @@ def trigger_uniqueize(
     if asset.parent_id is not None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Refusing to uniqueize a variant — point at the root parent Asset",
+            detail="Cannot uniqueize a variant, pass the root parent Asset",
         )
     if asset.status == AssetStatus.PROCESSING.value:
         raise HTTPException(

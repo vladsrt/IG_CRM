@@ -1,4 +1,4 @@
-"""Schemas for the fan-out orchestrator endpoint."""
+"""Schemas for the fan-out orchestrator route."""
 
 from __future__ import annotations
 
@@ -10,13 +10,12 @@ from app.schemas.ai import ParsedTaskPlan
 
 
 class FanOutTaskRequest(BaseModel):
-    """Body for ``POST /orchestrator/tasks/fan-out``.
+    """Body for POST /orchestrator/tasks/fan-out.
 
-    The ``plan`` is the LLM output the operator just reviewed (typically
-    obtained from ``POST /ai/generate-task``). ``target_account_ids`` is a
-    fallback / extension list — it is **unioned** with the accounts matched
-    by ``plan.target_tags`` so the human can hand-pick extras without losing
-    the tag-matched cohort.
+    `plan` is the LLM output the user just approved (usually from
+    POST /ai/generate-task). `target_account_ids` is a fallback or extra list.
+    It is merged (union) with the accounts matched by `plan.target_tags`, so
+    the user can hand pick extras without losing the tag-matched group.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -25,15 +24,15 @@ class FanOutTaskRequest(BaseModel):
     target_account_ids: list[uuid.UUID] = Field(
         default_factory=list,
         description=(
-            "Explicit InstagramAccount IDs to dispatch to. Used as a fallback "
-            "when `plan.target_tags` is empty, AND merged with tag-matched "
-            "accounts when both are present. Duplicates are removed."
+            "Explicit InstagramAccount ids to dispatch to. Used as a fallback "
+            "when `plan.target_tags` is empty, and merged with tag-matched "
+            "accounts when both are set. Duplicates are dropped."
         ),
     )
 
 
 class FanOutDispatchedTask(BaseModel):
-    """One row in the ``dispatched`` list of the response."""
+    """One row inside the response `dispatched` list."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -43,10 +42,10 @@ class FanOutDispatchedTask(BaseModel):
 
 
 class FanOutSkippedAccount(BaseModel):
-    """One row in the ``skipped`` list of the response.
+    """One row inside the response `skipped` list.
 
-    Covers both pre-dispatch misses (explicit account_id that doesn't exist)
-    and post-dispatch failures (DB write failed, broker unreachable, etc.).
+    Covers both: an explicit account_id that does not exist, and accounts that
+    failed during dispatch (db write failed, broker down, etc).
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -56,27 +55,27 @@ class FanOutSkippedAccount(BaseModel):
 
 
 class FanOutResponse(BaseModel):
-    """Summary returned by the fan-out endpoint."""
+    """Summary the fan-out route returns."""
 
     model_config = ConfigDict(from_attributes=True)
 
     requested_accounts: int = Field(
         description=(
-            "Number of unique accounts resolved from tags + explicit IDs "
-            "(before dispatch is attempted)."
+            "How many unique accounts we got from tags + explicit ids, before "
+            "we try to dispatch."
         ),
     )
     dispatched_count: int = Field(
-        description="Number of Tasks successfully created AND queued on Celery."
+        description="How many Tasks were saved and queued on Celery."
     )
     skipped_count: int = Field(
         description=(
-            "Accounts that resolved but failed to either persist a Task row "
-            "or hand off to Celery. See `skipped` for per-account reasons."
+            "Accounts that were resolved but the Task row or Celery push "
+            "failed. Per-account reasons are in `skipped`."
         ),
     )
     dispatched: list[FanOutDispatchedTask]
     skipped: list[FanOutSkippedAccount]
     celery_task_ids: list[str] = Field(
-        description="Flat list of Celery AsyncResult IDs (= dispatched[*].celery_task_id)."
+        description="Flat list of Celery AsyncResult ids (same as dispatched[*].celery_task_id)."
     )

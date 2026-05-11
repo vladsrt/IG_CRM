@@ -1,34 +1,9 @@
-"""
-Human Behavior Engine
----------------------
-Centralized "humanizer" used by every action handler that drives a real
-browser. Replaces raw DrissionPage interactions (``ele.click()``,
-``ele.input(text)``, instantaneous coordinate moves) with mouse
-trajectories, keystroke timing, reading pauses, and scroll noise designed
-to defeat heuristic anti-bot signals from Meta's risk engine.
+"""Human-like behavior engine.
 
-Public API
-~~~~~~~~~~
-``HumanBehaviorEngine(page)``
-    .move_to(target)             — bezier-traced cursor move
-    .click(target)               — move_to + click (with optional overshoot)
-    .type_into(target, text)     — variable-cadence keystrokes
-    .read_pause(content_length)  — sleep weighted by amount of content
-    .micro_scroll()              — 1-3 small wheel deltas in random direction
-    .idle(min_s, max_s)          — short uniform jitter
-
-The engine NEVER calls ``page.actions.move_to(target, duration=0)`` or
-sets cursor coordinates directly — every move is interpolated through a
-cubic Bezier curve sampled into discrete steps with ease-in / ease-out
-timing. Direct teleportation would produce a single ``mousemove`` event
-with no path history, which Instagram's client-side telemetry treats as
-a strong bot signal.
-
-Typing reference
-~~~~~~~~~~~~~~~~
-This module is fully type-annotated and intended to be mypy-strict-clean.
-``Locator`` is the union of types DrissionPage's ``Actions.move_to`` will
-accept (an element handle or an absolute ``(x, y)`` coordinate tuple).
+One place to emulate a human user for DrissionPage. We do not touch the DOM
+directly and we never teleport the cursor in 0ms, because Instagram flags
+that as bot activity. Instead we use bezier mouse paths, variable typing
+speed, and human-like pauses.
 """
 
 from __future__ import annotations
@@ -42,29 +17,28 @@ from typing import Any, Dict, Iterable, Optional, Protocol, Tuple, Union
 logger = logging.getLogger(__name__)
 
 
-# ── Type aliases ────────────────────────────────────────────────────────
+# type aliases
 Coord = Tuple[int, int]
-"""An absolute ``(x, y)`` cursor coordinate in viewport pixels."""
+"""Absolute (x, y) cursor coord in viewport pixels."""
 
 Locator = Union["_HasRect", Coord]
-"""What the engine accepts as a target — a DrissionPage element OR a coord."""
+"""What the engine takes as a target: a DrissionPage element OR a coord."""
 
 
 class _HasRect(Protocol):
     """Structural protocol for DrissionPage element handles.
 
-    Defined as a Protocol (not a hard import) so this module remains
-    importable in environments where ``DrissionPage`` is not installed
-    (CI, unit tests, type-checking only).
+    A Protocol (not a real import) so this module still imports when
+    DrissionPage is not installed (CI, unit tests, typecheck-only runs).
     """
 
-    rect: Any  # DrissionPage exposes .rect.midpoint as a (x, y) tuple
+    rect: Any  # DrissionPage gives .rect.midpoint as an (x, y) tuple
 
     def click(self) -> Any: ...
     def input(self, text: str, clear: bool = ...) -> Any: ...
 
 
-# ── Tunables ────────────────────────────────────────────────────────────
+# knobs
 _DEFAULT_OVERSHOOT_PROBABILITY: float = 0.18
 _DEFAULT_OVERSHOOT_PIXELS: Tuple[int, int] = (8, 22)
 _DEFAULT_STEP_COUNT_RANGE: Tuple[int, int] = (22, 42)
@@ -82,11 +56,11 @@ _MICRO_SCROLL_PAUSE_RANGE_S: Tuple[float, float] = (0.25, 0.75)
 
 
 class HumanBehaviorEngine:
-    """Inject human-like timing into a DrissionPage ``ChromiumPage`` session.
+    """Adds human-like timing to a DrissionPage ChromiumPage session.
 
-    One engine per browser session is the expected pattern — it is created
-    inside an action handler and passed nowhere. Engines hold *no* shared
-    state across handlers beyond the current cursor position.
+    One engine per browser session is the normal pattern. Build it inside
+    an action handler and do not pass it around. Engines keep no shared
+    state across handlers except the current cursor position.
     """
 
     def __init__(
@@ -97,19 +71,16 @@ class HumanBehaviorEngine:
         step_count_range: Tuple[int, int] = _DEFAULT_STEP_COUNT_RANGE,
         rng_seed: Optional[int] = None,
     ) -> None:
-        """Initialize the engine.
+        """Set up the engine.
 
         Args:
-            page: The DrissionPage ``ChromiumPage`` instance owned by an
-                ``InstagramBrowser``.
-            overshoot_probability: Probability that ``click()`` will
-                deliberately overshoot the target by a few pixels and then
-                correct. Must be in ``[0.0, 1.0]``.
-            step_count_range: Inclusive ``(min, max)`` number of points
-                sampled along each Bezier curve. Higher = smoother but
-                slower trajectories.
-            rng_seed: Optional seed for deterministic behavior in tests.
-                Production callers pass ``None``.
+            page: DrissionPage ChromiumPage owned by an InstagramBrowser.
+            overshoot_probability: chance that click() will overshoot the
+                target by a few pixels and then correct. Must be in [0, 1].
+            step_count_range: inclusive (min, max) number of points along
+                each bezier curve. Higher = smoother but slower paths.
+            rng_seed: optional seed so tests are deterministic. In prod
+                pass None.
         """
         if not 0.0 <= overshoot_probability <= 1.0:
             raise ValueError(
@@ -125,13 +96,13 @@ class HumanBehaviorEngine:
         self._rng = random.Random(rng_seed)
         self._cursor: Coord = (0, 0)
 
-    # ── Public API ─────────────────────────────────────────────────────
+    # public api
     def move_to(self, target: Locator) -> Coord:
-        """Move the cursor to ``target`` along a sampled Bezier curve.
+        """Move the cursor to `target` along a sampled bezier curve.
 
-        Returns the final cursor coordinate. Never teleports. Optionally
-        overshoots and corrects. Safe to call when the cursor is already
-        near the target — the curve degenerates to a short, low-step path.
+        Returns the final cursor coord. Never teleports. May overshoot and
+        correct. Safe to call when the cursor is already near the target,
+        the curve just becomes a short, low-step path.
         """
         target_xy = self._coord_of(target)
 
@@ -143,7 +114,7 @@ class HumanBehaviorEngine:
                 -_DEFAULT_OVERSHOOT_PIXELS[1], _DEFAULT_OVERSHOOT_PIXELS[1]
             )
             self._draw_bezier(self._cursor, (ox, oy), fast=False)
-            self.idle(0.06, 0.14)  # micro-pause before correction
+            self.idle(0.06, 0.14)  # tiny pause before the correction
             self._draw_bezier((ox, oy), target_xy, fast=True)
         else:
             self._draw_bezier(self._cursor, target_xy, fast=False)
@@ -152,20 +123,19 @@ class HumanBehaviorEngine:
         return target_xy
 
     def click(self, target: Locator) -> None:
-        """Move to ``target`` then click it via DrissionPage's ``Actions``.
+        """Move to `target` then click via DrissionPage Actions.
 
-        We deliberately use ``page.actions.click()`` (which dispatches a
-        synthetic ``mousedown``/``mouseup`` pair AT the current cursor
-        position) rather than ``ele.click()`` (which jumps to the
-        element's center with no path). This preserves the trajectory we
-        just drew.
+        We use page.actions.click() on purpose: it sends a synthetic
+        mousedown/mouseup pair AT the current cursor position. ele.click()
+        would jump to the element center with no path, killing the
+        trajectory we just drew.
         """
         self.move_to(target)
         self.idle(0.05, 0.18)
         try:
             self._page.actions.click()
         except Exception as exc:
-            logger.debug("[behavior] actions.click failed (%s); falling back to ele.click", exc)
+            logger.debug("[behavior] actions.click failed (%s), fallback to ele.click", exc)
             if hasattr(target, "click"):
                 target.click()  # type: ignore[union-attr]
             else:
@@ -178,77 +148,60 @@ class HumanBehaviorEngine:
         hover_dwell_range_s: Tuple[float, float] = (0.5, 1.0),
         click_after: bool = True,
     ) -> bool:
-        """Hover the element, wait for any React-driven hydration, then click.
+        """Hover the element, wait for React to hydrate, then click.
 
-        Why this exists: Instagram's left navigation rail (Home, Search,
-        Explore, Reels, Messages, Notifications, Create, Profile)
-        renders each entry as a stub icon and only mounts the real
-        click handler on the first ``mouseenter`` event. A direct
-        click on the un-hydrated stub either:
-
-        * does nothing (no listener registered yet), OR
-        * hits the wrong target because the rail expands a tooltip
-          panel mid-click and the synthetic event lands on the panel
-          instead of the icon.
-
-        The fix is the human gesture pattern: move the cursor over the
-        icon, dwell briefly while the rail hydrates, *then* click. This
-        is also what real users do — nobody slams a click on a nav
-        icon at 0ms; the cursor pauses for a beat first.
+        IG's left nav rail attaches click handlers only after the first
+        mouseenter. Direct clicks on unhydrated elements usually fail. We
+        hover first, wait a bit, then click. Just like a real user.
 
         Args:
-            target: The DrissionPage element to hover over.
-            hover_dwell_range_s: Min/max seconds to dwell after the
-                hover before clicking. The 0.5-1.0s default matches
-                the rail's hydration latency.
-            click_after: If False, only hover + dwell; the caller will
-                issue the click separately. Useful when the click
-                target is a different element that only appears once
-                the hover-rail expands.
+            target: DrissionPage element to hover.
+            hover_dwell_range_s: how long to dwell before clicking, so the
+                element can hydrate.
+            click_after: if False, skip the click (useful when the target
+                changes on hover).
 
         Returns:
-            True iff hover + (optional) click succeeded. Hover errors
-            are logged but never raised — the caller can still try a
-            plain click as a last-ditch fallback.
+            bool: True if hover and (if used) click both worked.
         """
         if hover_dwell_range_s[0] < 0 or hover_dwell_range_s[1] < hover_dwell_range_s[0]:
             raise ValueError(
                 f"Invalid hover_dwell_range_s: {hover_dwell_range_s}"
             )
 
-        # Step 1 — bezier-trace the cursor to the element so the
-        # mouseenter event arrives along a real trajectory.
+        # step 1: bezier-move the cursor to the element so mouseenter
+        # arrives along a real path.
         try:
             self.move_to(target)
         except Exception as exc:
             logger.warning("[behavior] hover_then_click move_to failed (%s)", exc)
 
-        # Step 2 — fire the explicit hover event. DrissionPage's
-        # ele.hover() dispatches a real mouseenter/mouseover pair the
-        # React rail listens for.
+        # step 2: fire the explicit hover event. DrissionPage ele.hover()
+        # sends a real mouseenter/mouseover pair, which the React rail
+        # listens for.
         try:
             target.hover()  # type: ignore[union-attr]
         except Exception as exc:
             logger.debug(
-                "[behavior] target.hover() failed (%s); relying on move_to mouseenter",
+                "[behavior] target.hover() failed (%s), using move_to mouseenter",
                 exc,
             )
 
-        # Step 3 — dwell for the rail to hydrate.
+        # step 3: wait for the rail to hydrate
         self.idle(*hover_dwell_range_s)
 
         if not click_after:
             return True
 
-        # Step 4 — click. Routed through actions.click() to preserve
+        # step 4: click. Routed through actions.click() so we keep
         # the cursor trajectory we just drew.
         try:
             self._page.actions.click()
             return True
         except Exception as exc:
             logger.warning(
-                "[behavior] hover_then_click actions.click failed (%s); "
-                "falling back to ele.click",
+                "[behavior] hover_then_click actions.click failed (%s), "
+                "fallback to ele.click",
                 exc,
             )
             try:
@@ -268,35 +221,21 @@ class HumanBehaviorEngine:
         enable_corner_click_fallback: bool = True,
         enable_escape_fallback: bool = True,
     ) -> int:
-        """Fast soft-fail sweep for IG's random nag modals; click them away.
+        """Soft sweep for IG modals (notifications, home prompts, etc).
 
-        Instagram throws unscheduled interstitials whenever it feels
-        like it: "Turn on notifications", "Message updates", "Add
-        Instagram to your home screen", suggested-people prompts,
-        cookies banners, "Video posts are now shared as reels", etc.
-        Different copy, different DOM, but always one of a small set
-        of dismiss buttons (``Not Now``, ``Cancel``, ``OK``, or a
-        close ``X`` icon inside a ``role="dialog"``).
+        We use text and aria-based selectors because class hashes change
+        often. Fails softly, so the main flow does not crash if there are
+        no modals at all.
 
-        Strict rules this sweep follows:
-
-        * **NEVER uses class hashes** like ``_a9--``, ``_ap36``, or
-          ``_a9_1`` — IG rotates those every couple of months, so any
-          locator that depends on them is on borrowed time. Every
-          selector below is text- or aria-attribute-based.
-        * **Soft fail** — every locator and click is wrapped in
-          try/except. This method never raises. If nothing is on
-          screen the sweep just returns ``0``.
-        * **Short timeouts** — default 1s per selector means a clean
-          (no-modal) sweep costs ~7-8s of dead time at worst, but
-          also catches modals that lazy-render up to a second after
-          the page settles.
-        * **Re-sweep after success** — up to ``max_dismissals`` times,
-          since IG often stacks two modals (notification prompt
-          closes → "Save login info?" mounts in the same render).
+        Args:
+            per_selector_timeout_s: how long to wait per selector check.
+            max_dismissals: how many sweep retries we do in case modals stack.
+            enable_corner_click_fallback: try clicking the top-left corner
+                to close.
+            enable_escape_fallback: try sending the ESC key.
 
         Returns:
-            Number of modals actually dismissed.
+            int: how many modals we closed.
         """
         if max_dismissals < 1:
             raise ValueError(f"max_dismissals must be >= 1, got {max_dismissals}")
@@ -305,12 +244,11 @@ class HumanBehaviorEngine:
                 f"per_selector_timeout_s must be > 0, got {per_selector_timeout_s}"
             )
 
-        # Delegate to the module-level helper so the 3-layer defense
-        # (text-button sweep → backdrop click at (10, 10) → ESC key)
-        # lives in exactly one place. The engine method exists mostly
-        # to keep the inline call site (``self.dismiss_interruptions()``)
-        # ergonomic for action handlers that already have a behavior
-        # engine in scope.
+        # delegate to the module-level helper, so the 3-layer defense
+        # (text button sweep, backdrop click at (10, 10), ESC key) lives
+        # in one place. This method exists mostly so action handlers that
+        # already have a behavior engine in scope can call
+        # self.dismiss_interruptions() inline.
         return dismiss_instagram_modals(
             self._page,
             per_selector_timeout_s=per_selector_timeout_s,
@@ -319,7 +257,7 @@ class HumanBehaviorEngine:
             enable_escape_fallback=enable_escape_fallback,
         )
 
-    # ── Left-rail navigation ────────────────────────────────────────────
+    # --- Left-rail navigation ---
     # Selector pool per target. Each target lists fallbacks in priority
     # order. The svg[aria-label=...] form is the icon at the rail's
     # collapsed state; the span[normalize-space()=...] form is the
@@ -386,42 +324,19 @@ class HumanBehaviorEngine:
         hover_dwell_s: float = 1.0,
         find_timeout_s: float = 6.0,
     ) -> bool:
-        """Navigate the left rail by hovering it open, then JS-clicking ``target``.
+        """Navigate left rail using hover hydration and JS clicks.
 
-        Why this method exists: Instagram's left navigation rail
-        renders each entry as a stub icon and only mounts the real
-        click handler on the first ``mouseenter`` event on the rail.
-        A direct click on the un-hydrated stub silently no-ops, OR
-        the rail expands a tooltip mid-click and the synthetic event
-        lands on the wrong element.
+        React router ignores basic clicks on SVG icons here due to an invisible 
+        hydration overlay. We hover the rail anchor (Home) to expand it, 
+        then trigger a JS click directly on the target element to bypass the overlay.
 
-        On top of that, IG's React router refuses to honor visual-only
-        clicks on the ``<svg>`` icon for Reels (and now most rail
-        entries) — the click handler is bound to the wrapping ``<a>``
-        and an invisible hydration overlay sits on top of the SVG.
-
-        The only pattern that survives both gates:
-
-            1. Hover the rail anchor (Home icon) so React mounts its
-               listeners and the rail expands.
-            2. Sleep ``hover_dwell_s`` (default 1.0s) — React needs the
-               full beat to wire up href-based navigation handlers.
-            3. Hover the *target element itself* and sleep again, so
-               the parent ``<a>`` enters its hydrated/expanded state.
-            4. Click the target via ``ele.click(by_js=True)``. JS click
-               dispatches the click directly on the element rather
-               than at a coordinate, which is what makes it bypass the
-               hydration overlay.
-
-        Supported ``target`` values: ``"create"``, ``"reels"``,
-        ``"home"``, ``"profile"``, ``"explore"``, ``"search"``
-        (case-insensitive). Unknown targets raise ``ValueError``.
+        Args:
+            target: "create", "reels", "home", "profile", "explore", or "search".
+            hover_dwell_s: Wait time for React handlers to mount.
+            find_timeout_s: Max time to find the target.
 
         Returns:
-            ``True`` iff a click was actually issued. Hover failures
-            are logged and the method still attempts the click. Click
-            failures and missing targets return ``False`` so the
-            caller (an action handler) can decide whether to abort.
+            bool: True if click was successful.
         """
         if hover_dwell_s < 0:
             raise ValueError(f"hover_dwell_s must be >= 0, got {hover_dwell_s}")
@@ -494,7 +409,7 @@ class HumanBehaviorEngine:
             )
             return False
 
-        # ── CRITICAL: resolve SVG → wrapping button BEFORE any JS click.
+        # --- CRITICAL: resolve SVG → wrapping button BEFORE any JS click. ---
         # SVGs don't inherit HTMLElement.click(), so ``ele.click(by_js=True)``
         # on a ``<svg aria-label="New post">`` throws
         # ``TypeError: this.click is not a function``. ``_ensure_clickable``
@@ -584,24 +499,16 @@ class HumanBehaviorEngine:
         settle_s: float = 1.0,
         pre_click_pause_range_s: Tuple[float, float] = (0.4, 0.9),
     ) -> None:
-        """Click a button after guaranteeing it is visible in the viewport.
+        """Scroll element into center viewport, let layout settle, then click.
 
-        Off-screen ``Submit`` / ``Save`` / ``Share`` buttons are the #1 cause
-        of silent click failures in DrissionPage — the synthetic mousedown
-        lands on whatever element happens to be under the cursor at that
-        coordinate, not the intended button. This helper:
+        Useful for commit buttons (Submit, Share) that might be clipped 
+        by sticky headers. Scrolling to center ensures coordinate clicks 
+        actually land on the target.
 
-        1. Calls ``element.scroll.to_see(center=True)`` to bring the button
-           into the viewport center.
-        2. Waits ``settle_s`` seconds for the layout to stabilize (IG often
-           reflows after a scroll, especially with sticky headers).
-        3. Adds a short pre-click hesitation — humans don't click a button
-           the millisecond it appears.
-        4. Routes the click through :meth:`click` so the cursor still
-           travels along a Bezier path.
-
-        Always prefer this over plain ``.click()`` for any commit-style
-        button (Submit, Save, Share, Confirm, Post).
+        Args:
+            target: Element to click.
+            settle_s: Wait time for React reflow after scroll.
+            pre_click_pause_range_s: Human hesitation before clicking.
         """
         try:
             target.scroll.to_see(center=True)  # type: ignore[union-attr]
@@ -621,38 +528,20 @@ class HumanBehaviorEngine:
         target: _HasRect,
         *,
         focus_first: bool = True,
-        backspace_passes: int = 1,  # kept for API compat; ignored by the JS path
+        backspace_passes: int = 1,
     ) -> bool:
-        """Hard-clear an input/textarea/contenteditable via JS injection.
+        """Clear an input field via JS injection and event dispatching.
 
-        React-controlled forms (Instagram's bio editor, the upload
-        caption, every place we type) ignore hardware ``Backspace``
-        keys whenever the React state for the node holds a non-empty
-        value — the hardware keystroke clears the DOM, then React
-        re-renders the old value back in on the next tick. The only
-        reliable wipe is to write directly to the node's ``value`` AND
-        ``textContent``, then dispatch a synthetic ``input`` event
-        (the one React listens for) so its internal state catches up
-        to the DOM.
+        React ignores hardware backspaces if state isn't synced. We update 
+        node values directly and fire 'input' events so React state catches up.
 
-        Strategy:
-
-        1. Focus the target so the caret is in the right place when
-           the caller later types into it.
-        2. Run a JS payload on the node that:
-             * sets ``.value`` (input/textarea path),
-             * sets ``.textContent`` and ``.innerText`` (contenteditable),
-             * dispatches a bubbling ``input`` event so React reconciles.
-        3. Read the field back. If it's still non-empty (rare, but
-           possible if React owns the value entirely), fall back to a
-           keystroke-based ``Ctrl+A`` + ``Backspace`` retry.
+        Args:
+            target: The input/textarea element.
+            focus_first: Click to focus before wiping.
+            backspace_passes: Retries for the keyboard Ctrl+A fallback.
 
         Returns:
-            ``True`` if the field is empty when we return, ``False`` if
-            we couldn't fully wipe it. Callers should check this and
-            decide whether to abort the action — typing into a
-            non-empty field will *append*, which is the bug we're
-            fixing here.
+            bool: True if field is empty at the end.
         """
         if backspace_passes < 1:
             raise ValueError(f"backspace_passes must be >= 1, got {backspace_passes}")
@@ -661,7 +550,7 @@ class HumanBehaviorEngine:
             self.click(target)
             self.idle(0.18, 0.45)
 
-        # ── Step 1 — JS wipe on the element handle ─────────────────────
+        # --- Step 1 — JS wipe on the element handle ---
         js_wipe = (
             "this.value = '';"
             "this.textContent = '';"
@@ -705,7 +594,7 @@ class HumanBehaviorEngine:
 
         self.idle(0.12, 0.28)
 
-        # ── Step 2 — verify empty ──────────────────────────────────────
+        # --- Step 2 — verify empty ---
         residual: str = ""
         if wiped:
             try:
@@ -721,7 +610,7 @@ class HumanBehaviorEngine:
                 )
                 residual = ""
 
-        # ── Step 3 — keystroke fallback if anything remains ────────────
+        # --- Step 3 — keystroke fallback if anything remains ---
         if residual:
             logger.warning(
                 "[behavior] clear_input_field: %d chars remained after JS wipe; "
@@ -853,7 +742,7 @@ class HumanBehaviorEngine:
             raise ValueError(f"Invalid idle range: ({min_s}, {max_s})")
         time.sleep(self._rng.uniform(min_s, max_s))
 
-    # ── JS-driven smooth scroll (preferred over DrissionPage's hard scrolls) ──
+    # --- JS-driven smooth scroll (preferred over DrissionPage's hard scrolls) ---
     def smooth_scroll(
         self,
         min_y: int = 300,
@@ -993,7 +882,7 @@ class HumanBehaviorEngine:
             logger.debug("[behavior] safe_click outer guard caught (%s)", exc)
         return False
 
-    # ── Deep humanization helpers (Warmup 2.0) ─────────────────────────
+    # --- Deep humanization helpers (Warmup 2.0) ---
     def deep_scroll_session(
         self,
         *,
@@ -1195,7 +1084,7 @@ class HumanBehaviorEngine:
         self.idle(0.6, 1.4)
         return result
 
-    # ── Internals for the helpers above ────────────────────────────────
+    # --- Internals for the helpers above ---
     def _first_visible_element(self, selectors: Iterable[str]) -> Any | None:
         """Return the first selector that resolves to an element, or None."""
         for sel in selectors:
@@ -1214,7 +1103,7 @@ class HumanBehaviorEngine:
         except Exception as exc:
             logger.debug("[behavior] Escape via actions failed (%s)", exc)
 
-    # ── Internals ──────────────────────────────────────────────────────
+    # --- Internals ---
     def _coord_of(self, target: Locator) -> Coord:
         """Resolve a target into an absolute ``(x, y)`` coordinate."""
         if isinstance(target, tuple):
@@ -1283,7 +1172,7 @@ class HumanBehaviorEngine:
             time.sleep(_step_delay(t, base_delay, self._rng))
 
 
-# ── SVG → clickable-parent resolution ───────────────────────────────────
+# --- SVG → clickable-parent resolution ---
 # Why this exists:
 #
 # IG renders most interactive icons as decorative SVGs wrapped in a
@@ -1390,7 +1279,7 @@ def _ensure_clickable(ele: Any) -> Any:
     return walked if walked is not None else ele
 
 
-# ── Standalone helpers (no HumanBehaviorEngine instance required) ───────
+# --- Standalone helpers (no HumanBehaviorEngine instance required) ---
 # Locator pool for ``dismiss_instagram_modals`` — kept module-level so
 # both the engine method and the standalone function read from the
 # same source of truth. STRICTLY no class-hash selectors (``_a9--``,
@@ -1536,7 +1425,7 @@ def dismiss_instagram_modals(
         )
         return 0
 
-    # ── Layer 1: text-button sweep ────────────────────────────────────
+    # --- Layer 1: text-button sweep ---
     dismissed = 0
     for sweep_idx in range(max_dismissals):
         clicked_this_pass = False
@@ -1577,7 +1466,7 @@ def dismiss_instagram_modals(
     if dismissed:
         logger.info("[behavior] L1 cleared %d modal(s) via text buttons", dismissed)
 
-    # ── Layer 2: backdrop click ───────────────────────────────────────
+    # --- Layer 2: backdrop click ---
     # Only fires if a dialog is STILL on screen after Layer 1.
     if enable_corner_click_fallback and _modal_still_present(page):
         logger.warning(
@@ -1586,7 +1475,7 @@ def dismiss_instagram_modals(
         if _click_empty_corner(page, x=10, y=10):
             logger.info("[behavior] L2 backdrop click dispatched at (10, 10)")
 
-    # ── Layer 3: ESC key ──────────────────────────────────────────────
+    # --- Layer 3: ESC key ---
     if enable_escape_fallback and _modal_still_present(page):
         logger.warning(
             "[behavior] modal still present after L2 — engaging L3 ESC key"
@@ -1598,7 +1487,7 @@ def dismiss_instagram_modals(
     return dismissed
 
 
-# ── Verified coordinate click (module-level, importable) ────────────────
+# --- Verified coordinate click (module-level, importable) ---
 
 class ClickVerificationError(RuntimeError):
     """Raised when safe_coordinate_click exhausts all retries without
@@ -1615,36 +1504,28 @@ def safe_coordinate_click(
     max_retries: int = 3,
     verify_timeout: float = 3.0,
 ) -> bool:
-    """Find element, scroll into viewport center, click at physical midpoint.
+    """Find element, scroll into viewport center, and click at physical midpoint.
 
-    This is the MANDATORY interaction pattern for Instagram's React SPA.
-    Standard DOM clicks fail because IG uses invisible overlays,
-    pointer-events:none SVGs, and React state-locked buttons.
-
-    **Paranoid State Checking** — if ``verify_locator`` is provided, the
-    click is retried up to ``max_retries`` times. After each click
-    attempt the helper waits up to ``verify_timeout`` seconds for the
-    verification element to appear (or disappear, if
-    ``verify_disappear=True``). Only when verification succeeds does the
-    helper return ``True``.
+    React ignores standard DOM clicks because of invisible overlays and 
+    pointer-events:none SVGs. This is our main interaction primitive to bypass that.
+    If verify_locator is provided, we retry the click until the target state is met.
 
     Args:
-        page: DrissionPage ``ChromiumPage`` instance.
+        page: DrissionPage ChromiumPage instance.
         locator_string: Selector for the element to click.
-        timeout: Seconds to wait for the click-target element.
-        verify_locator: Optional selector that MUST appear (or disappear)
-            after the click for it to count as successful.
-        verify_disappear: If ``True``, verification succeeds when
-            ``verify_locator`` is NOT found (element disappeared).
-        max_retries: Number of click attempts before giving up.
-        verify_timeout: Seconds to wait for the verification check.
+        timeout: Seconds to wait for the target element.
+        verify_locator: Optional selector that must appear (or disappear)
+            after the click for it to be considered successful.
+        verify_disappear: If True, verification succeeds when verify_locator
+            is no longer found (element disappeared).
+        max_retries: Number of click attempts before throwing an error.
+        verify_timeout: Seconds to wait for the verification state.
 
     Returns:
-        ``True`` if the click (and optional verification) succeeded.
+        bool: True if click and verification succeeded.
 
     Raises:
-        ClickVerificationError: If ``verify_locator`` was provided and
-            all retries failed verification.
+        ClickVerificationError: If verification failed after all retries.
     """
     # Step 1 — locate the target element once.
     try:
@@ -1760,7 +1641,7 @@ def _check_verification(
     return False
 
 
-# ── Pure functions (easy to unit-test, no side effects) ─────────────────
+# --- Pure functions (easy to unit-test, no side effects) ---
 def _cubic_bezier(
     t: float,
     x0: float,
@@ -1780,11 +1661,9 @@ def _cubic_bezier(
 
 
 def _step_delay(t: float, base_delay: float, rng: random.Random) -> float:
-    """Per-step sleep with ease-in / ease-out shape.
+    """Calculate per-step sleep using an ease-in / ease-out shape.
 
-    Real wrist motion accelerates from rest, peaks mid-flight, then
-    decelerates onto the target. We approximate this with an inverted
-    cubic ease — slowest at the endpoints, fastest near ``t == 0.5``.
+    Simulates real wrist motion: slow at start, fast in middle, slow at end.
     """
     # Distance from the midpoint of the trajectory in [0, 0.5].
     edge = abs(t - 0.5)

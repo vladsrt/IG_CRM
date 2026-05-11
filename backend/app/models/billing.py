@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 
 class Subscription(Base):
-    """User subscription plan."""
+    """User subscription plan row."""
 
     __tablename__ = "subscriptions"
 
@@ -28,12 +28,12 @@ class Subscription(Base):
         UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
-        unique=True, # У одного юзера только одна активная подписка
+        unique=True,  # one user, one active subscription
     )
     tier: Mapped[str] = mapped_column(
         String(50), 
         nullable=False, 
-        default="free", # free, pro, enterprise
+        default="free",  # free, pro, enterprise
     )
     valid_until: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
@@ -51,7 +51,7 @@ class Subscription(Base):
         nullable=False,
     )
 
-    # ── Relationships ───────────────────────────────────────────────────
+    # relations
     user: Mapped[User] = relationship(
         back_populates="subscription",
     )

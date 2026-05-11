@@ -1,4 +1,4 @@
-"""Time-series metrics intercepted from Instagram's GraphQL/XHR responses."""
+"""Time series metrics pulled from Instagram graphql and xhr responses."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 
 class MetricType(str, enum.Enum):
-    """Categories of metric the network interceptor knows how to extract."""
+    """Metric kinds the network interceptor can parse out."""
 
     FOLLOWERS = "followers"
     REACH = "reach"
@@ -34,15 +34,15 @@ class MetricType(str, enum.Enum):
 
 
 class AccountMetric(Base):
-    """A single metric data-point captured from a network response.
+    """One metric data point taken from a network response.
 
-    The interceptor writes one row per interesting JSON payload it sees on
-    the wire. Querying patterns:
+    The interceptor writes one row per interesting json payload it sees on the
+    wire. Typical queries:
 
-    * Latest follower count for an account:
-        ``ORDER BY captured_at DESC LIMIT 1`` filtered on ``metric_type='followers'``
-    * Last 10 Reels' view counts (shadowban baseline):
-        ``ORDER BY captured_at DESC LIMIT 10`` filtered on ``metric_type='reel_views'``
+    - latest follower count for an account:
+        order by captured_at desc limit 1, with metric_type='followers'
+    - last 10 reel views (used for shadowban baseline):
+        order by captured_at desc limit 10, with metric_type='reel_views'
     """
 
     __tablename__ = "account_metrics"
@@ -74,12 +74,12 @@ class AccountMetric(Base):
     reel_pk: Mapped[str | None] = mapped_column(
         String(64),
         nullable=True,
-        doc="IG media primary key for reel-scoped metrics; NULL for account-scoped.",
+        doc="IG media primary key for reel-level metrics. NULL for account-level.",
     )
     raw_payload: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB,
         nullable=True,
-        doc="Trimmed source payload kept for debugging; not for production reads.",
+        doc="Trimmed source payload, kept for debugging only.",
     )
     captured_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

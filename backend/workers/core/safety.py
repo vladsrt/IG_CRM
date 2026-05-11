@@ -1,11 +1,9 @@
-"""
-File-system safety helpers for the worker layer.
+"""Filesystem safety helpers for the worker layer.
 
-Anything that consumes an operator-supplied path (upload media, avatar
-image) must run it through :func:`resolve_within_media_root` first. This
-is the load-bearing defense against path-traversal: a malicious or
-compromised AI plan could otherwise dispatch ``/etc/shadow`` or any
-other host file to Instagram's servers.
+Anything that takes a path from the user (upload media, avatar image)
+must go through resolve_within_media_root first. This is the main check
+against path traversal. Otherwise a bad or hijacked AI plan could send
+/etc/shadow or any other host file straight to Instagram.
 """
 
 from __future__ import annotations
@@ -18,23 +16,24 @@ class UnsafePathError(ValueError):
 
 
 def resolve_within_media_root(candidate: str, media_root: str) -> str:
-    """Return the absolute resolved path of ``candidate`` IFF it sits under ``media_root``.
+    """Return the resolved absolute path of `candidate`, but only if it
+    sits under `media_root`.
 
-    ``Path.resolve(strict=True)`` follows symlinks, so a symlink under
-    MEDIA_ROOT pointing outside cannot be used to escape — we resolve
-    both ends and compare resolved paths via ``relative_to``.
+    Path.resolve(strict=True) follows symlinks, so a symlink inside
+    MEDIA_ROOT that points outside can not be used to escape. We resolve
+    both ends and compare the resolved paths with relative_to.
 
     Args:
-        candidate: Operator-supplied path (from ``Task.payload`` etc.).
-        media_root: The trusted root, normally ``settings.MEDIA_ROOT``.
+        candidate: path from the user (Task.payload, etc).
+        media_root: the trusted root, normally settings.MEDIA_ROOT.
 
     Returns:
-        The fully-resolved absolute path as a ``str``, safe to hand to
-        ``DrissionPage`` or ``subprocess``.
+        Fully resolved absolute path as a str, safe to pass to
+        DrissionPage or subprocess.
 
     Raises:
-        UnsafePathError: If ``candidate`` is empty / non-string, does not
-            exist, is not a regular file, or escapes ``media_root``.
+        UnsafePathError: when candidate is empty or not a string, does
+            not exist, is not a regular file, or escapes media_root.
     """
     if not candidate or not isinstance(candidate, str):
         raise UnsafePathError("path must be a non-empty string")

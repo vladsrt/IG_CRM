@@ -1,47 +1,37 @@
-"""
-Proxy Builder Utility (Manifest V3, blocking auth)
---------------------------------------------------
-Generates an unpacked Chrome extension on the fly so DrissionPage can
-drive a Chromium that talks to authenticated HTTP / HTTPS / SOCKS
-proxies without crashing on the OS-level basic-auth dialog.
+"""Proxy builder. Manifest V3, blocking auth.
 
-Key design points
-~~~~~~~~~~~~~~~~~
-* **Manifest V3** — current Chrome stable rejects MV2 extensions.
-* **Blocking auth listener** — In MV3 the general
-  ``webRequestBlocking`` permission is restricted, but
-  ``onAuthRequired`` retains support for ``"blocking"`` when the
-  extension declares the ``webRequestAuthProvider`` permission. The
-  listener returns ``{authCredentials: ...}`` synchronously, which
-  is the simplest and most reliable shape for proxy auth.
-* **No extension when no proxy** — :func:`create_proxy_extension`
-  returns ``None`` when given a falsy ``proxy_string``. Callers
-  branch on the return value; nothing gets written to disk for the
-  no-proxy path, so DrissionPage can never resurrect a stale
-  extension.
-* **Temporary folder by default** — :func:`create_proxy_extension`
-  writes to ``tempfile.mkdtemp(prefix="dp_proxy_ext_")`` unless the
-  caller supplies an explicit folder. Cleanup is the caller's
-  responsibility (see ``InstagramBrowser.close``).
-* **Bypass list** — ``localhost`` and ``127.0.0.1`` are always
-  excluded so health checks and devtools introspection stay direct.
+Builds an unpacked Chrome extension on the fly so DrissionPage can drive
+Chromium against authed HTTP / HTTPS / SOCKS proxies without hitting the
+native basic-auth dialog.
 
-Caveats — SOCKS authentication
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Chrome's ``chrome.proxy`` API accepts ``socks4`` / ``socks5`` schemes,
-but Chrome does NOT fire ``onAuthRequired`` for SOCKS — that callback
-only runs for HTTP/HTTPS. A SOCKS proxy with credentials therefore
-yields ``ERR_SOCKS_CONNECTION_FAILED`` at connect time. The default
-``socks_auth_policy="downgrade"`` rewrites the scheme to ``http`` and
-emits a heavy warning; most commercial proxy providers expose both
-transports on the same port so this Just Works. Override with
-``socks_auth_policy="strict"`` (raise) or ``"keep"`` (preserve, will
-fail) if you need different behaviour.
+Main points:
+- Manifest V3. Current stable Chrome rejects MV2 extensions.
+- Blocking auth listener. In MV3 the general webRequestBlocking permission
+  is restricted, but onAuthRequired still works with "blocking" when the
+  extension declares the webRequestAuthProvider permission. The listener
+  returns {authCredentials: ...} synchronously, which is the simplest and
+  most reliable shape for proxy auth.
+- No extension when there is no proxy. create_proxy_extension returns None
+  for empty proxy_string. Callers check the return value, nothing is
+  written to disk, so DrissionPage can not pick up a stale extension.
+- Temp folder by default. create_proxy_extension writes to
+  tempfile.mkdtemp(prefix="dp_proxy_ext_") unless the caller passes a
+  folder. Cleanup is the caller's job (see InstagramBrowser.close).
+- Bypass list. localhost and 127.0.0.1 always skip the proxy, so health
+  checks and devtools talk direct.
 
-Public API
-~~~~~~~~~~
-``parse_proxy_url(url) -> (scheme, user, pass, host, port)``
-``create_proxy_extension(proxy_string, extension_folder_name=None) -> Optional[str]``
+SOCKS auth caveat:
+Chrome's chrome.proxy API accepts socks4 / socks5 schemes, but Chrome does
+NOT fire onAuthRequired for SOCKS, that callback only runs for HTTP/HTTPS.
+A SOCKS proxy with credentials gives ERR_SOCKS_CONNECTION_FAILED at connect.
+Default socks_auth_policy="downgrade" rewrites the scheme to http and logs
+a big warning. Most commercial proxy providers expose both transports on
+the same port so it just works. Use socks_auth_policy="strict" (raise) or
+"keep" (preserve and fail) if you want other behavior.
+
+Public api:
+    parse_proxy_url(url) -> (scheme, user, pass, host, port)
+    create_proxy_extension(proxy_string, extension_folder_name=None) -> Optional[str]
 """
 
 from __future__ import annotations
@@ -55,46 +45,45 @@ from typing import Literal, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
-# ── Constants ───────────────────────────────────────────────────────────
-# Schemes Chrome's `chrome.proxy.settings.set` accepts.
+# constants
+# schemes that chrome.proxy.settings.set will accept.
 _VALID_SCHEMES: frozenset[str] = frozenset({"http", "https", "socks4", "socks5"})
 
-# Schemes that DO support per-request proxy-auth via Chrome's
-# webRequestAuthProvider permission. SOCKS does not — `onAuthRequired`
-# only fires for HTTP/HTTPS proxies, so a SOCKS proxy that demands
-# user/pass produces ``ERR_SOCKS_CONNECTION_FAILED`` at connect time.
+# schemes that support per-request proxy auth via Chrome's
+# webRequestAuthProvider permission. SOCKS does not, onAuthRequired only
+# fires for HTTP and HTTPS proxies, so a SOCKS proxy that wants user/pass
+# gives ERR_SOCKS_CONNECTION_FAILED at connect.
 _AUTH_CAPABLE_SCHEMES: frozenset[str] = frozenset({"http", "https"})
 
-# Hosts that should ALWAYS bypass the proxy. Localhost and the IPv4
-# loopback are non-negotiable — health probes, devtools, CDP all use
-# them and must not be tunnelled.
+# hosts that always skip the proxy. localhost and ipv4 loopback are a must,
+# health probes, devtools and CDP all use them and we can not tunnel them.
 _DEFAULT_BYPASS_LIST: list[str] = ["localhost", "127.0.0.1", "::1"]
 
-# Folder prefix when the caller doesn't supply an explicit folder name.
-# We use tempfile.mkdtemp() by default so the OS picks an unambiguous
-# location (e.g. /tmp on Linux) and each instance gets its own dir.
+# prefix for the temp folder when the caller does not pass a name. we use
+# tempfile.mkdtemp() by default so the OS picks a safe place (like /tmp on
+# linux) and every call gets its own dir.
 _TEMP_FOLDER_PREFIX: str = "dp_proxy_ext_"
 
 SocksAuthPolicy = Literal["downgrade", "strict", "keep"]
 
 
-# ── URL parsing ─────────────────────────────────────────────────────────
+# url parsing
 def parse_proxy_url(proxy_string: str) -> Tuple[str, str, str, str, str]:
-    """Parse a proxy URL into ``(scheme, user, password, host, port)``.
+    """Parse a proxy URL into (scheme, user, password, host, port).
 
     Accepts:
-        * ``protocol://user:pass@host:port``  (preferred)
-        * ``user:pass@host:port``             (assumed ``http``)
-        * ``host:port``                       (assumed ``http``, no auth)
+        protocol://user:pass@host:port  (preferred)
+        user:pass@host:port             (scheme defaults to http)
+        host:port                       (scheme defaults to http, no auth)
 
     Raises:
-        ValueError: on empty input, malformed input, or an unknown scheme.
+        ValueError: empty input, bad format, or unknown scheme.
     """
     raw = (proxy_string or "").strip()
     if not raw:
         raise ValueError("proxy_string is empty")
 
-    # 1. Scheme (optional; defaults to http).
+    # 1. scheme. optional, defaults to http.
     if "://" in raw:
         scheme, remainder = raw.split("://", 1)
         scheme = scheme.lower()
@@ -104,11 +93,11 @@ def parse_proxy_url(proxy_string: str) -> Tuple[str, str, str, str, str]:
 
     if scheme not in _VALID_SCHEMES:
         raise ValueError(
-            f"unknown proxy scheme {scheme!r}; expected one of "
+            f"unknown proxy scheme {scheme!r}, expected one of "
             f"{sorted(_VALID_SCHEMES)}"
         )
 
-    # 2. Optional credentials.
+    # 2. optional credentials
     if "@" in remainder:
         creds, server = remainder.rsplit("@", 1)
         if ":" not in creds:
@@ -120,7 +109,7 @@ def parse_proxy_url(proxy_string: str) -> Tuple[str, str, str, str, str]:
         server = remainder
         user, password = "", ""
 
-    # 3. host:port.
+    # 3. host:port
     if server.count(":") != 1:
         raise ValueError(
             f"proxy server must be host:port, got {server!r}"
@@ -132,7 +121,7 @@ def parse_proxy_url(proxy_string: str) -> Tuple[str, str, str, str, str]:
     return scheme, user, password, host, port
 
 
-# ── Extension generation ────────────────────────────────────────────────
+# extension generation
 def create_proxy_extension(
     proxy_string: Optional[str],
     extension_folder_name: Optional[str] = None,
@@ -141,59 +130,54 @@ def create_proxy_extension(
     bypass_list: Optional[list[str]] = None,
 ) -> Optional[str]:
     """Generate a Manifest V3 Chrome extension that routes traffic through
-    ``proxy_string`` and answers any ``onAuthRequired`` challenge.
+    `proxy_string` and answers any onAuthRequired challenge.
 
     Args:
-        proxy_string: A proxy URL in any of the forms listed in
-            :func:`parse_proxy_url`. **If ``None`` or empty, the
-            function does nothing and returns ``None``.** Callers
-            should branch on the return value: ``None`` means "do not
-            attach any extension". Nothing is ever written to disk on
-            this code path.
-        extension_folder_name: Where to write the extension's two
-            files. If ``None`` (default), a fresh
-            ``tempfile.mkdtemp(prefix="dp_proxy_ext_")`` is created
-            so each call is isolated and concurrent callers cannot
-            collide. Existing folders are reused (and overwritten)
-            when the caller supplies an explicit name. The caller
-            owns cleanup of the folder; see
-            :class:`workers.core.browser_core.InstagramBrowser.close`.
-        socks_auth_policy: How to handle SOCKS4/5 proxies that ship
-            credentials. See module docstring for details. Defaults
-            to ``"downgrade"`` (warn + rewrite scheme to ``http``).
-        bypass_list: Hosts that should bypass the proxy. Defaults to
-            ``["localhost", "127.0.0.1", "::1"]``. Pass an explicit
-            list (e.g. with internal corp domains) to extend, or pass
-            ``[]`` to disable bypass entirely (rare — health probes
-            usually want loopback bypass).
+        proxy_string: a proxy URL in any of the forms listed in
+            parse_proxy_url. If None or empty, the function does nothing
+            and returns None. Callers branch on the return value, None
+            means "do not attach any extension". Nothing is written to
+            disk in that case.
+        extension_folder_name: where to write the extension files. If
+            None (default), a fresh tempfile.mkdtemp(prefix="dp_proxy_ext_")
+            is made, so every call is isolated and concurrent callers do
+            not clash. If the caller passes a name, that folder is reused
+            (and overwritten). The caller owns folder cleanup, see
+            workers.core.browser_core.InstagramBrowser.close.
+        socks_auth_policy: how to handle SOCKS4/5 proxies that ship
+            credentials. See module docstring. Default is "downgrade",
+            warn and rewrite scheme to http.
+        bypass_list: hosts that skip the proxy. Default is
+            ["localhost", "127.0.0.1", "::1"]. Pass a list to extend it
+            (like internal company domains) or pass [] to turn bypass
+            off (rare, health probes usually want loopback bypass).
 
     Returns:
-        Absolute path to the generated extension folder, or ``None``
-        if ``proxy_string`` was falsy (no extension was created).
+        Absolute path to the new extension folder, or None when
+        proxy_string was empty (no extension was created).
     """
-    # ── Guard 1: no proxy → no extension. ─────────────────────────────
+    # guard 1: no proxy means no extension
     if not proxy_string or not str(proxy_string).strip():
         logger.debug(
-            "[proxy_builder] proxy_string is empty/None — not generating extension"
+            "[proxy_builder] proxy_string is empty/None, no extension"
         )
         return None
 
-    # ── Parse + validate. ─────────────────────────────────────────────
+    # parse and validate
     scheme, proxy_user, proxy_pass, proxy_host, proxy_port = parse_proxy_url(
         proxy_string
     )
 
-    # ── SOCKS + credentials guard. ────────────────────────────────────
-    # Only kicks in when BOTH conditions hold: scheme is SOCKS *and*
-    # creds are present. SOCKS without creds (IP-whitelisted at the
-    # provider) is fine — Chrome routes via SOCKS without the auth
-    # callback ever firing.
+    # SOCKS + credentials guard.
+    # only kicks in when both: scheme is SOCKS AND there are creds.
+    # SOCKS without creds (provider whitelisted our IP) is fine, Chrome
+    # routes via SOCKS and the auth callback never fires.
     if scheme not in _AUTH_CAPABLE_SCHEMES and (proxy_user or proxy_pass):
         warning_msg = (
             "Chrome's webRequestAuthProvider does NOT support per-request "
-            f"auth for {scheme!r} proxies — only HTTP/HTTPS. Supplying "
-            f"credentials with a {scheme} URL will produce "
-            "ERR_SOCKS_CONNECTION_FAILED at connect time."
+            f"auth for {scheme!r} proxies, only HTTP/HTTPS. Sending "
+            f"credentials with a {scheme} URL will give "
+            "ERR_SOCKS_CONNECTION_FAILED at connect."
         )
         if socks_auth_policy == "strict":
             raise ValueError(warning_msg + " (policy=strict)")
@@ -202,37 +186,35 @@ def create_proxy_extension(
         logger.warning(warning_msg)
         if socks_auth_policy == "downgrade":
             logger.warning(
-                "Auto-downgrading scheme %r → 'http' (policy=downgrade). "
+                "Auto-downgrading scheme %r to 'http' (policy=downgrade). "
                 "Most proxy providers expose both transports on the same "
-                "port. Pass socks_auth_policy='strict' to refuse, or "
-                "'keep' to preserve the SOCKS scheme and accept the failure.",
+                "port. Use socks_auth_policy='strict' to refuse, or "
+                "'keep' to keep the SOCKS scheme and accept the failure.",
                 scheme,
             )
             scheme = "http"
         else:  # "keep"
             logger.warning(
-                "Keeping scheme %r as requested (policy=keep). Expect "
-                "connection failures.",
+                "Keeping scheme %r (policy=keep). Expect connection "
+                "failures.",
                 scheme,
             )
         logger.warning("=" * 70)
 
-    # ── Resolve target folder. ────────────────────────────────────────
+    # pick target folder
     if extension_folder_name:
         folder = os.path.abspath(extension_folder_name)
         os.makedirs(folder, exist_ok=True)
     else:
         folder = tempfile.mkdtemp(prefix=_TEMP_FOLDER_PREFIX)
 
-    # ── manifest.json (Manifest V3). ─────────────────────────────────
-    # Notes:
-    #   * "manifest_version": 3
-    #   * "background.service_worker" replaces V2's "background.scripts"
-    #   * "<all_urls>" lives under "host_permissions" in V3
-    #   * "webRequestAuthProvider" must be in "permissions" — without
-    #     it, MV3 silently rejects onAuthRequired listeners with
-    #     "blocking", which is exactly the ERR_SOCKS_CONNECTION_FAILED
-    #     symptom the operator was seeing.
+    # manifest.json (MV3) notes:
+    #   - "manifest_version": 3
+    #   - "background.service_worker" replaces V2's "background.scripts"
+    #   - "<all_urls>" goes under "host_permissions" in V3
+    #   - "webRequestAuthProvider" must be in "permissions". Without it
+    #     MV3 silently drops onAuthRequired listeners that use "blocking",
+    #     which is the exact ERR_SOCKS_CONNECTION_FAILED symptom we saw.
     manifest: dict = {
         "name": "DrissionPage Proxy Auth",
         "version": "1.0.0",
@@ -252,26 +234,25 @@ def create_proxy_extension(
         "minimum_chrome_version": "108",
     }
 
-    # ── background.js (Service Worker). ──────────────────────────────
-    # JSON-encode every interpolated value so a credential containing
-    # a quote, backslash, or unicode char can't break out of the JS
-    # string literal.
+    # background.js (service worker).
+    # json-encode every value we interpolate, so a credential with a
+    # quote, backslash or unicode can not break out of the JS string.
     bg_scheme = json.dumps(scheme)
     bg_host = json.dumps(proxy_host)
-    bg_port = int(proxy_port)  # already validated as digits in parse step
+    bg_port = int(proxy_port)  # already checked as digits in parse step
     bg_user = json.dumps(proxy_user)
     bg_pass = json.dumps(proxy_pass)
     bg_bypass = json.dumps(list(bypass_list) if bypass_list is not None else _DEFAULT_BYPASS_LIST)
 
     background_js = f"""\
-// Auto-generated by workers/utils/proxy_builder.py — do not edit by hand.
-// Manifest V3 service worker. Two responsibilities:
-//   1. Configure Chrome's proxy.settings to route every request via
-//      the upstream proxy.
-//   2. Answer onAuthRequired with the credentials parsed from the
-//      proxy URL. We use the synchronous "blocking" extra info, which
-//      MV3 retains support for ONLY when the extension also declares
-//      the "webRequestAuthProvider" permission (see manifest above).
+// Auto-generated by workers/utils/proxy_builder.py, do not edit by hand.
+// MV3 service worker. Two jobs:
+//   1. set chrome.proxy.settings so every request goes through the
+//      upstream proxy.
+//   2. answer onAuthRequired with the creds we parsed from the proxy URL.
+//      we use the sync "blocking" form, which MV3 only allows when the
+//      extension also declares "webRequestAuthProvider" in permissions
+//      (see manifest above).
 
 const PROXY_CONFIG = {{
     mode: "fixed_servers",
@@ -288,17 +269,17 @@ const PROXY_CONFIG = {{
 chrome.proxy.settings.set(
     {{ value: PROXY_CONFIG, scope: "regular" }},
     function () {{
-        // Setting persists in the profile; nothing to do in the callback.
+        // setting is stored in the profile, nothing to do in the callback.
     }}
 );
 
 const PROXY_USER = {bg_user};
 const PROXY_PASS = {bg_pass};
 
-// Synchronous "blocking" listener. MV3 allows this for onAuthRequired
-// specifically when "webRequestAuthProvider" is in permissions.
-// Returning {{ authCredentials }} tells Chrome to satisfy the proxy's
-// HTTP 407 challenge with these creds.
+// sync "blocking" listener. MV3 allows it for onAuthRequired when the
+// extension has "webRequestAuthProvider" in permissions. Returning
+// { authCredentials } tells Chrome to answer the proxy HTTP 407 with
+// these creds.
 chrome.webRequest.onAuthRequired.addListener(
     function (details) {{
         return {{
@@ -313,7 +294,7 @@ chrome.webRequest.onAuthRequired.addListener(
 );
 """
 
-    # ── Write files. ─────────────────────────────────────────────────
+    # write files
     manifest_path = os.path.join(folder, "manifest.json")
     background_path = os.path.join(folder, "background.js")
     with open(manifest_path, "w", encoding="utf-8") as f:

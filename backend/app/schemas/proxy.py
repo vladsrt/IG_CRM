@@ -26,7 +26,7 @@ class ProxyRead(ProxyBase):
 
 
 class ProxyUpdate(BaseModel):
-    """PATCH payload — every field optional."""
+    """PATCH body. All fields optional."""
 
     model_config = ConfigDict(extra="forbid")
 

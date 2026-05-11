@@ -15,20 +15,20 @@ if TYPE_CHECKING:
 
 
 class ProxyType(str, enum.Enum):
-    """Proxy rotation strategy."""
+    """How the proxy rotates its IP."""
 
     ORDINARY = "ordinary"
     STICKY = "sticky"
 
 
 class ProxyProtocol(str, enum.Enum):
-    """Wire protocol used to talk to the upstream proxy.
+    """Protocol used to talk to the upstream proxy.
 
-    ``HTTP`` / ``HTTPS`` — handled natively by Chrome's authenticated
-    proxy extension. ``SOCKS4`` / ``SOCKS5`` — Chrome supports them as
-    transports but does NOT support per-request auth via
-    ``webRequest.onAuthRequired``; SOCKS proxies must be IP-whitelisted
-    at the provider for credentials to be omitted from the request URL.
+    HTTP and HTTPS work fine with Chrome's authenticated proxy extension.
+    SOCKS4 and SOCKS5 are also supported as a transport, but Chrome cannot
+    do per request auth for them through webRequest.onAuthRequired. So with
+    SOCKS the provider must whitelist our IP and we skip the user:pass part
+    in the proxy URL.
     """
 
     HTTP = "http"
@@ -38,7 +38,7 @@ class ProxyProtocol(str, enum.Enum):
 
 
 class Proxy(Base):
-    """Proxy server configuration."""
+    """Proxy server config row."""
 
     __tablename__ = "proxies"
     __table_args__ = (
@@ -70,7 +70,7 @@ class Proxy(Base):
         server_default=text("'http'"),
     )
 
-    # ── Relationships ───────────────────────────────────────────────────
+    # relations
     instagram_accounts: Mapped[list[InstagramAccount]] = relationship(
         back_populates="proxy",
         lazy="selectin",

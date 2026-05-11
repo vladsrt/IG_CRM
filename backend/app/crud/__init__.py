@@ -1,4 +1,4 @@
-"""CRUD layer — pure data-access functions consumed by API routers."""
+"""CRUD layer. Plain db functions used by the API routers."""
 
 from app.crud import account, media, proxy, subscription, task, user
 

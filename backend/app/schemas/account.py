@@ -25,7 +25,7 @@ class InstagramAccountCreate(InstagramAccountBase):
 
 
 class InstagramAccountUpdate(BaseModel):
-    """PATCH payload — every field optional, ``exclude_unset`` semantics in CRUD."""
+    """PATCH body. All fields optional, CRUD uses exclude_unset."""
 
     model_config = ConfigDict(extra="forbid")
 

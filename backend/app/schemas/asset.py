@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.models.asset import AssetStatus
 
 
-# ── MediaFolder ─────────────────────────────────────────────────────────
+# media folder
 class MediaFolderBase(BaseModel):
     name: str = Field(min_length=1, max_length=255)
 
@@ -24,7 +24,7 @@ class MediaFolderRead(MediaFolderBase):
     created_at: datetime
 
 
-# ── Asset ───────────────────────────────────────────────────────────────
+# asset
 class AssetBase(BaseModel):
     file_path: str
     metadata_: dict[str, Any] | None = Field(None, alias="metadata")
@@ -47,6 +47,6 @@ class AssetRead(AssetBase):
 
 
 class UniqueizeRequest(BaseModel):
-    """Optional body for ``POST /media/{asset_id}/uniqueize``."""
+    """Optional body for POST /media/{asset_id}/uniqueize."""
 
     copies: int = Field(default=10, ge=1, le=50)

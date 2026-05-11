@@ -1,4 +1,4 @@
-"""Persist worker-side ``MetricSample`` records into ``account_metrics``."""
+"""Save worker side MetricSample rows into the account_metrics table."""
 
 from __future__ import annotations
 
@@ -22,11 +22,11 @@ def persist_samples(
     account_id: uuid.UUID,
     samples: Iterable["MetricSample"],
 ) -> int:
-    """Bulk-insert ``samples`` for ``account_id``. Returns rows persisted.
+    """Bulk insert `samples` for `account_id`. Returns how many rows were saved.
 
-    Best-effort: a constraint violation (e.g. unknown account_id) is logged
-    and the transaction rolled back rather than propagated, so a metrics
-    write failure cannot fail the parent Task.
+    Best effort. If a constraint fails (like a bad account_id), we log it
+    and roll back instead of raising, so a metrics write does not break
+    the parent Task.
     """
     rows = [
         AccountMetric(

@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 
 class TaskStatus(str, enum.Enum):
-    """Lifecycle statuses for a background task."""
+    """Status values a background task can have."""
 
     DRAFT = "draft"
     PENDING = "pending"
@@ -26,7 +26,7 @@ class TaskStatus(str, enum.Enum):
 
 
 class Task(Base):
-    """A background task attached to an Instagram account."""
+    """Background task tied to one Instagram account."""
 
     __tablename__ = "tasks"
     __table_args__ = (
@@ -67,7 +67,7 @@ class Task(Base):
         nullable=False,
     )
 
-    # ── Relationships ───────────────────────────────────────────────────
+    # relations
     account: Mapped[InstagramAccount] = relationship(
         back_populates="tasks",
     )

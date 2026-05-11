@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 
 class User(Base):
-    """Application user who owns Instagram accounts, assets, and a subscription."""
+    """App user. Owns Instagram accounts, assets and one subscription."""
 
     __tablename__ = "users"
 
@@ -41,7 +41,7 @@ class User(Base):
         nullable=False,
     )
 
-    # ── Relationships ───────────────────────────────────────────────────
+    # relations
     instagram_accounts: Mapped[list[InstagramAccount]] = relationship(
         back_populates="user",
         cascade="all, delete-orphan",

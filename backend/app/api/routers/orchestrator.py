@@ -1,4 +1,4 @@
-"""Human-in-the-loop orchestration endpoints — dispatch jobs to Celery."""
+"""Orchestrator routes, push jobs to Celery."""
 
 from __future__ import annotations
 
@@ -29,8 +29,8 @@ from app.services.trust import (
 )
 from app.workers.celery_tasks import run_instagram_task, validate_account_session
 
-# Sent to the trust scorer for the User-Agent check. Should match the
-# default UA the worker actually uses (workers.core.executor.DEFAULT_USER_AGENT).
+# UA passed to the trust scorer. Keep this in sync with the UA used by the
+# worker (workers.core.executor.DEFAULT_USER_AGENT).
 _DISPATCH_USER_AGENT: str = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -42,21 +42,21 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/orchestrator", tags=["orchestrator"])
 
 
-# ── Response schemas ────────────────────────────────────────────────────
+# response schemas
 class DispatchResponse(BaseModel):
-    """Returned whenever an endpoint hands work off to a Celery worker."""
+    """Returned when a route pushes a job to a Celery worker."""
 
     celery_task_id: str
     status: str
     detail: str
 
 
-# ── Account validation ──────────────────────────────────────────────────
+# account validation
 @router.post(
     "/accounts/{account_id}/validate",
     response_model=DispatchResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    summary="Trigger background cookie/session validation for an Instagram account",
+    summary="Run background cookie/session check for an Instagram account",
 )
 def trigger_account_validation(
     account_id: uuid.UUID,
@@ -77,7 +77,7 @@ def trigger_account_validation(
     )
 
 
-# ── Single-task execution ──────────────────────────────────────────────
+# single task execution
 _DISPATCHABLE_STATUSES: frozenset[str] = frozenset(
     {TaskStatus.DRAFT.value, TaskStatus.PENDING.value}
 )
@@ -87,7 +87,7 @@ _DISPATCHABLE_STATUSES: frozenset[str] = frozenset(
     "/tasks/{task_id}/start",
     response_model=DispatchResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    summary="Queue an *existing* Task (single account) for execution",
+    summary="Queue an existing Task (one account) for run",
 )
 def trigger_task_start(
     task_id: uuid.UUID,
@@ -103,8 +103,8 @@ def trigger_task_start(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
-                f"Task {task.id} is in status '{task.status}' — only "
-                f"{sorted(_DISPATCHABLE_STATUSES)} can be started."
+                f"Task {task.id} status is '{task.status}', only "
+                f"{sorted(_DISPATCHABLE_STATUSES)} can start."
             ),
         )
 
@@ -130,15 +130,15 @@ def trigger_task_start(
     )
 
 
-# ── Fan-out: ParsedTaskPlan → many Tasks → many Celery jobs ────────────
+# fan out: one ParsedTaskPlan turns into many Tasks and many Celery jobs
 def _resolve_target_accounts(
     db: Session,
     request: FanOutTaskRequest,
 ) -> tuple[dict[uuid.UUID, InstagramAccount], list[uuid.UUID]]:
-    """Return ``(resolved_by_id, missing_explicit_ids)``.
+    """Returns (resolved_by_id, missing_explicit_ids).
 
-    Uses ``dict[id, account]`` rather than a set for O(1) dedupe + stable
-    iteration order. Tag-matched accounts come first, explicit IDs second.
+    We use dict[id, account] (not a set) so dedupe is O(1) and iteration order
+    stays stable. Tag matches go first, then the explicit ids.
     """
     resolved: dict[uuid.UUID, InstagramAccount] = {}
 
@@ -167,11 +167,10 @@ def _resolve_target_accounts(
 
 
 def _evaluate_account_trust(account: InstagramAccount) -> TrustReport:
-    """Run the Epic 8.1 trust gate for one account.
+    """Run the trust gate for one account.
 
-    Wrapped so a probe-side failure (network blip, DNS hiccup) is caught
-    and translated into a `score=0` report rather than crashing the whole
-    fan-out loop.
+    Wrapped in try/except so a network or dns problem inside the probe gives
+    back a score=0 report instead of breaking the whole fan-out loop.
     """
     try:
         return evaluate_trust(account, user_agent=_DISPATCH_USER_AGENT)
@@ -194,17 +193,17 @@ def _create_and_dispatch_one(
     account: InstagramAccount,
     request: FanOutTaskRequest,
 ) -> tuple[Task | None, str | None, str | None]:
-    """Persist one Task and hand it to Celery.
+    """Save one Task and push it to Celery.
 
-    Returns ``(task, celery_task_id, error_reason)``. Exactly one of
-    ``celery_task_id`` or ``error_reason`` is non-None.
+    Returns (task, celery_task_id, error_reason). Only one of celery_task_id or
+    error_reason is set.
 
-    Pre-flight gates (Epic 8):
-      1. Trust score (8.1) — fail-fast before any DB write.
-      2. Spintax + link obfuscation (8.2/8.3) — produce a per-account
-         unique payload so 50 dispatched Tasks do not share bytes.
+    Two gates before dispatch:
+      1. trust score, fail fast before any db write.
+      2. spintax plus link obfuscation, build a per-account payload so 50
+         dispatched tasks do not share the same bytes.
     """
-    # ── Gate 1: trust score (Epic 8.1) ─────────────────────────────────
+    # gate 1: trust score
     report = _evaluate_account_trust(account)
     if not report.passed:
         logger.info(
@@ -213,13 +212,13 @@ def _create_and_dispatch_one(
         )
         return None, None, report.to_skip_reason()
 
-    # ── Gate 2: per-account uniqueization (Epic 8.2 + 8.3) ─────────────
-    # Each call mutates the plan dict with spintax expansions and
-    # obfuscated link tokens, so two cloned tasks never share a payload.
+    # gate 2: per account uniqueize
+    # this rewrites the plan dict with spintax variants and link obfuscation,
+    # so two cloned tasks never end up with the same payload.
     base_payload = request.plan.to_payload_dict()
     unique_payload = uniqueize_plan_payload(base_payload)
 
-    # ── Persist + dispatch ─────────────────────────────────────────────
+    # save and dispatch
     try:
         task_in = TaskCreate(
             account_id=account.id,
@@ -234,7 +233,7 @@ def _create_and_dispatch_one(
         )
         return None, None, f"create_task failed: {type(exc).__name__}: {exc}"
 
-    # ── 2. Hand off to Celery. Roll the row back to DRAFT on broker failure.
+    # send to celery. if broker fails, roll the row back to DRAFT.
     try:
         async_result = run_instagram_task.delay(str(task.id))
     except Exception as exc:
@@ -260,40 +259,39 @@ def _create_and_dispatch_one(
     "/tasks/fan-out",
     response_model=FanOutResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    summary="Fan a reviewed ParsedTaskPlan out to one Task per matching account",
+    summary="Take an approved ParsedTaskPlan and create one Task per matching account",
 )
 def fan_out_plan(
     request: FanOutTaskRequest,
     db: Session = Depends(get_db),
 ) -> FanOutResponse:
-    """Dispatch the operator-approved plan to every matching account.
+    """Send the approved plan to every matching account.
 
-    Resolution order:
-        1. Accounts matching ``plan.target_tags`` (JSONB containment).
-        2. PLUS any accounts in ``target_account_ids`` (deduped).
+    How accounts are picked:
+        1. accounts matching plan.target_tags (jsonb contains).
+        2. plus any accounts in target_account_ids (deduped).
 
-    Per-account failures (DB write rejected, Celery broker down) do NOT
-    abort the run — they are collected into ``skipped`` and the operator
-    gets a per-account reason in the response.
+    If one account fails (db write rejected, celery broker down) the rest of
+    the run continues. Failures are put into the `skipped` list with a reason.
     """
     plan = request.plan
 
-    # ── Pre-flight: refuse to dispatch unactionable plans ─────────────
+    # pre-flight: reject plans we cannot run
     if plan.clarification_needed:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                "Plan still needs clarification — resolve it via the AI chat "
-                f"before fan-out. Question: {plan.clarification_needed!r}"
+                "Plan still needs more info, fix it in the AI chat before "
+                f"fan-out. Question: {plan.clarification_needed!r}"
             ),
         )
     if not plan.commands:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Plan has no commands — nothing to dispatch.",
+            detail="Plan has no commands, nothing to dispatch.",
         )
 
-    # ── Resolve target accounts ───────────────────────────────────────
+    # find target accounts
     resolved, missing_explicit = _resolve_target_accounts(db, request)
 
     if not resolved:
@@ -307,7 +305,7 @@ def fan_out_plan(
             ),
         )
 
-    # Pre-populate the skipped list with explicit IDs the DB didn't know.
+    # fill the skipped list with explicit ids the db did not find
     skipped: list[FanOutSkippedAccount] = [
         FanOutSkippedAccount(
             account_id=missing_id,
@@ -317,7 +315,7 @@ def fan_out_plan(
     ]
     dispatched: list[FanOutDispatchedTask] = []
 
-    # ── Dispatch loop — one short transaction per account ─────────────
+    # dispatch loop, one small tx per account
     for account in resolved.values():
         task, celery_id, error_reason = _create_and_dispatch_one(
             db, account, request

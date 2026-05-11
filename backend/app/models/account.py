@@ -17,19 +17,18 @@ if TYPE_CHECKING:
     from app.models.task import Task
 
 class AuthMethod(str, enum.Enum):
-    """Allowed authentication methods for Instagram accounts."""
+    """How we log into the Instagram account."""
 
     COOKIES = "cookies"
     MANUAL = "manual"
 
 
 class Platform(str, enum.Enum):
-    """Operating system the spoofed Chromium build advertises.
+    """OS that the fake Chromium build pretends to run on.
 
-    Bound to the account at creation time and used to seed the
-    User-Agent if the operator did not supply one. Once persisted, the
-    UA stays pinned for the lifetime of the account so we don't emit
-    "browser changed OS overnight" telemetry.
+    Set once when the account is created and used to pick a UA if the user
+    did not give one. After it is saved the UA stays the same forever, because
+    a real browser does not change OS between sessions.
     """
 
     WINDOWS = "windows"
@@ -38,7 +37,7 @@ class Platform(str, enum.Enum):
 
 
 class InstagramAccount(Base):
-    """An Instagram account linked to a user."""
+    """One Instagram account that belongs to a user."""
 
     __tablename__ = "instagram_accounts"
     __table_args__ = (
@@ -85,12 +84,11 @@ class InstagramAccount(Base):
         nullable=True,
     )
 
-    # ── Browser fingerprint pinning ─────────────────────────────────────
-    # ``platform`` decides which UA pool the account is seeded from at
-    # creation time. ``user_agent`` is the resolved UA string; once set
-    # it is NEVER auto-rotated — rotating UAs between sessions is itself
-    # a strong bot signal, since real browsers don't change their major
-    # version mid-week.
+    # browser fingerprint, pinned once
+    # platform picks the UA pool at create time. user_agent is the chosen UA
+    # string. once set, do not rotate it. swapping the UA between sessions is
+    # itself a bot signal, because real browsers do not change major version
+    # in the middle of the week.
     platform: Mapped[str] = mapped_column(
         String(16),
         nullable=False,
@@ -102,10 +100,10 @@ class InstagramAccount(Base):
         nullable=True,
     )
 
-    # ── Tagging (Sprint 5) ──────────────────────────────────────────────
-    # Free-form list of lowercase string tags (e.g. ["crypto", "tier1"]).
-    # Stored as a JSONB array so the AI orchestrator can target groups via
-    # JSONB containment queries (`tags @> '["crypto"]'::jsonb`).
+    # tags
+    # list of lowercase tag strings like ["crypto", "tier1"]. stored as a
+    # jsonb array so the orchestrator can target groups with jsonb contains
+    # queries (tags @> '["crypto"]'::jsonb).
     tags: Mapped[list[str]] = mapped_column(
         JSONB,
         nullable=False,
@@ -113,7 +111,7 @@ class InstagramAccount(Base):
         server_default=text("'[]'::jsonb"),
     )
 
-    # ── Relationships ───────────────────────────────────────────────────
+    # relations
     user: Mapped[User] = relationship(
         back_populates="instagram_accounts",
     )

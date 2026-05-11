@@ -1,4 +1,4 @@
-"""Proxy endpoints."""
+"""Proxy routes."""
 
 from __future__ import annotations
 

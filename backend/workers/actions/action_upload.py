@@ -1,52 +1,12 @@
 """
-Upload Action — v3 (native OS-dialog interception)
---------------------------------------------------
-Drives Instagram's web "Create → Post / Reel" flow against an already
-authenticated ``InstagramBrowser`` and uploads the file at
-``args["file_path"]``.
+Upload Action
+-------------
+Automates the IG upload flow. 
+We use DrissionPage's CDP file interception instead of hidden input injection, 
+because IG now gates the file input behind native OS dialog events.
 
-Why a rewrite?
-~~~~~~~~~~~~~~
-The previous implementation injected the file via the hidden
-``<input type="file">`` element. IG started gating that input behind a
-React state that only un-mocks once the visible "Select from computer"
-button has been clicked AND a real ``change`` event has fired through
-the OS file dialog. Hidden-input injection no longer works — the form
-silently sits at the file-picker step until the upload timeout expires.
-
-The fix: pre-arm DrissionPage's ``page.set.upload_files(path)`` BEFORE
-the click. DrissionPage intercepts the OS native file dialog at the
-CDP level, so the click that would normally pop a Finder/Explorer
-window instead fires a synthetic ``change`` on the real input and IG's
-state machine moves forward.
-
-Every visible-element interaction is still routed through
-:class:`HumanBehaviorEngine` so the session emits Bezier mouse
-trajectories, variable keystroke timing, smooth scrolls, and
-hesitation pauses.
-
-CRITICAL-4 — file_path is validated against ``settings.MEDIA_ROOT`` via
-:func:`workers.core.safety.resolve_within_media_root` before we hand it
-to DrissionPage. An operator-supplied path that escapes the media root
-(or doesn't exist, or isn't a regular file) is rejected with
-``UploadActionError`` before any DOM interaction.
-
-Public API
-~~~~~~~~~~
-``execute_upload(browser, args) -> dict`` — invoked by ``TaskExecutor``.
-The browser is owned by the executor; this module never instantiates
-one in production and never closes it.
-
-Supported ``args``
-~~~~~~~~~~~~~~~~~~
-* ``file_path``         (required, str)  — absolute path to image or video
-                                           UNDER ``settings.MEDIA_ROOT``
-* ``caption``           (optional, str)  — caption text. Defaults to ``""``.
-* ``location``          (optional, str)  — location name to search/select.
-* ``hide_likes``        (optional, bool) — toggle “Hide like and view counts”.
-* ``disable_comments``  (optional, bool) — toggle “Turn off commenting”.
-* ``upload_timeout_s``  (optional, int)  — overall ceiling on the share→done wait
-                                           (default 180s; raise for big videos)
+API:
+    execute_upload(browser, args) -> dict
 """
 
 from __future__ import annotations
@@ -75,7 +35,7 @@ logger = logging.getLogger(__name__)
 # safe_coordinate_click is imported from workers.core.behavior
 
 
-# ── URLs & tunables ─────────────────────────────────────────────────────
+# --- URLs & tunables ---
 _HOME_URL: str = "https://www.instagram.com/"
 _DEFAULT_STEP_TIMEOUT_S: float = 20.0
 _DEFAULT_UPLOAD_TIMEOUT_S: float = 180.0
@@ -83,25 +43,19 @@ _FILE_UPLOAD_PROCESSING_S: tuple[float, float] = (4.0, 8.0)
 _AFTER_NEXT_PAUSE_S: tuple[float, float] = (1.4, 2.6)
 
 
-# ── Errors ──────────────────────────────────────────────────────────────
+# --- Errors ---
 class UploadActionError(RuntimeError):
     """Raised when a step in the upload flow cannot complete."""
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────
+# --- Helpers ---
 def _find_first(
     page: Any,
     selectors: Iterable[str],
     *,
     timeout: float = _DEFAULT_STEP_TIMEOUT_S,
 ) -> Any | None:
-    """Return the first selector that resolves to a real element, or ``None``.
-
-    The overall ``timeout`` budget is split across the candidate
-    selectors so a missing locator never burns the full window on its
-    own. Per-selector exceptions are caught and logged at debug — the
-    iteration continues.
-    """
+    """Return the first matching element from a list of selectors, or None."""
     selectors = list(selectors)
     if not selectors:
         return None
@@ -126,13 +80,7 @@ def _humanized_click_first(
     label: str,
     safe: bool = True,
 ) -> Any:
-    """Find the first matching selector and click it through the behavior engine.
-
-    Defaults to ``safe=True`` because every commit-style button in this
-    new flow (Next, Share, Done) is liable to render below the fold on
-    small viewports. The caller can pass ``safe=False`` for non-commit
-    elements (e.g., the crop dropdown trigger).
-    """
+    """Find the first matching selector and click it. Safe by default for commit buttons."""
     ele = _find_first(page, selectors, timeout=timeout)
     if ele is None:
         raise UploadActionError(
@@ -151,7 +99,7 @@ def _humanized_click_first(
 
 
 def _step(label: str, fn: Callable[[], Any]) -> Any:
-    """Wrap a step so failures carry their step name in the error chain."""
+    """Wrap a step to trace errors."""
     logger.info("[upload] step: %s", label)
     try:
         return fn()
@@ -164,13 +112,7 @@ def _step(label: str, fn: Callable[[], Any]) -> Any:
 
 
 def _arm_file_upload(browser: InstagramBrowser, abs_path: str) -> None:
-    """Pre-arm DrissionPage's native file-dialog interception.
-
-    The next click that would pop an OS file dialog will be answered
-    with ``abs_path`` instead. Failure here is fatal — without this
-    arming, the visible "Select from computer" button will pop a
-    real OS dialog and freeze the session.
-    """
+    """Pre-arm DrissionPage CDP to intercept the OS file dialog with our file."""
     try:
         browser.page.set.upload_files(abs_path)
     except Exception as exc:
@@ -180,7 +122,7 @@ def _arm_file_upload(browser: InstagramBrowser, abs_path: str) -> None:
     logger.info("[upload] file-dialog interception armed for %s", abs_path)
 
 
-# ── Step implementations ────────────────────────────────────────────────
+# --- Step implementations ---
 def _navigate_home(browser: InstagramBrowser, behavior: HumanBehaviorEngine) -> None:
     browser.page.get(_HOME_URL)
     landed = _find_first(
@@ -220,23 +162,7 @@ def _wait_for_create_modal(
 def _open_create_dialog_via_left_rail(
     browser: InstagramBrowser, behavior: HumanBehaviorEngine
 ) -> None:
-    """Open IG's Create-new-post modal via the left rail.
-
-    Uses :meth:`HumanBehaviorEngine.navigate_left_rail` which hovers
-    the rail anchor (Home icon) for 0.8s to hydrate React listeners,
-    then clicks the ``Create`` entry by ``svg[aria-label="New post"]``
-    (with a ``span:has-text("Create")`` fallback the engine resolves
-    internally).
-
-    After the rail click, IG sometimes presents a Post / Reel / Story
-    submenu — we click ``Post`` if present and otherwise proceed
-    directly. The empty-state profile-Reels fallback that lived here
-    in the previous revision has been intentionally removed: the
-    spec wants a single, guaranteed path, and silently falling back
-    to a different upload type is worse than failing loudly.
-
-    Raises ``UploadActionError`` if the create modal does not open.
-    """
+    """Open IG's Create-new-post modal via the left rail."""
     logger.info("[upload] opening Create modal via left-rail")
 
     if not behavior.navigate_left_rail("create"):
@@ -269,12 +195,7 @@ def _open_create_dialog_via_left_rail(
 def _click_select_from_computer(
     browser: InstagramBrowser, behavior: HumanBehaviorEngine
 ) -> None:
-    """Click the visible 'Select from computer' button.
-
-    The file-dialog interception MUST already be armed (see
-    :func:`_arm_file_upload`). Clicking this button is what fires the
-    OS native file dialog DrissionPage will intercept.
-    """
+    """Click 'Select from computer' to trigger the intercepted file dialog."""
     _humanized_click_first(
         browser.page,
         behavior,
@@ -291,12 +212,7 @@ def _click_select_from_computer(
 def _set_crop_to_original(
     browser: InstagramBrowser, behavior: HumanBehaviorEngine
 ) -> None:
-    """Open the crop dropdown and pick 'Original' aspect ratio.
-
-    This step is robust to absence — some images already arrive at a
-    supported AR and IG skips the crop UI. We log and continue rather
-    than fail the whole upload if the dropdown isn't on screen.
-    """
+    """Pick 'Original' aspect ratio, if the crop UI is present."""
     crop_trigger = _find_first(
         browser.page,
         [
@@ -390,17 +306,7 @@ def _write_caption(
 def _click_share(
     browser: InstagramBrowser, behavior: HumanBehaviorEngine
 ) -> None:
-    """Click Share with belt-and-braces overlay handling.
-
-    The "Video posts are now shared as reels" informational modal
-    sometimes pops up at this exact moment — overlapping the Share
-    button — so we sweep for it IMMEDIATELY before the click. If the
-    standard ``safe_click_button`` then fails (typical symptom: the
-    coordinate-click is intercepted by an invisible overlay), we
-    fall back to ``ele.click(by_js=True)`` which dispatches the
-    click directly on the element in the page context and bypasses
-    overlay layers entirely.
-    """
+    """Click Share button, bypassing overlapping modals with JS click if needed."""
     share_selectors = [
         'xpath://div[@role="button" and normalize-space()="Share"]',
         'xpath://button[normalize-space()="Share"]',
@@ -408,7 +314,7 @@ def _click_share(
         'text:Share',
     ]
 
-    # ── Sweep IMMEDIATELY before the click. Anything that lands here
+    # --- Sweep IMMEDIATELY before the click. Anything that lands here ---
     # (notably the OK on the reels-sharing modal) overlaps the Share
     # button, and a stale sweep from earlier in the flow won't catch a
     # modal that just appeared.
@@ -427,7 +333,7 @@ def _click_share(
             f"Could not locate 'Share button' (tried {share_selectors})"
         )
 
-    # ── Primary: humanized scroll-to-see + bezier click.
+    # --- Primary: humanized scroll-to-see + bezier click. ---
     try:
         behavior.safe_click_button(share_btn)
         logger.info("[upload] Share clicked via safe_click_button")
@@ -439,7 +345,7 @@ def _click_share(
             exc,
         )
 
-    # ── Fallback: JS click bypasses any overlay sitting on top of the
+    # --- Fallback: JS click bypasses any overlay sitting on top of the ---
     # button. We sweep one more time on the way in — the failed
     # coordinate click sometimes shifts focus and a previously-hidden
     # nag modal mounts in the same beat.
@@ -461,13 +367,7 @@ def _click_share(
 
 
 def _wait_for_completion(browser: InstagramBrowser, timeout_s: float) -> str:
-    """Block until IG confirms the post landed. Returns the matched marker.
-
-    The new flow uses an ``<h3>`` toast for both reels and posts. We
-    accept either the explicit reel/post copy or the universal "shared"
-    fragment, and treat a "Done" button appearing in the same dialog as
-    a positive completion signal.
-    """
+    """Wait for IG to confirm the post/reel was shared."""
     deadline = time.monotonic() + timeout_s
     confirm_selectors: List[str] = [
         'xpath://h3[contains(.,"Your reel has been shared")]',
@@ -520,7 +420,7 @@ def _wait_for_completion(browser: InstagramBrowser, timeout_s: float) -> str:
 def _click_done(
     browser: InstagramBrowser, behavior: HumanBehaviorEngine
 ) -> None:
-    """Best-effort dismiss of the completion modal."""
+    """Dismiss completion modal."""
     done_btn = _find_first(
         browser.page,
         [
@@ -539,30 +439,18 @@ def _click_done(
         logger.debug("[upload] Done click failed (%s); ignoring", exc)
 
 
-# ── Public entrypoint ───────────────────────────────────────────────────
+# --- Public entrypoint ---
 def execute_upload(
     browser: InstagramBrowser, args: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
-    """Drive Instagram's Create-Post flow end-to-end using the
-    safe_coordinate_click paradigm for ALL interactions.
+    """Execute the upload flow via coordinate clicks and CDP file interception.
 
-    The browser is owned by the caller (``TaskExecutor``); this function
-    never instantiates a new one and never calls ``browser.close()``.
-    Step failures propagate as ``UploadActionError`` so the executor
-    can mark the parent Task FAILED with a useful message.
-
-    Implements the exact 11-step flow:
-      1. Click Create (svg[aria-label="New post"])
-      2. File injection via DrissionPage
-      3. Click Crop icon
-      4. Select Original
-      5. Click Next
-      6. Handle optional cover/sound
-      7. Click Next again
-      8. Write Caption
-      9. Add Location (optional)
-     10. Advanced Settings (optional)
-     11. Click Share (with 2s pre-wait for React state)
+    Args:
+        browser: Active InstagramBrowser instance.
+        args: Dict with file_path and optional metadata (caption, location).
+        
+    Returns:
+        dict: Upload result.
     """
     args = args or {}
 
@@ -592,7 +480,7 @@ def execute_upload(
     # One engine per upload session — used for idle pauses and typing only.
     behavior = HumanBehaviorEngine(page)
 
-    # ── Phase 0: clear any interruption modals before we touch anything.
+    # --- Phase 0: clear any interruption modals before we touch anything. ---
     try:
         behavior.dismiss_interruptions()
     except Exception as exc:
@@ -601,7 +489,7 @@ def execute_upload(
             exc,
         )
 
-    # ── Navigate to home feed first.
+    # --- Navigate to home feed first. ---
     _step("navigate to home feed",
           lambda: _navigate_home(browser, behavior))
 
@@ -613,9 +501,7 @@ def execute_upload(
             "[upload] post-home dismiss_interruptions raised (%s); continuing", exc
         )
 
-    # ══════════════════════════════════════════════════════════════════
-    # STEP 1: Click Create — verify "Create new post" modal appears
-    # ══════════════════════════════════════════════════════════════════
+    # Step 1: Open the create modal
     logger.info("[upload] step 1: Click Create (verified)")
     _VERIFY_CREATE_MODAL = (
         'xpath://div[@role="heading" and contains(.,"Create new post")]'
@@ -636,9 +522,7 @@ def execute_upload(
         )
     behavior.idle(1.0, 2.0)
 
-    # ══════════════════════════════════════════════════════════════════
-    # STEP 2: File injection via DrissionPage's upload handler
-    # ══════════════════════════════════════════════════════════════════
+    # Step 2: Set up native file upload and click select
     logger.info("[upload] step 2: File injection")
     _step("arm DrissionPage native file-dialog interception",
           lambda: _arm_file_upload(browser, abs_path))
@@ -658,9 +542,7 @@ def execute_upload(
             "[upload] post-processing dismiss raised (%s); continuing", exc,
         )
 
-    # ══════════════════════════════════════════════════════════════════
-    # STEP 3 + 4: Crop → Original (non-critical — skip if absent)
-    # ══════════════════════════════════════════════════════════════════
+    # Step 3-4: Crop to original if needed
     logger.info("[upload] step 3: Click Crop icon")
     if not safe_coordinate_click(page, 'css:svg[aria-label="Select crop"]', timeout=6):
         logger.info("[upload] no 'Select crop' icon — skipping")
@@ -671,10 +553,7 @@ def execute_upload(
             logger.warning("[upload] 'Original' not found — leaving default AR")
         behavior.idle(0.5, 1.0)
 
-    # ══════════════════════════════════════════════════════════════════
-    # STEP 5: Click Next → VERIFY header changes (Edit / Filters /
-    #         Cover photo — anything that is NOT the crop screen)
-    # ══════════════════════════════════════════════════════════════════
+    # Step 5: Advance past crop screen
     logger.info("[upload] step 5: Click Next (post-crop, verified)")
     _VERIFY_POST_CROP = (
         'xpath://div[@role="heading" and ('
@@ -698,10 +577,7 @@ def execute_upload(
         )
     behavior.idle(*_AFTER_NEXT_PAUSE_S)
 
-    # ══════════════════════════════════════════════════════════════════
-    # STEP 6 + 7: Handle optional cover/sound → Click Next again
-    #             VERIFY the caption textarea appears
-    # ══════════════════════════════════════════════════════════════════
+    # Step 6-7: Next past filters to caption screen
     logger.info("[upload] step 6-7: Click Next to caption (verified)")
     _VERIFY_CAPTION_SCREEN = 'css:div[aria-label="Write a caption..."]'
     page.wait(2.0)  # Let React render the optional panel
@@ -733,9 +609,7 @@ def execute_upload(
     logger.info("[upload] caption screen confirmed visible")
     behavior.idle(*_AFTER_NEXT_PAUSE_S)
 
-    # ══════════════════════════════════════════════════════════════════
-    # STEP 8: Write Caption (only if caption box is confirmed)
-    # ══════════════════════════════════════════════════════════════════
+    # Step 8: Write caption
     logger.info("[upload] step 8: Write Caption")
     if caption:
         if not safe_coordinate_click(page, _VERIFY_CAPTION_SCREEN, timeout=5):
@@ -744,9 +618,7 @@ def execute_upload(
         page.actions.type(caption)
         behavior.read_pause(content_length=len(caption))
 
-    # ══════════════════════════════════════════════════════════════════
-    # STEP 9: Add Location (non-critical — skip if missing)
-    # ══════════════════════════════════════════════════════════════════
+    # Step 9: Optional location
     if location:
         logger.info("[upload] step 9: Add Location (%r)", location)
         if safe_coordinate_click(page, 'css:input[placeholder="Add location"]', timeout=6):
@@ -768,9 +640,7 @@ def execute_upload(
     else:
         logger.info("[upload] step 9: no location — skipping")
 
-    # ══════════════════════════════════════════════════════════════════
-    # STEP 10: Advanced Settings (non-critical)
-    # ══════════════════════════════════════════════════════════════════
+    # Step 10: Optional advanced settings
     if hide_likes or disable_comments:
         logger.info("[upload] step 10: Advanced settings")
         if safe_coordinate_click(page, 't:span@text()=Advanced settings', timeout=4):
@@ -806,9 +676,7 @@ def execute_upload(
     else:
         logger.info("[upload] step 10: no advanced settings — skipping")
 
-    # ══════════════════════════════════════════════════════════════════
-    # STEP 11: Click Share → VERIFY completion marker appears
-    # ══════════════════════════════════════════════════════════════════
+    # Step 11: Share
     logger.info("[upload] step 11: Click Share (verified)")
     page.wait(2.0)  # Mandatory pre-wait for React state
 
@@ -854,7 +722,7 @@ def execute_upload(
 
     logger.info("[upload] Share clicked and verified")
 
-    # ── Wait for completion + dismiss ──────────────────────────────────
+    # --- Wait for completion + dismiss ---
     marker = _step("wait for completion",
                    lambda: _wait_for_completion(browser, upload_timeout_s))
 
@@ -872,7 +740,7 @@ def execute_upload(
     }
 
 
-# ── Standalone smoke-test (not used in production) ──────────────────────
+# --- Standalone smoke-test (not used in production) ---
 _SMOKE_TEST_PROXY: str = "8d1f77cde74f6dffffea__cr.us:80fe1a46ee235b27@gw.dataimpulse.com:823"
 
 _SMOKE_TEST_USER_AGENT: str = (
