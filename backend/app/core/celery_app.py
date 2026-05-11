@@ -1,16 +1,16 @@
-"""Celery application instance.
+"""Celery app instance.
 
-Run a worker with::
+Start a worker:
 
     celery -A app.core.celery_app.celery_app worker --loglevel=info
 
-Run the periodic-task scheduler with::
+Start the beat scheduler:
 
     celery -A app.core.celery_app.celery_app beat --loglevel=info
 
-The task module is auto-discovered from ``app.workers.celery_tasks`` so that
-``run_instagram_task.delay(...)`` works from anywhere in the codebase as long
-as the worker process has imported this module.
+Task modules are picked up from app.workers.celery_tasks, so
+run_instagram_task.delay(...) works from anywhere as long as the worker
+process imported this module.
 """
 
 from __future__ import annotations
@@ -33,22 +33,22 @@ celery_app.conf.update(
     accept_content=["json"],
     timezone="UTC",
     enable_utc=True,
-    # Reliability ────────────────────────────────────────────────────────
+    # reliability
     task_acks_late=True,
     task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,
-    # Limits ─────────────────────────────────────────────────────────────
+    # limits
     task_time_limit=settings.CELERY_TASK_TIME_LIMIT,
     task_soft_time_limit=settings.CELERY_TASK_SOFT_TIME_LIMIT,
-    # Result backend ─────────────────────────────────────────────────────
+    # result backend
     result_expires=60 * 60 * 24,  # keep results for 24h
 )
 
 
-# ── Periodic schedule (Celery Beat) ─────────────────────────────────────
-# CRITICAL-1 janitor — sweep orphaned RUNNING Tasks every 5 minutes.
-# Combined with the at-task-start orphan-recovery in run_instagram_task,
-# this ensures no Task can stay stuck in RUNNING after a worker death.
+# beat schedule
+# janitor: sweep stuck RUNNING tasks every 5 minutes. together with the
+# at-start recovery inside run_instagram_task, this stops any task from
+# being stuck in RUNNING after a worker dies.
 celery_app.conf.beat_schedule = {
     "reap-stale-tasks-every-5-min": {
         "task": "ig_crm.reap_stale_tasks",
@@ -60,5 +60,5 @@ celery_app.conf.beat_schedule = {
 
 @celery_app.task(name="ig_crm.ping")
 def ping() -> str:
-    """Lightweight health-check task — useful to verify worker connectivity."""
+    """Tiny health-check task. Use to check the worker is reachable."""
     return "pong"
