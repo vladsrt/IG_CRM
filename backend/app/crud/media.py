@@ -1,4 +1,4 @@
-"""CRUD for ``MediaFolder`` and ``Asset`` (Sprint 5)."""
+"""CRUD for MediaFolder and Asset."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from app.models.user import User
 from app.schemas.asset import MediaFolderCreate
 
 
-# ── MediaFolder ─────────────────────────────────────────────────────────
+# media folder
 def get_folder(db: Session, folder_id: uuid.UUID) -> MediaFolder | None:
     return db.get(MediaFolder, folder_id)
 
@@ -56,7 +56,7 @@ def delete_folder(db: Session, folder_id: uuid.UUID) -> bool:
     return True
 
 
-# ── Asset ───────────────────────────────────────────────────────────────
+# asset
 def get_asset(db: Session, asset_id: uuid.UUID) -> Asset | None:
     return db.get(Asset, asset_id)
 
