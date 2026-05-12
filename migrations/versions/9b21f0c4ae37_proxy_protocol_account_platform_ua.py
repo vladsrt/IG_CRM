@@ -1,17 +1,9 @@
-"""proxy.protocol + account.platform + account.user_agent
+"""
+adds protocol to proxies, platform and user agent to accounts.
 
 Revision ID: 9b21f0c4ae37
 Revises: 54c53356ac82
 Create Date: 2026-05-08 09:00:00.000000
-
-Adds:
-    * proxies.protocol               (varchar(10), NOT NULL, default 'http')
-    * instagram_accounts.platform    (varchar(16), NOT NULL, default 'windows')
-    * instagram_accounts.user_agent  (varchar(512), NULL)
-
-Plus matching CHECK constraints. The ``server_default``s cover the
-backfill on existing rows; the application defaults take over for new
-inserts after the migration runs.
 """
 from typing import Sequence, Union
 
@@ -27,8 +19,8 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    """Upgrade schema."""
-    # ── proxies.protocol ────────────────────────────────────────────────
+    """upgrades schema."""
+    # proxies.protocol
     op.add_column(
         "proxies",
         sa.Column(
@@ -44,7 +36,7 @@ def upgrade() -> None:
         "protocol IN ('http', 'https', 'socks4', 'socks5')",
     )
 
-    # ── instagram_accounts.platform ─────────────────────────────────────
+    # instagram_accounts.platform
     op.add_column(
         "instagram_accounts",
         sa.Column(
@@ -60,7 +52,7 @@ def upgrade() -> None:
         "platform IN ('windows', 'macos', 'linux')",
     )
 
-    # ── instagram_accounts.user_agent ───────────────────────────────────
+    # instagram_accounts.user_agent
     op.add_column(
         "instagram_accounts",
         sa.Column("user_agent", sa.String(length=512), nullable=True),
@@ -68,7 +60,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Downgrade schema."""
+    """downgrades schema."""
     op.drop_column("instagram_accounts", "user_agent")
     op.drop_constraint(
         "ck_instagram_accounts_platform", "instagram_accounts", type_="check"
