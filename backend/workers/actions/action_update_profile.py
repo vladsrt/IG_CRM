@@ -1,11 +1,6 @@
 """
-Update Profile Action
----------------------
-Drives IG's web profile-edit + privacy-settings flow.
-Updates bio text, avatar, and account privacy.
-
-API:
-    execute_update_profile(browser, args) -> dict
+update profile action.
+edits instagram profile bio, avatar, and privacy settings.
 """
 
 from __future__ import annotations
@@ -27,7 +22,7 @@ from workers.core.safety import UnsafePathError, resolve_within_media_root
 logger = logging.getLogger(__name__)
 
 
-# --- URLs & tunables ---
+# settings
 _EDIT_URL: str = "https://www.instagram.com/accounts/edit/"
 _PRIVACY_URL: str = "https://www.instagram.com/accounts/who_can_see_your_content/"
 
@@ -39,12 +34,12 @@ _AVATAR_CHANGE_DIALOG_TIMEOUT_S: float = 12.0
 _AVATAR_TOAST_POLL_INTERVAL_S: float = 0.5
 
 
-# --- Errors ---
+# errors
 class ProfileActionError(RuntimeError):
     """Raised when a step in the update-profile flow cannot complete."""
 
 
-# --- Selector helpers (mirror action_upload's pattern; see design notes) ---
+# selector helpers
 def _find_first(
     page: Any,
     selectors: Iterable[str],
@@ -75,10 +70,7 @@ def _humanized_click_first(
     label: str,
     safe: bool = False,
 ) -> Any:
-    """Locate the first matching element and click it via the behavior engine.
-
-    When `safe=True`, the click uses `safe_click_button` for commit buttons.
-    """
+    """click the first matching element."""
     ele = _find_first(page, selectors, timeout=timeout)
     if ele is None:
         raise ProfileActionError(
@@ -109,7 +101,7 @@ def _step(label: str, fn: Callable[[], Any]) -> Any:
         ) from exc
 
 
-# --- Step implementations ---
+# steps
 def _navigate_to_edit_page(
     browser: InstagramBrowser, behavior: HumanBehaviorEngine
 ) -> None:
@@ -184,11 +176,7 @@ def _set_avatar(
 def _dismiss_change_photo_dialog(
     browser: InstagramBrowser, behavior: HumanBehaviorEngine
 ) -> bool:
-    """Close the 'Change Profile Photo' dialog after avatar injection.
-
-    Returns:
-        bool: True if Cancel was successfully clicked.
-    """
+    """close the change photo dialog."""
     # Wait for the "Profile photo added." toast as a positive signal
     toast_selectors = [
         'xpath://p[normalize-space()="Profile photo added."]',
@@ -380,7 +368,7 @@ def _click_submit(
 def _wait_for_save_marker(
     browser: InstagramBrowser, timeout_s: float = _SAVE_MARKER_TIMEOUT_S
 ) -> str:
-    """Block until IG confirms the save. Returns the matched marker selector."""
+    """wait for the save confirmation toast."""
     deadline = time.monotonic() + timeout_s
     confirm_selectors = [
         'xpath://*[contains(text(),"Profile saved.")]',
@@ -429,18 +417,13 @@ def _wait_for_save_marker(
     )
 
 
-# --- Public entrypoint ---
+# main entry point
 def execute_update_profile(
     browser: InstagramBrowser, args: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
-    """Drive the IG profile / privacy edit flow.
-
-    Args:
-        browser: Active InstagramBrowser instance.
-        args: Dict with bio, avatar_path, is_private.
-        
-    Returns:
-        dict: Result of the update.
+    """
+    runs the profile update process.
+    returns dict with results.
     """
     args = args or {}
 

@@ -1,12 +1,6 @@
 """
-Upload Action
--------------
-Automates the IG upload flow. 
-We use DrissionPage's CDP file interception instead of hidden input injection, 
-because IG now gates the file input behind native OS dialog events.
-
-API:
-    execute_upload(browser, args) -> dict
+upload action.
+uploads a file to instagram.
 """
 
 from __future__ import annotations
@@ -35,7 +29,7 @@ logger = logging.getLogger(__name__)
 # safe_coordinate_click is imported from workers.core.behavior
 
 
-# --- URLs & tunables ---
+# settings
 _HOME_URL: str = "https://www.instagram.com/"
 _DEFAULT_STEP_TIMEOUT_S: float = 20.0
 _DEFAULT_UPLOAD_TIMEOUT_S: float = 180.0
@@ -43,19 +37,19 @@ _FILE_UPLOAD_PROCESSING_S: tuple[float, float] = (4.0, 8.0)
 _AFTER_NEXT_PAUSE_S: tuple[float, float] = (1.4, 2.6)
 
 
-# --- Errors ---
+# errors
 class UploadActionError(RuntimeError):
     """Raised when a step in the upload flow cannot complete."""
 
 
-# --- Helpers ---
+# helpers
 def _find_first(
     page: Any,
     selectors: Iterable[str],
     *,
     timeout: float = _DEFAULT_STEP_TIMEOUT_S,
 ) -> Any | None:
-    """Return the first matching element from a list of selectors, or None."""
+    """find first element from selectors."""
     selectors = list(selectors)
     if not selectors:
         return None
@@ -80,7 +74,7 @@ def _humanized_click_first(
     label: str,
     safe: bool = True,
 ) -> Any:
-    """Find the first matching selector and click it. Safe by default for commit buttons."""
+    """click first element found."""
     ele = _find_first(page, selectors, timeout=timeout)
     if ele is None:
         raise UploadActionError(
@@ -99,7 +93,7 @@ def _humanized_click_first(
 
 
 def _step(label: str, fn: Callable[[], Any]) -> Any:
-    """Wrap a step to trace errors."""
+    """run step and catch errors."""
     logger.info("[upload] step: %s", label)
     try:
         return fn()
@@ -112,7 +106,7 @@ def _step(label: str, fn: Callable[[], Any]) -> Any:
 
 
 def _arm_file_upload(browser: InstagramBrowser, abs_path: str) -> None:
-    """Pre-arm DrissionPage CDP to intercept the OS file dialog with our file."""
+    """setup file upload."""
     try:
         browser.page.set.upload_files(abs_path)
     except Exception as exc:
@@ -122,7 +116,7 @@ def _arm_file_upload(browser: InstagramBrowser, abs_path: str) -> None:
     logger.info("[upload] file-dialog interception armed for %s", abs_path)
 
 
-# --- Step implementations ---
+# steps
 def _navigate_home(browser: InstagramBrowser, behavior: HumanBehaviorEngine) -> None:
     browser.page.get(_HOME_URL)
     landed = _find_first(
@@ -145,7 +139,7 @@ def _navigate_home(browser: InstagramBrowser, behavior: HumanBehaviorEngine) -> 
 def _wait_for_create_modal(
     browser: InstagramBrowser, *, timeout_s: float = 10.0
 ) -> bool:
-    """Verify the 'Create new post' modal is open. Returns ``bool``, never raises."""
+    """check if create modal is open."""
     deadline = time.monotonic() + timeout_s
     selectors: list[str] = [
         'xpath://div[@role="heading" and @aria-level="1" and contains(.,"Create new post")]',
@@ -162,7 +156,7 @@ def _wait_for_create_modal(
 def _open_create_dialog_via_left_rail(
     browser: InstagramBrowser, behavior: HumanBehaviorEngine
 ) -> None:
-    """Open IG's Create-new-post modal via the left rail."""
+    """open create post modal."""
     logger.info("[upload] opening Create modal via left-rail")
 
     if not behavior.navigate_left_rail("create"):
@@ -195,7 +189,7 @@ def _open_create_dialog_via_left_rail(
 def _click_select_from_computer(
     browser: InstagramBrowser, behavior: HumanBehaviorEngine
 ) -> None:
-    """Click 'Select from computer' to trigger the intercepted file dialog."""
+    """click select from computer."""
     _humanized_click_first(
         browser.page,
         behavior,
@@ -212,7 +206,7 @@ def _click_select_from_computer(
 def _set_crop_to_original(
     browser: InstagramBrowser, behavior: HumanBehaviorEngine
 ) -> None:
-    """Pick 'Original' aspect ratio, if the crop UI is present."""
+    """set crop to original."""
     crop_trigger = _find_first(
         browser.page,
         [
@@ -306,7 +300,7 @@ def _write_caption(
 def _click_share(
     browser: InstagramBrowser, behavior: HumanBehaviorEngine
 ) -> None:
-    """Click Share button, bypassing overlapping modals with JS click if needed."""
+    """click share button."""
     share_selectors = [
         'xpath://div[@role="button" and normalize-space()="Share"]',
         'xpath://button[normalize-space()="Share"]',
@@ -314,9 +308,7 @@ def _click_share(
         'text:Share',
     ]
 
-    # --- Sweep IMMEDIATELY before the click. Anything that lands here ---
-    # (notably the OK on the reels-sharing modal) overlaps the Share
-    # button, and a stale sweep from earlier in the flow won't catch a
+    # check for modals right before clicking share so they don't block the click
     # modal that just appeared.
     try:
         behavior.dismiss_interruptions()
@@ -333,7 +325,7 @@ def _click_share(
             f"Could not locate 'Share button' (tried {share_selectors})"
         )
 
-    # --- Primary: humanized scroll-to-see + bezier click. ---
+    # try normal click first
     try:
         behavior.safe_click_button(share_btn)
         logger.info("[upload] Share clicked via safe_click_button")
@@ -345,8 +337,8 @@ def _click_share(
             exc,
         )
 
-    # --- Fallback: JS click bypasses any overlay sitting on top of the ---
-    # button. We sweep one more time on the way in — the failed
+    # fallback: use javascript click if normal click fails.
+    # sweep again just in case a popup appeared when click failed.
     # coordinate click sometimes shifts focus and a previously-hidden
     # nag modal mounts in the same beat.
     try:
@@ -367,7 +359,7 @@ def _click_share(
 
 
 def _wait_for_completion(browser: InstagramBrowser, timeout_s: float) -> str:
-    """Wait for IG to confirm the post/reel was shared."""
+    """wait for upload to finish."""
     deadline = time.monotonic() + timeout_s
     confirm_selectors: List[str] = [
         'xpath://h3[contains(.,"Your reel has been shared")]',
@@ -420,7 +412,7 @@ def _wait_for_completion(browser: InstagramBrowser, timeout_s: float) -> str:
 def _click_done(
     browser: InstagramBrowser, behavior: HumanBehaviorEngine
 ) -> None:
-    """Dismiss completion modal."""
+    """click done."""
     done_btn = _find_first(
         browser.page,
         [
@@ -439,18 +431,13 @@ def _click_done(
         logger.debug("[upload] Done click failed (%s); ignoring", exc)
 
 
-# --- Public entrypoint ---
+# main entry point
 def execute_upload(
     browser: InstagramBrowser, args: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
-    """Execute the upload flow via coordinate clicks and CDP file interception.
-
-    Args:
-        browser: Active InstagramBrowser instance.
-        args: Dict with file_path and optional metadata (caption, location).
-        
-    Returns:
-        dict: Upload result.
+    """
+    uploads a post or reel to instagram.
+    returns dict with result.
     """
     args = args or {}
 
@@ -480,7 +467,7 @@ def execute_upload(
     # One engine per upload session — used for idle pauses and typing only.
     behavior = HumanBehaviorEngine(page)
 
-    # --- Phase 0: clear any interruption modals before we touch anything. ---
+    # clear popups before starting
     try:
         behavior.dismiss_interruptions()
     except Exception as exc:
@@ -489,7 +476,7 @@ def execute_upload(
             exc,
         )
 
-    # --- Navigate to home feed first. ---
+    # go to home page
     _step("navigate to home feed",
           lambda: _navigate_home(browser, behavior))
 
@@ -722,7 +709,7 @@ def execute_upload(
 
     logger.info("[upload] Share clicked and verified")
 
-    # --- Wait for completion + dismiss ---
+    # wait to finish and close
     marker = _step("wait for completion",
                    lambda: _wait_for_completion(browser, upload_timeout_s))
 
@@ -740,7 +727,7 @@ def execute_upload(
     }
 
 
-# --- Standalone smoke-test (not used in production) ---
+# smoke test
 _SMOKE_TEST_PROXY: str = "8d1f77cde74f6dffffea__cr.us:80fe1a46ee235b27@gw.dataimpulse.com:823"
 
 _SMOKE_TEST_USER_AGENT: str = (

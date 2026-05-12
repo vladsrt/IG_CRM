@@ -1,12 +1,6 @@
 """
-Warmup Action
--------------
-Runs a randomized, time-bounded session to keep an IG account looking alive.
-We scroll the feed, watch reels, visit profiles, and like comments based on weights.
-Everything goes through HumanBehaviorEngine to avoid detection.
-
-API:
-    execute_warmup(browser, args) -> dict
+warmup action.
+simulates a real user scrolling and looking at posts to keep the account active.
 """
 
 from __future__ import annotations
@@ -32,7 +26,7 @@ from workers.core.browser_core import InstagramBrowser
 logger = logging.getLogger(__name__)
 
 
-# --- Defaults ---
+# defaults
 DEFAULT_FEED_URL: str = "https://www.instagram.com/"
 DEFAULT_PAGE_LOAD_WAIT_S: float = 5.0
 DEFAULT_DURATION_MINUTES: float = 15.0
@@ -47,8 +41,7 @@ DEFAULT_WEIGHTS: Dict[str, float] = {
     "visit_profile": 10.0,
 }
 
-# --- Locators (curated against current IG web DOM as of 2026-Q2) ---
-# Single source of truth — bumping a selector here updates every action.
+# css selectors
 PROFILE_LINK_LOCATOR = 'css:a[role="link"][href^="/"] span[dir="auto"]'
 PROFILE_FIRST_POST_LOCATOR = 'css:a[href*="/p/"], a[href*="/reel/"]'
 COMMENT_ICON_LOCATOR = 'css:svg[aria-label="Comment"][height="24"]'
@@ -98,7 +91,7 @@ _REELS_PER_VISIT_RANGE: tuple[int, int] = (2, 7)
 _PROFILE_DWELL_S_RANGE: tuple[float, float] = (3.0, 9.0)
 _POST_MODAL_DWELL_S_RANGE: tuple[float, float] = (4.0, 12.0)
 
-# --- Engagement probabilities (hardcoded per QA spec) ---
+# probabilities for actions
 # Each post / reel rolls these INDEPENDENTLY:
 #   * 30% chance to like.
 #   * 45% chance to open the comments modal and engage.
@@ -113,7 +106,6 @@ _OPEN_COMMENTS_PROBABILITY: float = 0.45
 _COMMENT_LIKE_CHANCE_RANGE: tuple[float, float] = (0.60, 0.70)
 _COMMENT_ATTEMPTS_RANGE: tuple[int, int] = (3, 4) 
 
-
 # Short-timeout sweep used when a per-tick lookup fails — the regular
 # defaults (1.5s × 14 selectors) are too slow for in-loop usage. With
 # 0.5s × 14 the worst case is ~7s and most sweeps short-circuit on the
@@ -121,12 +113,12 @@ _COMMENT_ATTEMPTS_RANGE: tuple[int, int] = (3, 4)
 _INLOOP_DISMISS_TIMEOUT_S: float = 0.5
 
 
-# --- Helpers ---
+# helpers
 # safe_coordinate_click is imported from workers.core.behavior
 
 
 def _safe_find(page: Any, selector: str, *, timeout: float = 2.5) -> Any | None:
-    """Return the first matching element or ``None`` — never raises."""
+    """find element without throwing errors."""
     try:
         return page.ele(selector, timeout=timeout)
     except Exception as exc:
@@ -135,7 +127,7 @@ def _safe_find(page: Any, selector: str, *, timeout: float = 2.5) -> Any | None:
 
 
 def _safe_find_all(page: Any, selector: str, *, timeout: float = 2.5) -> List[Any]:
-    """Return all matching elements (possibly empty) — never raises."""
+    """find all matching elements."""
     try:
         return list(page.eles(selector, timeout=timeout) or [])
     except Exception as exc:
@@ -144,11 +136,7 @@ def _safe_find_all(page: Any, selector: str, *, timeout: float = 2.5) -> List[An
 
 
 def _is_already_liked(ele: Any) -> bool:
-    """Check if the Like button is currently in the 'Unlike' state.
-
-    We check the SVG aria-label since wrapper labels are often unreliable.
-    Fails closed: if we can't tell, we assume it's already liked so we don't unlike real posts.
-    """
+    """check if post is already liked."""
     if ele is None:
         return True
     try:
@@ -179,10 +167,7 @@ def _is_already_liked(ele: Any) -> bool:
 
 
 def _sweep_modals_safely(browser: InstagramBrowser, *, label: str) -> int:
-    """In-loop modal sweep. Fast timeout, won't break the session if it fails.
-    
-    Used when expected elements are missing, usually because IG mounted an overlay.
-    """
+    """close any popups quickly."""
     try:
         n = dismiss_instagram_modals(
             browser.page,
@@ -204,11 +189,7 @@ def _try_like_visible_post(
     *,
     counter_key: str,
 ) -> bool:
-    """Find the Like SVG and trigger a hardware coordinate click.
-
-    Returns:
-        bool: True if we clicked a like.
-    """
+    """try to click the like button on a post."""
     # Check if the Like SVG is present and not already in Unlike state.
     like_svg = _safe_find(browser.page, 'css:svg[aria-label="Like"]', timeout=2.0)
     if like_svg is None:
@@ -242,11 +223,7 @@ def _engage_with_comments(
     modal_counter_key: str = "comment_modals_opened",
     likes_counter_key: str = "comments_liked",
 ) -> bool:
-    """Open comments, maybe like a few, then close.
-
-    Returns:
-        bool: True if the modal was opened.
-    """
+    """open comments, maybe like some, then close."""
     # Open comments via direct SVG coordinate click.
     if not safe_coordinate_click(browser.page, 'css:svg[aria-label="Comment"]'):
         _sweep_modals_safely(browser, label="comment-button lookup miss")
@@ -320,7 +297,7 @@ def _engage_with_comments(
     return True
 
 
-# --- Action: scroll the feed ---
+# action: scroll the feed
 def _action_scroll_feed(
     browser: InstagramBrowser,
     behavior: HumanBehaviorEngine,
@@ -349,18 +326,18 @@ def _action_scroll_feed(
         _engage_with_comments(browser, behavior, rng, counters)
 
 
-# --- Action: open comment thread on the visible post ---
+# action: open comments
 def _action_open_comments(
     browser: InstagramBrowser,
     behavior: HumanBehaviorEngine,
     rng: random.Random,
     counters: Dict[str, int],
 ) -> None:
-    """Top-level dispatcher action to open comments."""
+    """dispatcher action to open comments."""
     _engage_with_comments(browser, behavior, rng, counters)
 
 
-# --- Action: hop into Reels and watch a few ---
+# action: watch reels
 def _action_watch_reels(
     browser: InstagramBrowser,
     behavior: HumanBehaviorEngine,
@@ -406,7 +383,7 @@ def _action_watch_reels(
         behavior.idle(0.4, 1.2)
 
 
-# --- Action: visit a random profile ---
+# action: visit profile
 def _action_visit_profile(
     browser: InstagramBrowser,
     behavior: HumanBehaviorEngine,
@@ -460,7 +437,7 @@ def _action_visit_profile(
     behavior.idle(1.4, 2.8)
 
 
-# --- Dispatch table ---
+# dispatcher map
 _ActionFn = Callable[
     [InstagramBrowser, HumanBehaviorEngine, random.Random, Dict[str, int]], None
 ]
@@ -480,19 +457,14 @@ def _pick_action(weights: Dict[str, float], rng: random.Random) -> str:
     return rng.choices(keys, weights=vals, k=1)[0]
 
 
-# --- Public entrypoint ---
+# main entry point
 def execute_warmup(
     browser: InstagramBrowser,
     args: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Execute warmup session loop.
-
-    Args:
-        browser: Active InstagramBrowser instance.
-        args: Dict containing duration_minutes, feed_url, etc.
-        
-    Returns:
-        dict: Session metrics and log.
+    """
+    starts warmup session.
+    returns session result.
     """
     args = args or {}
     rng = random.Random()
@@ -553,7 +525,7 @@ def execute_warmup(
     action_log: List[Dict[str, Any]] = []
 
     while time.monotonic() < end_time:
-        # --- ROBOTS.TXT GUARD ---
+        # catch wrong url
         # If a prior tick crashed and somehow re-navigated to the
         # cookie-injection domain (/robots.txt), force recovery to the
         # feed. Without this the entire remaining session runs against
@@ -618,7 +590,7 @@ def execute_warmup(
     }
 
 
-# --- Standalone smoke-test (not used in production) ---
+# smoke test
 _SMOKE_TEST_PROXY: str = "8d1f77cde74f6dffffea__cr.us:80fe1a46ee235b27@gw.dataimpulse.com:823"
 
 _SMOKE_TEST_USER_AGENT: str = (
