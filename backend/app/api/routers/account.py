@@ -1,4 +1,4 @@
-"""Instagram account routes."""
+"""instagram account routes."""
 
 from __future__ import annotations
 
@@ -14,6 +14,10 @@ from app.schemas.account import (
     InstagramAccountRead,
     InstagramAccountUpdate,
 )
+
+# uncomment these to protect routes with jwt auth:
+# from app.api.dependencies import get_current_user
+# from app.models.user import User
 
 router = APIRouter(prefix="/accounts", tags=["instagram-accounts"])
 
@@ -45,6 +49,22 @@ def list_accounts(
 ) -> list[InstagramAccountRead]:
     rows = crud_account.list_accounts(db, user_id=user_id, skip=skip, limit=limit)
     return [InstagramAccountRead.model_validate(a) for a in rows]
+
+
+# --- example: how to protect this route with jwt ---
+# replace list_accounts above with this to enforce multi-tenancy:
+#
+# @router.get("/", response_model=list[InstagramAccountRead])
+# def list_accounts(
+#     skip: int = Query(0, ge=0),
+#     limit: int = Query(100, ge=1, le=500),
+#     current_user: User = Depends(get_current_user),
+#     db: Session = Depends(get_db),
+# ) -> list[InstagramAccountRead]:
+#     rows = crud_account.list_accounts(
+#         db, user_id=current_user.id, skip=skip, limit=limit,
+#     )
+#     return [InstagramAccountRead.model_validate(a) for a in rows]
 
 
 @router.get("/{account_id}", response_model=InstagramAccountRead)
