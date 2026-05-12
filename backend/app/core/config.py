@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     FFMPEG_TIMEOUT_SECONDS: int = 60 * 15       # 15 min per uniqueize pass
     FFMPEG_DEFAULT_BITRATE_BPS: int = 3_000_000  # used if ffprobe can not read the input
 
+    # jwt auth
+    SECRET_KEY: str = ""  # set in .env, required for production
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+    JWT_ALGORITHM: str = "HS256"
+
+    # cors
+    CORS_ALLOWED_ORIGINS: list[str] = ["*"]
+
 
 # singleton, import `settings` instead of building a new one
 settings = Settings()
