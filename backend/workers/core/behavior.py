@@ -610,7 +610,7 @@ class HumanBehaviorEngine:
                 )
                 residual = ""
 
-        # --- Step 3 — keystroke fallback if anything remains ---
+        # step 3: use backspace if still not empty
         if residual:
             logger.warning(
                 "[behavior] clear_input_field: %d chars remained after JS wipe; "
@@ -668,13 +668,9 @@ class HumanBehaviorEngine:
         char_delay_range_s: Tuple[float, float] = _DEFAULT_KEYSTROKE_RANGE_S,
         thinking_probability: float = _DEFAULT_THINKING_PROBABILITY,
     ) -> None:
-        """Type ``text`` into ``target`` one character at a time.
-
-        Each keystroke is followed by a randomized inter-key delay. With
-        small probability a longer "thinking" pause is inserted to mimic
-        a human stopping mid-sentence.
-
-        ``target`` must be a DrissionPage element (not a coord).
+        """
+        types text into target one by one.
+        adds random delays between keys to look real.
         """
         if focus_first:
             self.click(target)
@@ -695,12 +691,8 @@ class HumanBehaviorEngine:
                 time.sleep(self._rng.uniform(*_DEFAULT_THINKING_RANGE_S))
 
     def read_pause(self, content_length: Optional[int] = None) -> None:
-        """Sleep as if the operator were reading.
-
-        When ``content_length`` is provided, the pause is roughly
-        ``content_length / READING_CHARS_PER_SECOND`` with ±30% jitter
-        (clamped to ``[_READING_MIN_S, _READING_MAX_S]``). When ``None``,
-        a short uniform pause is used.
+        """
+        wait to simulate reading text.
         """
         if content_length is None or content_length <= 0:
             time.sleep(self._rng.uniform(_READING_MIN_S, 1.8))
@@ -716,11 +708,8 @@ class HumanBehaviorEngine:
         pixel_range: Tuple[int, int] = _MICRO_SCROLL_PIXEL_RANGE,
         upward_probability: float = 0.3,
     ) -> None:
-        """Emit 1-3 small wheel deltas in a randomized direction.
-
-        Real users skim — they micro-scroll between actions. Pure-bot
-        sessions almost never do. The default mix is mostly downward with
-        an occasional upward correction.
+        """
+        scrolls a little bit up or down.
         """
         n_lo, n_hi = count_range
         n = self._rng.randint(n_lo, n_hi)
@@ -737,12 +726,12 @@ class HumanBehaviorEngine:
             time.sleep(self._rng.uniform(*_MICRO_SCROLL_PAUSE_RANGE_S))
 
     def idle(self, min_s: float, max_s: float) -> None:
-        """Short uniform sleep — the universal "human is breathing" beat."""
+        """sleep for a random time between min_s and max_s."""
         if min_s < 0 or max_s < min_s:
             raise ValueError(f"Invalid idle range: ({min_s}, {max_s})")
         time.sleep(self._rng.uniform(min_s, max_s))
 
-    # --- JS-driven smooth scroll (preferred over DrissionPage's hard scrolls) ---
+    # js smooth scroll
     def smooth_scroll(
         self,
         min_y: int = 300,
@@ -751,29 +740,8 @@ class HumanBehaviorEngine:
         upward_probability: float = 0.15,
         post_scroll_pause_range_s: Tuple[float, float] = (0.8, 2.6),
     ) -> int:
-        """Smoothly scroll the page by a randomized amount via injected JS.
-
-        DrissionPage's ``page.scroll.down(N)`` issues an instant
-        ``scrollTo``-style jump that produces a single, choppy scroll
-        event with no intermediate frames. Real browsers, when a user
-        rolls the wheel, emit dozens of incremental scroll events as the
-        viewport eases to its new position. We replicate that by calling
-        ``window.scrollBy({top: y, behavior: 'smooth'})`` — the browser
-        handles the easing animation natively.
-
-        Args:
-            min_y: Lower bound on scroll distance (pixels). Must be > 0.
-            max_y: Upper bound on scroll distance (pixels).
-            upward_probability: Chance the scroll goes UP instead of down,
-                simulating a user who saw something interesting and went
-                back to look at it. Defaults to 15%.
-            post_scroll_pause_range_s: After-scroll pause range. The pause
-                always happens — humans don't fire wheel events
-                back-to-back without at least a beat to look at the new
-                content.
-
-        Returns:
-            Signed pixel delta actually requested (negative = upward).
+        """
+        scrolls the page smoothly using javascript.
         """
         if min_y < 1 or max_y < min_y:
             raise ValueError(f"Invalid smooth_scroll bounds: ({min_y}, {max_y})")
@@ -825,25 +793,8 @@ class HumanBehaviorEngine:
         hover_first: bool = True,
         pre_click_pause_range_s: Tuple[float, float] = (0.2, 0.7),
     ) -> bool:
-        """Click ``target`` with humanized timing, swallowing locator errors.
-
-        Behaviour:
-
-        1. If ``hover_first`` and the target has a ``.rect`` (i.e. it's a
-           DrissionPage element, not a coord), move the cursor to it
-           along a Bezier path — that's the "hover".
-        2. Sleep ``pre_click_pause_range_s`` (default 0.2-0.7s) — a real
-           user doesn't click the instant the cursor lands.
-        3. Issue the click.
-
-        EVERYTHING is wrapped in try/except. If ``target`` is ``None``, a
-        stale element, or the click itself raises, this method returns
-        ``False`` instead of propagating — exactly what the warmup loop
-        wants, since "the comment icon wasn't visible this iteration"
-        should never crash a 15-minute session.
-
-        Returns:
-            True iff the click was issued without raising.
+        """
+        clicks an element safely, ignoring errors if not found.
         """
         if target is None:
             return False
@@ -882,7 +833,7 @@ class HumanBehaviorEngine:
             logger.debug("[behavior] safe_click outer guard caught (%s)", exc)
         return False
 
-    # --- Deep humanization helpers (Warmup 2.0) ---
+    # deep humanization helpers
     def deep_scroll_session(
         self,
         *,
@@ -890,19 +841,8 @@ class HumanBehaviorEngine:
         upward_correction_probability: float = 0.18,
         flick_probability: float = 0.12,
     ) -> Dict[str, int]:
-        """Scroll the feed for ~``duration_s`` seconds with rich variance.
-
-        Behaviour mix per tick (chosen randomly each iteration):
-
-        * **Slow read** — small downward delta + a long reading pause
-          weighted by an imagined post length.
-        * **Skim** — medium downward delta + short pause.
-        * **Flick** — large fast scroll burst (3-6 stacked deltas) with
-          almost no pause, simulating a bored thumb-flick.
-        * **Upward correction** — occasional scroll-back, like a user
-          who saw something interesting and went back to look at it.
-
-        Returns a small counter dict for logging in action results.
+        """
+        scrolls the page for a given duration.
         """
         if duration_s <= 0:
             raise ValueError(f"duration_s must be > 0, got {duration_s}")
@@ -957,14 +897,8 @@ class HumanBehaviorEngine:
         *,
         like_probability: float = 0.25,
     ) -> bool:
-        """With ``like_probability``, like the post currently centered in view.
-
-        Looks for an unliked Like button (``aria-label="Like"``) on a
-        post visible in the viewport and clicks it humanly. If the
-        button is already in the "Unlike" state we skip — accidentally
-        un-liking a post on the visible feed is a real-user-impact bug.
-
-        Returns True iff a like was actually clicked.
+        """
+        likes a post on the screen based on probability.
         """
         if not 0.0 <= like_probability <= 1.0:
             raise ValueError(f"like_probability out of [0,1]: {like_probability}")
@@ -998,12 +932,8 @@ class HumanBehaviorEngine:
         like_count_range: Tuple[int, int] = (0, 2),
         read_seconds_range: Tuple[float, float] = (3.0, 9.0),
     ) -> Dict[str, int]:
-        """Maybe open a post's comments, scroll through them, like 0-2.
-
-        With ``open_probability`` we click the comments icon on the
-        post currently in the viewport, scroll through the list as if
-        reading replies, and like a random subset of comments. Returns
-        a counter dict suitable for the warmup result log.
+        """
+        opens comments and maybe likes some.
         """
         if not 0.0 <= open_probability <= 1.0:
             raise ValueError(f"open_probability out of [0,1]: {open_probability}")
@@ -1084,9 +1014,9 @@ class HumanBehaviorEngine:
         self.idle(0.6, 1.4)
         return result
 
-    # --- Internals for the helpers above ---
+    # internals
     def _first_visible_element(self, selectors: Iterable[str]) -> Any | None:
-        """Return the first selector that resolves to an element, or None."""
+        """return the first element found."""
         for sel in selectors:
             try:
                 ele = self._page.ele(sel, timeout=2)
@@ -1103,9 +1033,9 @@ class HumanBehaviorEngine:
         except Exception as exc:
             logger.debug("[behavior] Escape via actions failed (%s)", exc)
 
-    # --- Internals ---
+    # more internals
     def _coord_of(self, target: Locator) -> Coord:
-        """Resolve a target into an absolute ``(x, y)`` coordinate."""
+        """get coordinate of target."""
         if isinstance(target, tuple):
             return int(target[0]), int(target[1])
         try:
@@ -1118,13 +1048,7 @@ class HumanBehaviorEngine:
         return int(mid[0]), int(mid[1])
 
     def _draw_bezier(self, start: Coord, end: Coord, *, fast: bool) -> None:
-        """Sample a cubic Bezier from ``start`` to ``end`` and walk it.
-
-        Control points are placed perpendicular to the start→end vector at
-        a fraction of its length, on opposite sides. This produces the
-        gentle S-curves and one-sided arcs that real wrist motion
-        generates, rather than a straight line.
-        """
+        """draws a curve from start to end."""
         sx, sy = start
         ex, ey = end
         if (sx, sy) == (ex, ey):
@@ -1172,49 +1096,9 @@ class HumanBehaviorEngine:
             time.sleep(_step_delay(t, base_delay, self._rng))
 
 
-# --- SVG → clickable-parent resolution ---
-# Why this exists:
-#
-# IG renders most interactive icons as decorative SVGs wrapped in a
-# clickable element. SVG elements DO NOT inherit ``HTMLElement.click()``
-# — calling ``ele.click(by_js=True)`` on an ``<svg>`` throws
-# ``TypeError: this.click is not a function``. Coordinate clicks on the
-# SVG also frequently fail because the SVG itself has
-# ``pointer-events: none`` (Reels especially) and the click passes
-# through to whatever element is below.
-#
-# The fix is the two-step lookup the QA spec demands:
-#   1. Find the SVG.
-#   2. Walk up to its clickable wrapper (``role="button"`` /
-#      ``<button>`` / ``<a>``).
-#   3. Click the wrapper, never the SVG.
+# svg to clickable parent
 def _walk_up_to_clickable(ele: Any) -> Any | None:
-    """Walk up from ``ele`` to its nearest clickable ancestor.
-
-    Cascading lookup, in priority order:
-
-        1. ``ele.parent('@role=button', timeout=0)`` — IG's standard
-           ``<div role="button">`` wrapper.
-        2. ``ele.parent('tag:button')`` — real HTML ``<button>``.
-        3. ``ele.parent('tag:a')`` — anchor wrapper (used by most
-           left-rail entries: Home, Reels, Profile, etc.).
-        4. ``ele.parent(2)`` — second-level ancestor; on IG the
-           SVG's grandparent is usually the bounding box that
-           actually receives clicks even when no role/tag matches.
-        5. ``ele.parent(1)`` — immediate parent; near-universal
-           fallback. If the element has any ancestor at all, this
-           wins.
-
-    The numeric fallbacks (4 + 5) exist because IG's left rail
-    sometimes wraps icons in plain ``<div>`` elements with no
-    ``role`` and no link semantics — the older
-    "role=button OR tag:a only" cascade returned ``None`` for those
-    layouts and produced ``no clickable parent`` log lines that
-    blocked the upload flow.
-
-    Returns ``None`` only if every layer fails (which means the
-    element has no parent at all, i.e. it was detached).
-    """
+        """find clickable parent."""
     if ele is None:
         return None
 
@@ -1257,14 +1141,7 @@ def _walk_up_to_clickable(ele: Any) -> Any | None:
 
 
 def _ensure_clickable(ele: Any) -> Any:
-    """Return ``ele`` if it's already an HTMLElement; otherwise walk up.
-
-    Used immediately before any ``ele.click(by_js=True)`` to guarantee
-    the element actually supports the JS ``.click()`` method. SVGs
-    are auto-resolved to their wrapping button. If no clickable
-    ancestor exists, returns the original SVG (caller should use
-    coordinate click, not JS click).
-    """
+    """make sure element can be clicked."""
     if ele is None:
         return None
     try:
@@ -1317,13 +1194,7 @@ def _modal_still_present(page: Any, *, timeout: float = 0.3) -> bool:
 
 
 def _click_empty_corner(page: Any, *, x: int = 10, y: int = 10) -> bool:
-    """Layer-2 fallback: click an "empty" coordinate to dismiss overlays.
-
-    Many IG modals dismiss themselves when their backdrop is clicked.
-    Coordinate (10, 10) sits at the top-left of the viewport — typically
-    on the modal's backdrop layer (or at worst on the edge of the left
-    rail nav). The click is wrapped so it can never raise.
-    """
+    """click empty space to close popups."""
     try:
         # DP's actions API: move first, then click. Some DP versions
         # accept a (x, y) tuple to move_to; others require keyword args.
@@ -1340,21 +1211,7 @@ def _click_empty_corner(page: Any, *, x: int = 10, y: int = 10) -> bool:
 
 
 def _press_escape(page: Any) -> bool:
-    """Layer-3 fallback: send the ESC key to force-close any dialog.
-
-    Tries three escape mechanisms in order, since DrissionPage
-    versions differ on which sequence the ``actions.type`` API
-    accepts:
-
-        1. ``"\\x1b"`` — ASCII ESC (the form the QA spec calls for
-           explicitly: ``page.actions.type('\\x1b')``).
-        2. ``"\\ue00c"`` — W3C WebDriver ESC codepoint, used by some
-           DP versions internally.
-        3. ``page.run_js`` dispatching a synthetic ``keydown`` event
-           with ``key='Escape'`` — last resort that works in a live
-           page even when the actions API is broken (e.g. a CDP
-           session got into a weird state).
-    """
+    """press escape key to close popups."""
     for esc_form, label in (("\x1b", "ASCII \\x1b ESC"), ("\ue00c", "W3C \\ue00c ESC")):
         try:
             page.actions.type(esc_form)
@@ -1389,33 +1246,9 @@ def dismiss_instagram_modals(
     enable_corner_click_fallback: bool = True,
     enable_escape_fallback: bool = True,
 ) -> int:
-    """Three-layer soft-fail defense against IG's nag / onboarding modals.
-
-    Layered approach (each layer only runs if the previous one didn't
-    fully clear the modal):
-
-        **Layer 1 — text-button sweep.** Look for ``Not Now`` /
-        ``Cancel`` / ``OK`` / dialog-scoped ``Close`` icons via the
-        :data:`_MODAL_DISMISS_SELECTORS` pool. Click each one found,
-        re-sweeping up to ``max_dismissals`` times in case modals
-        stack. This is the path that handles 95% of cases.
-
-        **Layer 2 — backdrop click.** If a ``<div role="dialog">`` is
-        still on screen after Layer 1 (meaning React intercepted the
-        button clicks, or the button's text moved), simulate a click
-        at coordinate (10, 10). Most IG modals dismiss themselves
-        when their backdrop is clicked.
-
-        **Layer 3 — ESC key.** If a dialog is STILL present after
-        Layer 2, send the Escape key (W3C ``\\ue00c`` first, then
-        ASCII ``\\x1b``, then a JS-dispatched ``keydown`` event).
-
-    Every layer is wrapped in try/except. This function never raises.
-
-    Returns:
-        Number of modals dismissed via Layer 1's text-button clicks.
-        Layer 2 / Layer 3 dismissals are NOT counted here (they're
-        last-resort guards, not the canonical path) but ARE logged.
+    """
+    tries to close instagram modals like notifications.
+    returns how many modals were closed.
     """
     if max_dismissals < 1 or per_selector_timeout_s <= 0 or post_click_settle_s < 0:
         logger.warning(
@@ -1504,28 +1337,8 @@ def safe_coordinate_click(
     max_retries: int = 3,
     verify_timeout: float = 3.0,
 ) -> bool:
-    """Find element, scroll into viewport center, and click at physical midpoint.
-
-    React ignores standard DOM clicks because of invisible overlays and 
-    pointer-events:none SVGs. This is our main interaction primitive to bypass that.
-    If verify_locator is provided, we retry the click until the target state is met.
-
-    Args:
-        page: DrissionPage ChromiumPage instance.
-        locator_string: Selector for the element to click.
-        timeout: Seconds to wait for the target element.
-        verify_locator: Optional selector that must appear (or disappear)
-            after the click for it to be considered successful.
-        verify_disappear: If True, verification succeeds when verify_locator
-            is no longer found (element disappeared).
-        max_retries: Number of click attempts before throwing an error.
-        verify_timeout: Seconds to wait for the verification state.
-
-    Returns:
-        bool: True if click and verification succeeded.
-
-    Raises:
-        ClickVerificationError: If verification failed after all retries.
+    """
+    clicks on an element by its coordinates safely.
     """
     # Step 1 — locate the target element once.
     try:
@@ -1653,7 +1466,7 @@ def _cubic_bezier(
     x3: float,
     y3: float,
 ) -> Tuple[float, float]:
-    """Evaluate a cubic Bezier at parameter ``t in [0, 1]``."""
+    """evaluates a bezier curve."""
     u = 1.0 - t
     bx = u * u * u * x0 + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * x3
     by = u * u * u * y0 + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y3
@@ -1661,10 +1474,7 @@ def _cubic_bezier(
 
 
 def _step_delay(t: float, base_delay: float, rng: random.Random) -> float:
-    """Calculate per-step sleep using an ease-in / ease-out shape.
-
-    Simulates real wrist motion: slow at start, fast in middle, slow at end.
-    """
+    """calculates delay between mouse movements."""
     # Distance from the midpoint of the trajectory in [0, 0.5].
     edge = abs(t - 0.5)
     # Slowness factor: 1.0 at endpoints, ~0.25 at midpoint.
