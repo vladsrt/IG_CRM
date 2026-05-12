@@ -1,10 +1,12 @@
-"""FastAPI app, plugs all routers together."""
+"""fastapi app, plugs all routers together."""
 
 from __future__ import annotations
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routers import account, ai, media, orchestrator, proxy, task, user
+from app.api.routers import account, ai, auth, media, orchestrator, proxy, task, user
+from app.core.config import settings
 
 app = FastAPI(
     title="Instagram CRM API",
@@ -12,9 +14,19 @@ app = FastAPI(
         "Sprint 1: core API and CRUD with subscription billing. "
         "Sprint 2: task orchestrator and Celery dispatch. "
         "Sprint 3: AI prompt to task plan. "
-        "Sprint 5: media manager, ffmpeg uniqueization, account tagging."
+        "Sprint 5: media manager, ffmpeg uniqueization, account tagging. "
+        "Sprint 6: JWT authentication and CORS."
     ),
-    version="0.5.0",
+    version="0.6.0",
+)
+
+# cors
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.CORS_ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -24,6 +36,7 @@ def health() -> dict[str, str]:
 
 
 # routers
+app.include_router(auth.router)
 app.include_router(user.router)
 app.include_router(proxy.router)
 app.include_router(account.router)
@@ -31,3 +44,4 @@ app.include_router(task.router)
 app.include_router(orchestrator.router)
 app.include_router(ai.router)
 app.include_router(media.router)
+
