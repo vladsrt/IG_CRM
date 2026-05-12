@@ -1,20 +1,6 @@
-"""Shared fixtures for the IG CRM test suite.
-
-Design notes
-~~~~~~~~~~~~
-* Tests are unit-level: no real Postgres, no real Chromium, no real Redis,
-  no real OpenAI. Every external boundary is mocked at the import seam of
-  the module under test.
-* The FastAPI ``TestClient`` is wired to the real app, but ``get_db`` is
-  overridden to yield a no-op MagicMock — every test that touches CRUD
-  patches the CRUD module directly, bypassing the session entirely.
-* For worker tests, ``SessionLocal`` is patched to return a context-manager
-  MagicMock built by :func:`make_mock_session` so we can stage the
-  ``db.get`` / ``db.execute`` returns per-test.
-
-Required dev dependencies::
-
-    pip install pytest pytest-mock httpx
+"""
+shared fixtures for tests.
+we mock postgres, redis, openai and browsers.
 """
 
 from __future__ import annotations
@@ -30,17 +16,13 @@ from unittest.mock import MagicMock
 import pytest
 
 
-# ── sys.path bootstrap ──────────────────────────────────────────────────
-# Make ``app.*`` and ``workers.*`` importable when pytest is invoked from
-# any directory. backend/ is the parent of this tests/ folder.
+# sys path setup
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 if str(_BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(_BACKEND_ROOT))
 
 
-# ── Environment variables (must be set BEFORE app imports) ──────────────
-# These prevent app.core.config.Settings from blowing up on first import,
-# and stop services like AIParser from trying to call out to OpenAI.
+# env variables
 os.environ.setdefault("OPENAI_API_KEY", "sk-test-suite")
 os.environ.setdefault("DATABASE_URL", "sqlite+pysqlite:///:memory:")
 os.environ.setdefault("CELERY_BROKER_URL", "memory://")
@@ -48,13 +30,9 @@ os.environ.setdefault("CELERY_RESULT_BACKEND", "cache+memory://")
 os.environ.setdefault("MEDIA_ROOT", "/tmp/ig-crm-test-media")
 
 
-# ── Factory helpers (importable from any test file) ─────────────────────
+# test factories
 def make_fake_account(**overrides: Any) -> SimpleNamespace:
-    """Return a ``SimpleNamespace`` shaped like an ``InstagramAccount`` row.
-
-    SimpleNamespace works with Pydantic v2's ``from_attributes=True`` so
-    it can be returned through a FastAPI route's ``response_model``.
-    """
+    """returns a fake account."""
     base: dict[str, Any] = dict(
         id=uuid.uuid4(),
         user_id=uuid.uuid4(),
@@ -110,16 +88,7 @@ def make_mock_session(
     get_returns: dict[Any, Any] | None = None,
     execute_results: list[Any] | None = None,
 ) -> tuple[MagicMock, MagicMock]:
-    """Build a context-manager MagicMock that imitates ``SessionLocal()``.
-
-    Returns ``(context_manager, inner_session)``. Patch
-    ``app.workers.celery_tasks.SessionLocal`` (or wherever it's imported)
-    with ``return_value=context_manager``; assert against ``inner_session``.
-
-    The ``execute_results`` list is consumed in order — one entry per
-    expected ``db.execute(...)`` call. Each entry should be a MagicMock
-    whose ``.scalar_one_or_none()`` returns the desired value.
-    """
+    """returns a mock db session."""
     db = MagicMock(name="MockSession")
     if get_returns is not None:
         db.get.side_effect = lambda model, _id: get_returns.get(model)
@@ -133,7 +102,7 @@ def make_mock_session(
 
 
 def passing_trust_report():
-    """A :class:`TrustReport` that satisfies the fan-out trust gate."""
+    """returns a passing trust report."""
     from app.services.trust import TrustReport
     return TrustReport(
         score=80,
@@ -146,7 +115,7 @@ def passing_trust_report():
 
 
 def failing_trust_report(reason: str = "proxy probe failed"):
-    """A :class:`TrustReport` that fails the fan-out trust gate."""
+    """returns a failing trust report."""
     from app.services.trust import TrustReport
     return TrustReport(
         score=15,
@@ -158,15 +127,10 @@ def failing_trust_report(reason: str = "proxy probe failed"):
     )
 
 
-# ── FastAPI TestClient with mocked get_db ───────────────────────────────
+# fastapi test client
 @pytest.fixture
 def client():
-    """FastAPI ``TestClient`` with ``get_db`` overridden to yield a no-op mock.
-
-    Every test that touches DB-bound routes mocks the CRUD layer
-    explicitly via ``mocker.patch(...)``. The overridden ``get_db`` is
-    just there so dependency resolution succeeds.
-    """
+    """test client with fake db."""
     from fastapi.testclient import TestClient
 
     from app.api.main import app
@@ -182,14 +146,10 @@ def client():
         app.dependency_overrides.clear()
 
 
-# ── Mocked browser (DrissionPage neutralized at the seam) ───────────────
+# mock browser
 @pytest.fixture
 def mocked_browser_class(mocker):
-    """Replace ``InstagramBrowser`` everywhere it's imported by handlers + executor.
-
-    Returns the mock class. ``.return_value`` is the per-instance mock —
-    set ``.page``, ``.inject_cookies``, etc. on it to drive handler code.
-    """
+    """replaces InstagramBrowser for testing."""
     mock_class = MagicMock(name="InstagramBrowserClass")
     instance = MagicMock(name="InstagramBrowserInstance")
     instance.page = MagicMock(name="ChromiumPage")
@@ -206,10 +166,10 @@ def mocked_browser_class(mocker):
     return mock_class
 
 
-# ── Filesystem fixtures ─────────────────────────────────────────────────
+# file fixtures
 @pytest.fixture
 def media_root(tmp_path: Path) -> str:
-    """Per-test MEDIA_ROOT directory. Yielded as a ``str`` to match settings."""
+    """returns a fake media root."""
     root = tmp_path / "media"
     root.mkdir()
     return str(root)
@@ -217,7 +177,7 @@ def media_root(tmp_path: Path) -> str:
 
 @pytest.fixture
 def safe_media_file(media_root: str) -> str:
-    """Create a real file inside ``media_root`` and return its absolute path."""
+    """creates a fake file for testing."""
     p = Path(media_root) / "video.mp4"
     p.write_bytes(b"\x00\x00\x00\x18ftypmp42")  # plausible mp4 header
     return str(p)

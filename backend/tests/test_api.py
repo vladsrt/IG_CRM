@@ -1,20 +1,6 @@
-"""API-layer tests — FastAPI routes with mocked CRUD + Celery dispatch.
-
-What's covered
-~~~~~~~~~~~~~~
-* ``POST /accounts/`` — creation happy path, validation rejection,
-  CRUD-layer ValueError → 400 mapping.
-* ``POST /orchestrator/tasks/fan-out`` — successful dispatch (asserts
-  Celery ``.delay()`` was called per resolved account), the
-  ``clarification_needed`` short-circuit, the empty-commands short-circuit,
-  the no-resolved-accounts 400, and the trust-gate skip path.
-
-Mocking strategy
-~~~~~~~~~~~~~~~~
-All CRUD calls and the trust-evaluator are patched at the import seam
-inside the relevant router module (``app.api.routers.account`` /
-``app.api.routers.orchestrator``). This isolates the route logic itself
-without touching the real database or running a real proxy probe.
+"""
+api tests.
+tests accounts and orchestrator routes with mocked db and celery.
 """
 
 from __future__ import annotations
@@ -30,9 +16,7 @@ from tests.conftest import (
 )
 
 
-# ════════════════════════════════════════════════════════════════════════
-#                          POST /accounts/
-# ════════════════════════════════════════════════════════════════════════
+# post /accounts/
 class TestCreateAccount:
     def test_happy_path_returns_201_and_serialized_account(self, client, mocker):
         user_id = uuid.uuid4()
@@ -113,11 +97,9 @@ class TestCreateAccount:
         assert "does not exist" in response.json()["detail"]
 
 
-# ════════════════════════════════════════════════════════════════════════
-#                  POST /orchestrator/tasks/fan-out
-# ════════════════════════════════════════════════════════════════════════
+# post /orchestrator/tasks/fan-out
 class TestFanOut:
-    """End-to-end orchestrator behavior with CRUD + trust + Celery mocked."""
+    """tests for orchestrator tasks fan-out."""
 
     @staticmethod
     def _valid_plan(commands=None, tags=("crypto",), clarification=None):

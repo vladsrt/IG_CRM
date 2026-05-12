@@ -1,14 +1,6 @@
-"""Trust Score Engine — pure unit coverage with the network probe disabled.
-
-Every test passes ``skip_proxy_probe=True`` so the trust evaluator never
-attempts a real HTTP HEAD; the proxy weight is granted IFF the proxy is
-attached, regardless of the network.
-
-Threshold + weights (from app/services/trust.py):
-    PROXY_WEIGHT       = 60
-    USER_AGENT_WEIGHT  = 25
-    HYGIENE_WEIGHT     = 15
-    DEFAULT_MIN_TRUST_SCORE = 50
+"""
+tests for the trust score engine.
+proxy probing is disabled here to run faster.
 """
 
 from __future__ import annotations
@@ -35,11 +27,7 @@ _GOOD_UA = (
 
 
 def _make_account(*, tags=(), status=None, with_proxy=True):
-    """Build an InstagramAccount-shaped SimpleNamespace for trust evaluation.
-
-    The trust evaluator only reads ``account.proxy``, ``account.tags``, and
-    ``account.status`` — nothing else needs to be set.
-    """
+    """creates a fake instagram account for testing trust."""
     proxy = None
     if with_proxy:
         proxy = SimpleNamespace(
@@ -56,7 +44,7 @@ def _make_account(*, tags=(), status=None, with_proxy=True):
     )
 
 
-# ── Negative-path tests ─────────────────────────────────────────────────
+# negative tests
 class TestTrustFailures:
     def test_missing_proxy_drops_score_below_threshold(self):
         account = _make_account(with_proxy=False)
@@ -109,13 +97,13 @@ class TestTrustFailures:
         assert "checkpoint_required" in str(report.reasons)
 
     def test_dead_proxy_alone_is_a_hard_fail(self):
-        """Even with perfect UA + hygiene, no proxy = below threshold."""
+        """fails if there is no proxy."""
         account = _make_account(with_proxy=False)
         report = evaluate_trust(account, user_agent=_GOOD_UA, skip_proxy_probe=True)
         assert report.passed is False, "proxy must be necessary, not optional"
 
     def test_to_skip_reason_includes_low_trust_score_token(self):
-        """Fan-out depends on the leading 'low_trust_score' token for the UI."""
+        """skip reason includes low trust score token."""
         account = _make_account(with_proxy=False)
         report = evaluate_trust(account, user_agent=_GOOD_UA, skip_proxy_probe=True)
         skip_reason = report.to_skip_reason()
@@ -123,7 +111,7 @@ class TestTrustFailures:
         assert f"score={report.score}/100" in skip_reason
 
 
-# ── Positive-path tests ─────────────────────────────────────────────────
+# positive tests
 class TestTrustHappyPath:
     def test_clean_account_with_good_proxy_and_ua_scores_full(self):
         account = _make_account(tags=[], status=None)
@@ -137,17 +125,17 @@ class TestTrustHappyPath:
         assert report.reasons == []
 
     def test_neutral_tags_do_not_penalize(self):
-        """Only the curated risk-tag set should drop hygiene."""
+        """normal tags do not lower trust."""
         account = _make_account(tags=["crypto", "tier1", "fitness"])
         report = evaluate_trust(account, user_agent=_GOOD_UA, skip_proxy_probe=True)
         assert report.hygiene_ok is True
         assert report.score == 100
 
 
-# ── Combinatorial / edge cases ──────────────────────────────────────────
+# edge cases
 class TestTrustEdges:
     def test_evaluator_crash_is_handled_in_report_form(self):
-        """When the proxy probe raises, score=0 and the reason reports it."""
+        """catches errors in the proxy probe."""
         # Build an account whose proxy is well-formed enough to invoke the
         # probe path, but with a bogus host that will fail DNS resolution.
         account = SimpleNamespace(

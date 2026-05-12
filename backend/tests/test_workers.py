@@ -1,17 +1,6 @@
-"""Celery worker tests — control flow of ``run_instagram_task``.
-
-Strategy
-~~~~~~~~
-* ``SessionLocal`` is patched per-test to return a context-manager
-  MagicMock (see :func:`tests.conftest.make_mock_session`). The fake
-  session's ``db.get`` and ``db.execute`` are seeded to return the staged
-  ``Task`` / ``InstagramAccount`` rows.
-* ``TaskExecutor`` is patched at the module seam so no Chromium ever
-  spawns. Tests assert against the executor's ``.execute`` call and the
-  ``_set_task_status`` mock to verify state transitions.
-* Tasks are invoked via ``.apply()`` rather than ``.run()`` so Celery's
-  request context (``self.request.retries``) is correctly populated for
-  ``self.retry()`` paths.
+"""
+celery worker tests.
+tests task states without running browser.
 """
 
 from __future__ import annotations
@@ -29,11 +18,7 @@ from tests.conftest import make_fake_account, make_fake_task, make_mock_session
 
 
 def _patch_session_factory(mocker, *, fake_task, fake_account, sibling=None):
-    """Patch ``SessionLocal`` to return a context-manager mock.
-
-    The sibling-RUNNING check returns ``sibling`` (None by default → no
-    sibling, so the dispatch proceeds).
-    """
+    """patches session to return mock."""
     cm, db = make_mock_session(
         get_returns={Task: fake_task, InstagramAccount: fake_account},
         execute_results=[
@@ -45,9 +30,7 @@ def _patch_session_factory(mocker, *, fake_task, fake_account, sibling=None):
     return cm, db
 
 
-# ════════════════════════════════════════════════════════════════════════
-#                     run_instagram_task — happy path
-# ════════════════════════════════════════════════════════════════════════
+# happy path
 class TestRunInstagramTaskHappyPath:
     def test_pending_task_transitions_running_then_completed(self, mocker):
         task = make_fake_task(status=TaskStatus.PENDING.value)
@@ -94,7 +77,7 @@ class TestRunInstagramTaskHappyPath:
     def test_payload_handed_to_executor_contains_account_credentials(
         self, mocker
     ):
-        """The payload built inside the locked tx must include the IG creds + proxy."""
+        """payload must have ig credentials and proxy."""
         task = make_fake_task(
             status=TaskStatus.PENDING.value,
             payload={
@@ -128,12 +111,10 @@ class TestRunInstagramTaskHappyPath:
         assert payload["commands"] == [{"action": "warmup", "args": {}}]
 
 
-# ════════════════════════════════════════════════════════════════════════
-#                run_instagram_task — orphan recovery
-# ════════════════════════════════════════════════════════════════════════
+# orphan recovery
 class TestOrphanRecovery:
     def test_running_task_is_refused_and_marked_failed(self, mocker):
-        """If the task arrives RUNNING, refuse + mark FAILED + don't spawn browser."""
+        """task arriving as running should be marked failed."""
         task = make_fake_task(status=TaskStatus.RUNNING.value)
         account = make_fake_account(id=task.account_id)
 
@@ -159,7 +140,7 @@ class TestOrphanRecovery:
         assert "Orphan recovery" in task.error_log
 
     def test_completed_task_is_treated_as_non_runnable(self, mocker):
-        """A task already in COMPLETED should not re-execute."""
+        """completed tasks should not run again."""
         task = make_fake_task(status=TaskStatus.COMPLETED.value)
         account = make_fake_account(id=task.account_id)
         _patch_session_factory(mocker, fake_task=task, fake_account=account)
@@ -176,9 +157,7 @@ class TestOrphanRecovery:
         executor_class.assert_not_called()
 
 
-# ════════════════════════════════════════════════════════════════════════
-#               run_instagram_task — failure paths
-# ════════════════════════════════════════════════════════════════════════
+# failure paths
 class TestFailurePaths:
     def test_executor_exception_marks_task_failed(self, mocker):
         task = make_fake_task(status=TaskStatus.PENDING.value)
@@ -245,12 +224,10 @@ class TestFailurePaths:
         )
 
 
-# ════════════════════════════════════════════════════════════════════════
-#         run_instagram_task — pessimistic lock contention
-# ════════════════════════════════════════════════════════════════════════
+# lock contention
 class TestLockContention:
     def test_for_update_nowait_failure_triggers_retry(self, mocker):
-        """When another worker holds the row, raise Celery Retry with backoff."""
+        """retries if account row is locked."""
         task = make_fake_task(status=TaskStatus.PENDING.value)
         account = make_fake_account(id=task.account_id)
 
@@ -275,7 +252,7 @@ class TestLockContention:
         executor_class.assert_not_called()
 
     def test_sibling_running_task_triggers_retry(self, mocker):
-        """If a sibling is RUNNING for the same account, retry with backoff."""
+        """retries if another task is running for the account."""
         task = make_fake_task(status=TaskStatus.PENDING.value)
         account = make_fake_account(id=task.account_id)
         sibling_id = uuid.uuid4()

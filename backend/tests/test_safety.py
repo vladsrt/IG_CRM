@@ -1,15 +1,6 @@
-"""Path-traversal protection — ``workers.core.safety.resolve_within_media_root``.
-
-This is the single defense between an operator-controlled file path
-(``Task.payload["args"]["file_path"]``) and ``DrissionPage`` /
-``subprocess``. The function MUST reject:
-
-* absolute paths outside MEDIA_ROOT (``/etc/passwd``)
-* relative ``../`` traversals
-* symlinks under MEDIA_ROOT pointing outside it
-* nonexistent paths
-* directories
-* empty / non-string input
+"""
+tests for path traversal protection.
+makes sure users cannot access files outside media root.
 """
 
 from __future__ import annotations
@@ -22,7 +13,7 @@ import pytest
 from workers.core.safety import UnsafePathError, resolve_within_media_root
 
 
-# ── Happy path ──────────────────────────────────────────────────────────
+# happy path
 class TestHappyPath:
     def test_file_under_media_root_resolves_to_absolute_path(self, media_root):
         target = Path(media_root) / "video.mp4"
@@ -41,7 +32,7 @@ class TestHappyPath:
         assert result == str(nested.resolve())
 
 
-# ── Traversal attempts ──────────────────────────────────────────────────
+# traversal attempts
 class TestTraversalAttempts:
     def test_absolute_path_outside_media_root_is_rejected(self, media_root):
         with pytest.raises(UnsafePathError, match="escapes media root"):
@@ -58,11 +49,8 @@ class TestTraversalAttempts:
             resolve_within_media_root(attempt, media_root)
 
     def test_symlink_pointing_outside_is_rejected(self, media_root, tmp_path):
-        """Symlinks under MEDIA_ROOT that resolve outside MUST be rejected.
-
-        ``Path.resolve(strict=True)`` follows the symlink BEFORE we compare
-        against the root — that's the load-bearing line. ``os.path.abspath``
-        alone would have missed this.
+        """
+        symlinks pointing outside media root should be rejected.
         """
         outside = tmp_path / "outside_secret.txt"
         outside.write_bytes(b"do not leak")
@@ -74,7 +62,7 @@ class TestTraversalAttempts:
             resolve_within_media_root(str(sneaky), media_root)
 
 
-# ── Bad inputs ──────────────────────────────────────────────────────────
+# bad inputs
 class TestBadInputs:
     def test_empty_string_is_rejected(self, media_root):
         with pytest.raises(UnsafePathError, match="non-empty string"):
