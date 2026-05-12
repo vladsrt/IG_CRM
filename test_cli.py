@@ -1,73 +1,6 @@
 """
-Interactive CLI Test Harness
-----------------------------
-Stand-alone, terminal-driven tester for every DrissionPage action in
-this project — plus a no-DB FFmpeg uniqueization smoke test. Bypasses
-Celery, the orchestrator, and the database.
-
-How to use
-~~~~~~~~~~
-    1. Paste your IG cookies into ``COOKIES`` below (same shape that
-       ``InstagramBrowser.inject_cookies`` expects).
-    2. Run:    python test_cli.py
-    3. The script asks (in order):
-         a. whether to use a proxy
-         b. if yes — protocol (http/https/socks4/socks5)
-         c. if yes — proxy string ``IP:PORT:USER:PASS`` (the script
-            converts it to ``protocol://USER:PASS@IP:PORT``)
-         d. operating-system platform to spoof (windows/macos/linux)
-       The final proxy URL and the resolved User-Agent are printed
-       BEFORE Chromium boots so you can sanity-check.
-    4. Pick from the numbered menu. The menu loops until [0] Exit.
-
-Behaviour notes for QA
-~~~~~~~~~~~~~~~~~~~~~~
-* **Update Profile** has three distinct code paths the CLI exercises
-  separately:
-    - Bio only           (option 2) — fires the form Submit + waits
-                                      for the "Profile saved." toast.
-    - Avatar only        (option 3) — file injection is asynchronous;
-                                      "Profile photo added." toast +
-                                      Cancel-on-dialog handles persistence.
-                                      Submit is intentionally NOT clicked.
-    - Bio + Avatar       (option 6) — combined: avatar dialog is
-                                      cancelled, then bio + Submit fire.
-* **Upload** uses the left-rail Create flow
-  (``navigate_left_rail("create")``) with mandatory hover-hydration
-  and a 3-layer interruption-modal sweep at the start. The
-  empty-state profile-Reels fallback has been removed.
-* **Warmup 2.0** uses the same left-rail navigation for the Reels
-  tab. Probabilities are hard-pinned: 30% like / 45% open comments /
-  60-70% per-comment × 3-4 attempts. The action loop is
-  time-bounded (``while time.monotonic() < end_time``) with weighted
-  action selection.
-* **Modal dismissal** is a 3-layer defense:
-  L1 = text-button click (Not Now / Cancel / OK / Close);
-  L2 = backdrop click at viewport (10, 10) if a dialog is still
-       present;
-  L3 = ESC key (``\\x1b`` first, then W3C ``\\ue00c``, then a
-       JS-dispatched ``KeyboardEvent``).
-  Option [7] runs three sweeps back-to-back so QA can see all three
-  layers fire in isolation.
-* **SVG clicks** are auto-resolved to their wrapping ``<a>`` /
-  ``<button>`` / ``[role="button"]`` ancestor before any JS click
-  (``_walk_up_to_clickable`` cascade: ``@role=button`` →
-  ``tag:button`` → ``tag:a`` → ``parent(2)`` → ``parent(1)``).
-  This is what makes the New-post left-rail icon clickable
-  reliably — a JS click on the bare SVG throws
-  ``TypeError: this.click is not a function``.
-* **Browser** uses a fresh Chromium ``user_data_dir`` per launch
-  (``user_data_dir="fresh"`` passed to ``InstagramBrowser``), so
-  cached proxy decisions / ServiceWorkers / cookies from previous
-  test runs cannot leak into the current one. The dir is auto-deleted
-  on ``close()``.
-* **FFmpeg uniqueization** runs at the production-locked noise level
-  of 4 (regression-safe, deterministic).
-
-Failure handling
-~~~~~~~~~~~~~~~~
-Every action call is wrapped in try/except. A failed test prints the
-traceback and returns you to the menu — it never exits the CLI.
+cli test tool.
+lets you test instagram actions locally without the database.
 """
 
 from __future__ import annotations
@@ -101,10 +34,7 @@ from workers.utils.ua_generator import (  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
-# ─── HARDCODE YOUR COOKIES HERE ────────────────────────────────────────
-#   Same shape as ``InstagramBrowser.inject_cookies`` accepts.
-#   Replace the example values below with your real session cookies.
-# ───────────────────────────────────────────────────────────────────────
+# your cookies go here
 COOKIES: List[Dict[str, str]] = [
     {
         "name": "datr",
@@ -166,20 +96,9 @@ HEADLESS: bool = False  # flip to True for unattended runs
 _VALID_PROTOCOLS: tuple[str, ...] = ("http", "https", "socks4", "socks5")
 
 
-# ─── Proxy parsing ─────────────────────────────────────────────────────
+# proxy parsing
 def parse_proxy(raw: str, *, protocol: str = "http") -> str:
-    """Convert ``IP:PORT:USER:PASS`` → ``protocol://USER:PASS@IP:PORT``.
-
-    The DataImpulse / IPRoyal / Bright Data style of distributing creds
-    is a flat colon-separated quad. DrissionPage's proxy extension wants
-    a real URL with a scheme. This helper does both jobs: it validates
-    the four-field shape and prepends the chosen scheme.
-
-    Raises:
-        ValueError: if ``raw`` does not have exactly four colon-split
-            non-empty fields, or if ``protocol`` is not one of
-            ``http`` / ``https`` / ``socks4`` / ``socks5``.
-    """
+    """formats the proxy string."""
     proto = (protocol or "").strip().lower()
     if proto not in _VALID_PROTOCOLS:
         raise ValueError(
@@ -215,9 +134,9 @@ def _redact(proxy_url: str) -> str:
     return f"***@{proxy_url.split('@', 1)[1]}"
 
 
-# ─── Browser launcher ──────────────────────────────────────────────────
+# browser launcher
 def _resolve_user_agent(platform: Platform) -> str:
-    """Manual override > random pick from the platform pool."""
+    """gets user agent string."""
     if MANUAL_USER_AGENT.strip():
         return MANUAL_USER_AGENT.strip()
     return get_random_user_agent(platform)
@@ -226,24 +145,7 @@ def _resolve_user_agent(platform: Platform) -> str:
 def _open_browser(
     proxy: Optional[str], platform: Platform, user_agent: str,
 ) -> InstagramBrowser:
-    """Single launcher path — no facade, no plain ChromiumPage.
-
-    Both proxy and no-proxy modes go through ``InstagramBrowser``,
-    which handles:
-
-    * Generating the MV3 proxy extension when ``proxy`` is set.
-    * Forcing ``--no-proxy-server`` when ``proxy`` is ``None`` so
-      DrissionPage's stale INI proxy can't leak through.
-    * Clearing DrissionPage's INI-cached proxy via ``set_proxy("")``
-      regardless of branch — prevents the "no tunnel" symptom when
-      DP otherwise injects ``--proxy-server=`` from a previous run.
-    * Pinning a fresh Chromium ``user_data_dir`` per launch so the
-      browser starts against a clean profile (no cached proxy
-      decisions, no leftover ServiceWorker state, no stale cookies).
-
-    All three of those guards landing on every test run is what makes
-    the no-proxy / with-proxy cases reproducible.
-    """
+    """starts the browser."""
     if not COOKIES:
         print(
             "\n[!] WARNING: COOKIES list is empty — IG will redirect to "
@@ -275,15 +177,9 @@ def _open_browser(
     return browser
 
 
-# ─── FFmpeg uniqueization (standalone, no DB) ──────────────────────────
+# ffmpeg test
 def _run_ffmpeg_uniqueize(input_path: str) -> str:
-    """Run a single ffmpeg pass that re-encodes ``input_path`` with a
-    unique fingerprint, light invisible noise, and stripped metadata —
-    same pipeline as the Celery ``uniqueize_video`` task, minus the DB.
-
-    Returns the absolute output path, written next to the input as
-    ``<stem>__uniq_<8hex>.<ext>``.
-    """
+    """tests adding noise to a video."""
     src = Path(input_path).expanduser().resolve()
     if not src.is_file():
         raise FileNotFoundError(f"input not found: {src}")
@@ -307,7 +203,7 @@ def _run_ffmpeg_uniqueize(input_path: str) -> str:
     return str(out)
 
 
-# ─── Test runners (each opens + closes its own browser) ────────────────
+# test runners
 def _run_warmup(
     proxy: Optional[str], platform: Platform, user_agent: str,
     duration_minutes: float,
@@ -347,15 +243,7 @@ def _run_update_bio_and_avatar(
     proxy: Optional[str], platform: Platform, user_agent: str,
     bio: str, avatar_path: str,
 ) -> None:
-    """Exercise the combined bio + avatar path (Submit + save-marker fires).
-
-    Splitting this from the single-field tests is deliberate: the
-    avatar-only branch in ``execute_update_profile`` skips the form
-    Submit entirely, while the combined branch still cancels the
-    Change-Photo dialog and THEN submits the form for the bio. The
-    two paths have completely different failure modes — keep them
-    testable separately.
-    """
+    """tests setting both bio and avatar."""
     browser = _open_browser(proxy, platform, user_agent)
     try:
         result = execute_update_profile(
@@ -369,19 +257,7 @@ def _run_update_bio_and_avatar(
 def _run_modal_dismissal(
     proxy: Optional[str], platform: Platform, user_agent: str,
 ) -> None:
-    """Standalone exercise of ``dismiss_instagram_modals`` against the live feed.
-
-    Loads ``https://www.instagram.com/`` with the configured cookies/
-    proxy/UA, then runs the standalone modal sweep and reports the
-    count. Useful when QA is hunting a specific interstitial — you
-    can manually trigger it by visiting a fresh account, then run
-    this option to confirm the sweep clears it.
-
-    Several sweeps run back-to-back so you can also see whether IG
-    queues a new modal immediately after the first one closes
-    (it sometimes does — "Turn on notifications" → "Save your login
-    info?" within a single render).
-    """
+    """tests closing all modals."""
     browser = _open_browser(proxy, platform, user_agent)
     try:
         print("[*] navigating to https://www.instagram.com/ …")
@@ -431,7 +307,7 @@ def _run_upload(
         browser.close()
 
 
-# ─── Interactive prompts ───────────────────────────────────────────────
+# interactive prompts
 def _prompt_yes_no(question: str) -> bool:
     while True:
         ans = input(f"{question} (y/n): ").strip().lower()
@@ -521,7 +397,7 @@ def main() -> int:
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
     )
 
-    # ── Session-wide setup: proxy + platform + UA, asked once. ─────────
+    # setup
     proxy = _prompt_proxy()
     platform = _prompt_platform()
     user_agent = _resolve_user_agent(platform)
