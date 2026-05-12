@@ -235,3 +235,5 @@ backend/browser_profiles/
 .DS_Store
 Thumbs.dbmedia/
 media/
+runtime_proxy_plugin_*
+.venv/
