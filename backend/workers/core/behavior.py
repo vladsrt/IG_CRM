@@ -1098,7 +1098,7 @@ class HumanBehaviorEngine:
 
 # svg to clickable parent
 def _walk_up_to_clickable(ele: Any) -> Any | None:
-        """find clickable parent."""
+    """find clickable parent."""
     if ele is None:
         return None
 
