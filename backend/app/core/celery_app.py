@@ -1,12 +1,32 @@
 """Celery app instance.
 
-Start a worker:
+Start the default worker (uploads, warmup, profile edits):
 
-    celery -A app.core.celery_app.celery_app worker --loglevel=info
+    celery -A app.core.celery_app.celery_app worker \
+        -Q ig_crm.default \
+        --loglevel=info \
+        --concurrency=2 \
+        --hostname=worker-default@%h
+
+Start the dedicated stats worker (lightweight metrics collection):
+
+    celery -A app.core.celery_app.celery_app worker \
+        -Q stats_queue \
+        --loglevel=info \
+        --concurrency=1 \
+        --hostname=worker-stats@%h
 
 Start the beat scheduler:
 
     celery -A app.core.celery_app.celery_app beat --loglevel=info
+
+All-in-one for local development (never use in production):
+
+    celery -A app.core.celery_app.celery_app worker \
+        -Q ig_crm.default,stats_queue \
+        --loglevel=info \
+        --concurrency=2 \
+        -B
 
 Task modules are picked up from app.workers.celery_tasks, so
 run_instagram_task.delay(...) works from anywhere as long as the worker
@@ -45,14 +65,28 @@ celery_app.conf.update(
 )
 
 
+# task routing: stats collection runs on a dedicated queue so it never
+# competes with heavy browser tasks (uploads, warmup) for worker slots.
+celery_app.conf.task_routes = {
+    "ig_crm.gather_account_metrics": {"queue": "stats_queue"},
+}
+
+
 # beat schedule
-# janitor: sweep stuck RUNNING tasks every 5 minutes. together with the
-# at-start recovery inside run_instagram_task, this stops any task from
-# being stuck in RUNNING after a worker dies.
 celery_app.conf.beat_schedule = {
+    # janitor: sweep stuck RUNNING tasks every 5 minutes. together with the
+    # at-start recovery inside run_instagram_task, this stops any task from
+    # being stuck in RUNNING after a worker dies.
     "reap-stale-tasks-every-5-min": {
         "task": "ig_crm.reap_stale_tasks",
         "schedule": 300.0,  # seconds
+        "args": (),
+    },
+    # stats dispatcher: fetch all active accounts and dispatch a
+    # gather_account_metrics task to the stats_queue for each one.
+    "dispatch-stats-collection-every-1h": {
+        "task": "ig_crm.dispatch_stats_collection",
+        "schedule": 3600.0,  # seconds
         "args": (),
     },
 }
@@ -62,3 +96,4 @@ celery_app.conf.beat_schedule = {
 def ping() -> str:
     """Tiny health-check task. Use to check the worker is reachable."""
     return "pong"
+
