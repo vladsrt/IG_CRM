@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List
 from workers.actions.action_update_profile import execute_update_profile
 from workers.actions.action_upload import execute_upload
 from workers.actions.action_warmup import execute_warmup
+from workers.actions.action_gather_stats import execute_gather_stats
 from workers.core.browser_core import InstagramBrowser
 from workers.core.observability import (
     CheckpointException,
@@ -47,6 +48,8 @@ ACTION_REGISTRY: Dict[str, ActionHandler] = {
     "upload_story":   execute_upload,
     # profile and privacy edits
     "update_profile": execute_update_profile,
+    # technical: headless stats collection
+    "gather_stats":   execute_gather_stats,
 }
 
 
