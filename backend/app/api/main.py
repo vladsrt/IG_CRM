@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routers import account, ai, auth, media, orchestrator, proxy, task, user
+from app.api.routers import account, ai, auth, media, metrics, orchestrator, proxy, task, user
 from app.core.config import settings
 
 app = FastAPI(
@@ -15,9 +15,10 @@ app = FastAPI(
         "Sprint 2: task orchestrator and Celery dispatch. "
         "Sprint 3: AI prompt to task plan. "
         "Sprint 5: media manager, ffmpeg uniqueization, account tagging. "
-        "Sprint 6: JWT authentication and CORS."
+        "Sprint 6: JWT authentication and CORS. "
+        "Sprint 7: background metrics collection and dashboard API."
     ),
-    version="0.6.0",
+    version="0.7.0",
 )
 
 # cors
@@ -44,4 +45,5 @@ app.include_router(task.router)
 app.include_router(orchestrator.router)
 app.include_router(ai.router)
 app.include_router(media.router)
+app.include_router(metrics.router)
 
