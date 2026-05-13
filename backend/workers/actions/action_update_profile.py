@@ -45,6 +45,7 @@ def _find_first(
     selectors: Iterable[str],
     *,
     timeout: float = _DEFAULT_STEP_TIMEOUT_S,
+) -> Any | None:
     """Return the first matching element from a list of selectors, or None."""
     selectors = list(selectors)
     if not selectors:
