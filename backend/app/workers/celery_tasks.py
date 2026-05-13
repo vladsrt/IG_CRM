@@ -432,3 +432,179 @@ def reap_stale_tasks(stale_after_seconds: int | None = None) -> dict[str, Any]:
         "threshold_seconds": threshold,
         "task_ids": reaped_ids,
     }
+
+
+# statuses that exclude an account from stats collection.
+# accounts in these states either can't be accessed or should not be touched.
+_STATS_EXCLUDED_STATUSES: frozenset[str] = frozenset(
+    {"checkpoint_required", "banned", "invalid"}
+)
+
+
+# task: dispatch_stats_collection (hourly beat dispatcher)
+@celery_app.task(name="ig_crm.dispatch_stats_collection")
+def dispatch_stats_collection() -> dict[str, Any]:
+    """Fetch all active accounts and dispatch a stats task for each one.
+
+    Triggered by Celery Beat every hour. For each eligible account, sends
+    a gather_account_metrics task to the stats_queue. The per-account task
+    handles its own session isolation (FOR UPDATE NOWAIT), so it's safe to
+    dispatch even if a standard task is running on the account.
+    """
+    dispatched_ids: list[str] = []
+
+    with SessionLocal() as db:
+        stmt = select(InstagramAccount).where(
+            ~InstagramAccount.status.in_(_STATS_EXCLUDED_STATUSES)
+            | InstagramAccount.status.is_(None)
+        )
+        accounts = list(db.execute(stmt).scalars())
+
+    for account in accounts:
+        gather_account_metrics.delay(str(account.id))
+        dispatched_ids.append(str(account.id))
+
+    logger.info(
+        "[dispatch_stats_collection] dispatched %d account(s) to stats_queue",
+        len(dispatched_ids),
+    )
+    return {
+        "dispatched": len(dispatched_ids),
+        "account_ids": dispatched_ids,
+    }
+
+
+# task: gather_account_metrics (per-account stats collection)
+@celery_app.task(
+    bind=True,
+    name="ig_crm.gather_account_metrics",
+    time_limit=180,           # hard kill after 3 min (fast action)
+    soft_time_limit=120,      # SoftTimeLimitExceeded after 2 min
+)
+def gather_account_metrics(self: CeleryTask, account_id: str) -> dict[str, Any]:
+    """Spawn a headless browser to collect metrics for one account.
+
+    Safety guarantees:
+        1. Acquires a FOR UPDATE NOWAIT lock on the account row.
+           If another task (upload, warmup, etc.) already holds the lock,
+           we skip gracefully — no retry, wait for the next hourly beat.
+        2. Pings the proxy before launching Chrome. Dead proxy = abort.
+        3. Runs in headless mode to conserve server RAM.
+        4. Uses the existing TaskExecutor + ObservabilityMonitor pipeline
+           for metrics interception and persistence.
+
+    This task does NOT create a Task row — it's a technical background job,
+    not a user-visible task. Metrics appear in account_metrics regardless.
+    """
+    acct_uuid = uuid.UUID(account_id)
+    logger.info("[gather_account_metrics] account_id=%s", acct_uuid)
+
+    # step 1: load the account and attempt the pessimistic row lock.
+    # the lock prevents a concurrent browser session on the same account,
+    # which would trigger an instant ban from Meta.
+    try:
+        with SessionLocal() as db:
+            try:
+                account = db.execute(
+                    select(InstagramAccount)
+                    .where(InstagramAccount.id == acct_uuid)
+                    .with_for_update(nowait=True)
+                ).scalar_one_or_none()
+            except OperationalError:
+                # another worker holds the lock — a standard task is running.
+                # do NOT retry. stats collection is best-effort, the next
+                # hourly beat will pick this account up again.
+                logger.info(
+                    "[gather_account_metrics] account_id=%s is busy "
+                    "(locked by another task), skipping stats collection",
+                    acct_uuid,
+                )
+                return {"account_id": account_id, "status": "account_busy"}
+
+            if account is None:
+                logger.warning(
+                    "[gather_account_metrics] account %s not found", acct_uuid
+                )
+                return {"account_id": account_id, "status": "not_found"}
+
+            # step 2: pre-flight proxy check.
+            # if the proxy is dead, launching Chrome is a waste of RAM.
+            proxy = account.proxy
+            if proxy is not None:
+                from app.services.trust import _evaluate_proxy
+
+                proxy_ok, _, proxy_reason = _evaluate_proxy(proxy, skip_probe=False)
+                if not proxy_ok:
+                    logger.warning(
+                        "[gather_account_metrics] proxy dead for account_id=%s: %s",
+                        acct_uuid,
+                        proxy_reason,
+                    )
+                    return {
+                        "account_id": account_id,
+                        "status": "proxy_dead",
+                        "reason": proxy_reason,
+                    }
+
+            # step 3: build the minimal payload.
+            # single command: gather_stats. headless is forced to True.
+            payload: dict[str, Any] = {
+                "task_id": None,  # no Task row for technical background jobs
+                "account_id": str(account.id),
+                "ig_username": account.ig_username,
+                "proxy_string": _build_proxy_string(proxy),
+                "cookies": account.cookies or {},
+                "headless": True,
+                "user_agent": account.user_agent,
+                "commands": [
+                    {
+                        "action": "gather_stats",
+                        "args": {"ig_username": account.ig_username},
+                    }
+                ],
+            }
+
+            # commit the transaction to release the FOR UPDATE lock.
+            # TaskExecutor will open its own sessions for metric persistence.
+            db.commit()
+
+    except Exception:
+        logger.exception(
+            "[gather_account_metrics] failed to prepare payload for account_id=%s",
+            acct_uuid,
+        )
+        raise
+
+    # step 4: run the browser session.
+    # TaskExecutor starts the ObservabilityMonitor, which intercepts GraphQL
+    # responses and persists them to account_metrics automatically.
+    try:
+        result: dict[str, Any] = TaskExecutor(payload).execute()
+    except SoftTimeLimitExceeded:
+        logger.error(
+            "[gather_account_metrics] soft time limit hit for account_id=%s",
+            acct_uuid,
+        )
+        return {"account_id": account_id, "status": "timeout"}
+    except Exception as exc:
+        logger.exception(
+            "[gather_account_metrics] browser session failed for account_id=%s",
+            acct_uuid,
+        )
+        return {
+            "account_id": account_id,
+            "status": "failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    logger.info(
+        "[gather_account_metrics] completed for account_id=%s, metrics=%s",
+        acct_uuid,
+        result.get("metrics"),
+    )
+    return {
+        "account_id": account_id,
+        "status": "ok",
+        "metrics": result.get("metrics"),
+    }
+
