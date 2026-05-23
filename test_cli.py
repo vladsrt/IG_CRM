@@ -80,7 +80,7 @@ COOKIES: List[Dict[str, str]] = [
     },
     {
         "name": "rur",
-        "value": "\"LDC\\05466998291245\\0541809865019:01fe6b120c5bfb0d60544e123c0a3e8dc7140f66037453d599e2cfa2e931bca861395676\"",
+        "value": '"LDC\\\\05466998291245\\\\0541809865019:***"',
         "domain": ".instagram.com",
         "path": "/"
     }
@@ -208,10 +208,41 @@ def _run_warmup(
     proxy: Optional[str], platform: Platform, user_agent: str,
     duration_minutes: float,
 ) -> None:
+    """Runs Warmup 3.2 session.
+    
+    Smooth human-like browsing: one scroll per tick (300-950px),
+    reels-heavy time split (55% weight), viewed-post tracking,
+    double-verify on every like/comment, proper Reels navigation
+    via 'Navigate to next Reel' button.
+    """
     browser = _open_browser(proxy, platform, user_agent)
     try:
         result = execute_warmup(browser, args={"duration_minutes": duration_minutes})
-        print(f"[+] warmup result: {result}")
+        print(f"\n[+] warmup result (version={result.get('version')}):")
+        counters = result.get("counters", {})
+        print(f"    ticks:               {counters.get('ticks', 0)}")
+        print(f"    posts liked:         {counters.get('posts_liked', 0)}")
+        print(f"    comments opened:     {counters.get('comment_modals_opened', 0)}")
+        print(f"    comments liked:      {counters.get('comments_liked', 0)}")
+        print(f"    reels sessions:      {counters.get('reels_sessions', 0)}")
+        print(f"    reels watched:       {counters.get('reels_watched', 0)}")
+        print(f"    reels watch time:    {counters.get('reels_watch_seconds', 0)}s")
+        print(f"    reels liked:         {counters.get('reels_liked', 0)}")
+        print(f"    profiles visited:    {counters.get('profiles_visited', 0)}")
+        print(f"    zoned out:           {counters.get('zoned_out_count', 0)} times")
+        # Scroll pattern breakdown
+        scroll_keys = [k for k in counters if k.startswith("scroll_")]
+        if scroll_keys:
+            print(f"    scroll patterns:     {', '.join(f'{k}=>{counters[k]}' for k in sorted(scroll_keys))}")
+        
+        # Print action log summary
+        action_log = result.get("action_log", [])
+        if action_log:
+            print(f"\n    action log ({len(action_log)} ticks):")
+            for tick in action_log:
+                status = "OK" if tick.get("ok") else "ERR"
+                print(f"      [{status}] {tick['action']:15s} {tick['elapsed_s']:5.1f}s"
+                      + (f"  — {tick['error']}" if tick.get("error") else ""))
     finally:
         browser.close()
 
@@ -380,10 +411,10 @@ _MENU = """
 ─────────────────────────────────────────
   IG-CRM Local Action Test CLI
 ─────────────────────────────────────────
-  [1] Test Warmup 2.0                (modal sweep + 30/45/60-70 probs)
+  [1] Test Warmup 3.2                (smooth scroll + post likes + comment hearts + reels next + profile)
   [2] Test Update Profile Bio        (Submit path)
   [3] Test Update Avatar             (async, NO Submit)
-  [4] Test Upload Media              (left-rail Create)
+  [4] Test Upload Media              (Create → Post dropdown → Select from computer)
   [5] Test FFmpeg Uniqueization
   [6] Test Update Bio + Avatar       (combined Submit path)
   [7] Test Modal Dismissal           (standalone sweep verification)

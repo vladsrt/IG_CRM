@@ -11,12 +11,15 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
+from app.api.dependencies import get_current_user
 from app.schemas.ai import GenerateTaskRequest, ParsedTaskPlan
 from app.services.ai_parser import AIParser, AIParserError
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/ai", tags=["ai"])
+router = APIRouter(
+    prefix="/ai", tags=["ai"], dependencies=[Depends(get_current_user)]
+)
 
 
 def get_ai_parser() -> AIParser:

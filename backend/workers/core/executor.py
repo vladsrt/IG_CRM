@@ -75,11 +75,13 @@ class TaskExecutor:
         self.account_id: str | None = payload.get("account_id")
 
         proxy_string = payload.get("proxy_string")
-        if not proxy_string:
+        allow_no_proxy = bool(payload.get("allow_no_proxy"))
+        if not proxy_string and not allow_no_proxy:
             raise ExecutorError(
                 f"payload is missing 'proxy_string' (task_id={self.task_id})"
             )
-        self.proxy_string: str = proxy_string
+        # None -> InstagramBrowser runs with --no-proxy-server (direct).
+        self.proxy_string: str | None = proxy_string or None
 
         self.user_agent: str = payload.get("user_agent") or DEFAULT_USER_AGENT
         self.headless: bool = bool(payload.get("headless", False))

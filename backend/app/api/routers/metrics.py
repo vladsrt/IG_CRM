@@ -42,42 +42,55 @@ def get_dashboard(
         - total_reel_views: sum of the latest reel_views per account.
         - total_tasks_running: count of tasks currently in RUNNING status.
     """
-    # get all account IDs belonging to this user
-    account_ids_stmt = select(InstagramAccount.id).where(
-        InstagramAccount.user_id == current_user.id
-    )
-    account_ids: list[uuid.UUID] = list(
-        db.execute(account_ids_stmt).scalars().all()
-    )
+    # all accounts of this user, with their status (for active/checkpoint counts)
+    rows = db.execute(
+        select(InstagramAccount.id, InstagramAccount.status).where(
+            InstagramAccount.user_id == current_user.id
+        )
+    ).all()
+    account_ids: list[uuid.UUID] = [r[0] for r in rows]
 
-    total_accounts = len(account_ids)
+    accounts_total = len(account_ids)
+    accounts_active = sum(1 for r in rows if r[1] == "active")
+    accounts_checkpoint = sum(1 for r in rows if r[1] == "checkpoint_required")
 
     if not account_ids:
         return DashboardResponse(
-            total_accounts=0,
+            accounts_total=0,
+            accounts_active=0,
+            accounts_checkpoint=0,
             total_followers=0,
             total_reel_views=0,
-            total_tasks_running=0,
+            tasks_running=0,
+            tasks_completed_24h=0,
+            tasks_failed_24h=0,
         )
 
-    # latest followers per account: use a window function to pick the most
-    # recent row per (account_id, metric_type='followers')
+    # latest value per account for these metric types, summed across the fleet
     total_followers = _sum_latest_metric(db, account_ids, "followers")
     total_reel_views = _sum_latest_metric(db, account_ids, "reel_views")
 
-    # running tasks across the user's accounts
-    running_count = db.execute(
-        select(func.count(Task.id)).where(
+    # task counts: currently running, plus completed/failed in the last 24h
+    cutoff_24h = datetime.now(timezone.utc) - timedelta(hours=24)
+
+    def _count_tasks(status_value: str, since: datetime | None = None) -> int:
+        stmt = select(func.count(Task.id)).where(
             Task.account_id.in_(account_ids),
-            Task.status == TaskStatus.RUNNING.value,
+            Task.status == status_value,
         )
-    ).scalar_one()
+        if since is not None:
+            stmt = stmt.where(Task.created_at >= since)
+        return int(db.execute(stmt).scalar_one() or 0)
 
     return DashboardResponse(
-        total_accounts=total_accounts,
+        accounts_total=accounts_total,
+        accounts_active=accounts_active,
+        accounts_checkpoint=accounts_checkpoint,
         total_followers=total_followers,
         total_reel_views=total_reel_views,
-        total_tasks_running=running_count,
+        tasks_running=_count_tasks(TaskStatus.RUNNING.value),
+        tasks_completed_24h=_count_tasks(TaskStatus.COMPLETED.value, cutoff_24h),
+        tasks_failed_24h=_count_tasks(TaskStatus.FAILED.value, cutoff_24h),
     )
 
 
@@ -139,33 +152,28 @@ def _sum_latest_metric(
     For each account, picks the most recent AccountMetric row with the given
     metric_type and sums the values. Uses a lateral subquery for efficiency.
     """
-    from sqlalchemy import literal_column
-
-    # subquery: latest metric per account
+    # latest metric value per account, correlated to the outer InstagramAccount
     latest = (
         select(AccountMetric.value)
         .where(
-            AccountMetric.account_id == literal_column("acct.id"),
+            AccountMetric.account_id == InstagramAccount.id,
             AccountMetric.metric_type == metric_type,
         )
         .order_by(AccountMetric.captured_at.desc())
         .limit(1)
-        .correlate_except(AccountMetric)
+        .correlate(InstagramAccount)
         .scalar_subquery()
     )
 
-    # for each account, grab the latest value; coalesce to 0 if no data
-    acct_alias = (
-        select(
-            InstagramAccount.id,
-            func.coalesce(latest, 0).label("latest_value"),
-        )
+    # one row per account with its latest value (0 if none), then sum
+    per_account = (
+        select(func.coalesce(latest, 0).label("v"))
         .where(InstagramAccount.id.in_(account_ids))
-        .subquery("acct")
+        .subquery()
     )
 
     total = db.execute(
-        select(func.sum(acct_alias.c.latest_value))
+        select(func.coalesce(func.sum(per_account.c.v), 0))
     ).scalar_one()
 
     return int(total or 0)

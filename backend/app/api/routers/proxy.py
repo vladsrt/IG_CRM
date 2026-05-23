@@ -7,12 +7,16 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 
+from app.api.dependencies import get_current_user
 from app.core.database import get_db
 from app.crud import proxy as crud_proxy
 from app.crud.proxy import ProxyUpdate
 from app.schemas.proxy import ProxyCreate, ProxyRead
 
-router = APIRouter(prefix="/proxies", tags=["proxies"])
+# Shared proxy pool: require login on every route (no per-user scoping yet).
+router = APIRouter(
+    prefix="/proxies", tags=["proxies"], dependencies=[Depends(get_current_user)]
+)
 
 
 @router.post(

@@ -1,0 +1,40 @@
+# Infra for IG CRM: Postgres (+ optional Redis).
+# App processes (API / Celery worker / beat / frontend) run on the HOST via
+# ./dev.sh — the worker needs the host's Chromium, so it is NOT containerised.
+#
+# Usage:
+#   sudo docker rm -f ig_crm_db        # one-time: drop the old manual container
+#   sudo docker compose up -d          # start postgres
+#   ./dev.sh                           # start api + worker + beat + frontend
+#
+# Redis: you already have one running on :6379, so it is left commented out.
+# Enable it only if you DON'T have a redis (and nothing else holds 6379).
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: ig_crm_db
+    environment:
+      POSTGRES_USER: ig_user
+      POSTGRES_PASSWORD: ig_password123
+      POSTGRES_DB: ig_crm
+    ports:
+      - "5433:5432"
+    volumes:
+      - ig_crm_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ig_user -d ig_crm"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # redis:
+  #   image: redis:7
+  #   container_name: ig_crm_redis
+  #   ports:
+  #     - "6379:6379"
+  #   restart: unless-stopped
+
+volumes:
+  ig_crm_pgdata:

@@ -172,7 +172,9 @@ class TestFanOut:
             },
         )
         assert response.status_code == 400
-        assert "clarification" in response.json()["detail"].lower()
+        # the route refuses with a "needs more info / Question:" message
+        detail = response.json()["detail"].lower()
+        assert "more info" in detail or "question" in detail
 
     def test_empty_commands_short_circuits_with_400(self, client):
         response = client.post(

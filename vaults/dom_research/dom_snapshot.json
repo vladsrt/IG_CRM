@@ -1,0 +1,46 @@
+[
+  {
+    "found": true,
+    "label": "feed_first_article",
+    "selector": "css:article",
+    "tag": "",
+    "attrs": {},
+    "class_list": [],
+    "children_summary": [],
+    "js_error": "\nJavaScript running error.\nJS: function(){\n            (()=>{\n                const el = document.querySelector(\"css:article\");\n                if(!el) return JSON.stringify({found:false});\n                const attrs={};\n                for(const a of el.attributes) attrs[a.name]=a.value;\n                const children=[];\n                const walk=(root, depth)=>{\n                    if(depth>2) return;\n                    for(const c of root.children){\n                        const entry={\n                            tag: c.tagName,\n                            role: c.getAttribute('role')||null,\n                            aria: c.getAttribute('aria-label')||null,\n                            classes: c.className?.toString()?.substring(0,120)||'',\n                            text: c.textContent?.substring(0,80)||'',\n                            childCount: c.children.length,\n                        };\n                        children.push(entry);\n                        if(depth<1) walk(c,depth+1);\n                    }\n                };\n                walk(el,0);\n                return JSON.stringify({\n                    tag: el.tagName,\n                    cls: el.className?.toString()?.substring(0,200)||'',\n                    attrs,\n                    children: children,\n                    htmlSample: el.outerHTML?.substring(0,800)||'',\n                });\n            })()\n        }\nInformation: {'exceptionId': 1, 'text': 'Uncaught', 'lineNumber': 2, 'columnNumber': 36, 'scriptId': '56', 'exception': {'type': 'object', 'subtype': 'error', 'className': 'DOMException', 'description': \"SyntaxError: Failed to execute 'querySelector' on 'Document': 'css:article' is not a valid selector.\\n    at <anonymous>:3:37\\n    at HTMLDocument.<anonymous> (<anonymous>:31:15)\", 'objectId': '2863831353683791445.2.5', 'preview': {'type': 'object', 'subtype': 'error', 'description': \"SyntaxError: Failed to execute 'querySelector' on 'Document': 'css:article' is not a valid selector.\\n    at <anonymous>:3:37\\n    at HTMLDocument.<anonymous> (<anonymous>:31:15)\", 'overflow': False, 'properties': [{'name': 'stack', 'type': 'string', 'value': \"SyntaxError: Failed to execute 'querySelector' on …  at HTMLDocument.<anonymous> (<anonymous>:31:15)\"}, {'name': 'code', 'type': 'number', 'value': '12'}, {'name': 'name', 'type': 'string', 'value': 'SyntaxError'}, {'name': 'message', 'type': 'string', 'value': \"Failed to execute 'querySelector' on 'Document': 'css:article' is not a valid selector.\"}]}}}\nVersion: 4.1.1.2"
+  },
+  {
+    "section": "feed_buttons",
+    "js_result": ""
+  },
+  {
+    "section": "comments_opened",
+    "success": true
+  },
+  {
+    "section": "comments_modal",
+    "js_result": ""
+  },
+  {
+    "found": true,
+    "label": "reels_main_container",
+    "selector": "css:main",
+    "tag": "",
+    "attrs": {},
+    "class_list": [],
+    "children_summary": [],
+    "js_error": "\nJavaScript running error.\nJS: function(){\n            (()=>{\n                const el = document.querySelector(\"css:main\");\n                if(!el) return JSON.stringify({found:false});\n                const attrs={};\n                for(const a of el.attributes) attrs[a.name]=a.value;\n                const children=[];\n                const walk=(root, depth)=>{\n                    if(depth>2) return;\n                    for(const c of root.children){\n                        const entry={\n                            tag: c.tagName,\n                            role: c.getAttribute('role')||null,\n                            aria: c.getAttribute('aria-label')||null,\n                            classes: c.className?.toString()?.substring(0,120)||'',\n                            text: c.textContent?.substring(0,80)||'',\n                            childCount: c.children.length,\n                        };\n                        children.push(entry);\n                        if(depth<1) walk(c,depth+1);\n                    }\n                };\n                walk(el,0);\n                return JSON.stringify({\n                    tag: el.tagName,\n                    cls: el.className?.toString()?.substring(0,200)||'',\n                    attrs,\n                    children: children,\n                    htmlSample: el.outerHTML?.substring(0,800)||'',\n                });\n            })()\n        }\nInformation: {'exceptionId': 2, 'text': 'Uncaught', 'lineNumber': 2, 'columnNumber': 36, 'scriptId': '163', 'exception': {'type': 'object', 'subtype': 'error', 'className': 'DOMException', 'description': \"SyntaxError: Failed to execute 'querySelector' on 'Document': 'css:main' is not a valid selector.\\n    at <anonymous>:3:37\\n    at HTMLDocument.<anonymous> (<anonymous>:31:15)\", 'objectId': '2863831353683791445.2.16', 'preview': {'type': 'object', 'subtype': 'error', 'description': \"SyntaxError: Failed to execute 'querySelector' on 'Document': 'css:main' is not a valid selector.\\n    at <anonymous>:3:37\\n    at HTMLDocument.<anonymous> (<anonymous>:31:15)\", 'overflow': False, 'properties': [{'name': 'stack', 'type': 'string', 'value': \"SyntaxError: Failed to execute 'querySelector' on …  at HTMLDocument.<anonymous> (<anonymous>:31:15)\"}, {'name': 'code', 'type': 'number', 'value': '12'}, {'name': 'name', 'type': 'string', 'value': 'SyntaxError'}, {'name': 'message', 'type': 'string', 'value': \"Failed to execute 'querySelector' on 'Document': 'css:main' is not a valid selector.\"}]}}}\nVersion: 4.1.1.2"
+  },
+  {
+    "section": "reels_page",
+    "js_result": ""
+  },
+  {
+    "section": "reels_after_scroll",
+    "js_result": ""
+  },
+  {
+    "section": "all_articles_summary",
+    "js_result": ""
+  }
+]

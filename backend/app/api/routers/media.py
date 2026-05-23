@@ -18,6 +18,7 @@ from fastapi import (
     UploadFile,
     status,
 )
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -31,11 +32,14 @@ from app.schemas.asset import (
     MediaFolderRead,
     UniqueizeRequest,
 )
+from app.api.dependencies import get_current_user
 from app.workers.media_tasks import uniqueize_video
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/media", tags=["media"])
+router = APIRouter(
+    prefix="/media", tags=["media"], dependencies=[Depends(get_current_user)]
+)
 
 
 # helpers
@@ -155,6 +159,36 @@ def get_asset(
             status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found"
         )
     return AssetRead.model_validate(asset)
+
+
+@router.delete("/assets/{asset_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_asset(
+    asset_id: uuid.UUID,
+    db: Session = Depends(get_db),
+) -> Response:
+    if not crud_media.delete_asset(db, asset_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found"
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/assets/{asset_id}/file")
+def get_asset_file(
+    asset_id: uuid.UUID,
+    db: Session = Depends(get_db),
+) -> FileResponse:
+    """Stream the actual media file so the operator can preview/verify it."""
+    asset = crud_media.get_asset(db, asset_id)
+    if asset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found")
+    # validate the path lives under MEDIA_ROOT (symlink-safe) before serving
+    from workers.core.safety import UnsafePathError, resolve_within_media_root
+    try:
+        safe = resolve_within_media_root(asset.file_path, str(_media_root()))
+    except UnsafePathError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not available")
+    return FileResponse(safe, media_type="video/mp4", filename=Path(safe).name)
 
 
 @router.post(

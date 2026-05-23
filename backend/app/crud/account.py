@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.secrets import encrypt_cookies, encrypt_secret
 from app.models.account import AuthMethod, InstagramAccount, Platform
 from app.models.proxy import Proxy
 from app.models.user import User
@@ -94,6 +95,10 @@ def create_account(
     )
     payload["tags"] = _normalize_tags(payload.get("tags"))
 
+    # encrypt secrets at rest (Fernet). decrypted only in the worker.
+    payload["ig_password"] = encrypt_secret(payload.get("ig_password"))
+    payload["cookies"] = encrypt_cookies(payload.get("cookies"))
+
     # pick and save a UA at create time. if the user gave none, take one
     # from the pool that matches the chosen platform. once saved, the UA is
     # not rotated. swapping the UA later is a bigger bot signal than just
@@ -135,6 +140,11 @@ def update_account(
         data["platform"] = data["platform"].value
     if "tags" in data:
         data["tags"] = _normalize_tags(data["tags"])
+    # re-encrypt secrets if they are being updated
+    if "ig_password" in data:
+        data["ig_password"] = encrypt_secret(data["ig_password"])
+    if "cookies" in data:
+        data["cookies"] = encrypt_cookies(data["cookies"])
 
     for field, value in data.items():
         setattr(account, field, value)

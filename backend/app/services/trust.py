@@ -24,6 +24,7 @@ from typing import Optional
 from urllib.parse import urlparse
 from urllib.request import ProxyHandler, Request, build_opener
 
+from app.core.config import settings
 from app.models.account import InstagramAccount
 from app.models.proxy import Proxy
 
@@ -38,8 +39,9 @@ PROXY_WEIGHT: int = 60
 USER_AGENT_WEIGHT: int = 25
 HYGIENE_WEIGHT: int = 15
 
-DEFAULT_MIN_TRUST_SCORE: int = 50
-"""Below this the fan-out route will not dispatch the task."""
+DEFAULT_MIN_TRUST_SCORE: int = settings.MIN_TRUST_SCORE
+"""Below this the fan-out route will not dispatch the task. From settings so it
+can be lowered (e.g. to 0) for testing without good proxies."""
 
 _RISK_TAGS: frozenset[str] = frozenset(
     {"possible_shadowban", "checkpoint", "banned", "frozen"}
@@ -67,8 +69,8 @@ class TrustReport:
 
     @property
     def passed(self) -> bool:
-        """True if the score is at or above the threshold."""
-        return self.score >= DEFAULT_MIN_TRUST_SCORE
+        """True if the score is at or above the threshold (read live from settings)."""
+        return self.score >= settings.MIN_TRUST_SCORE
 
     def to_skip_reason(self) -> str:
         """One-line summary that fits FanOutSkippedAccount.reason."""

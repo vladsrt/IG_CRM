@@ -8,10 +8,12 @@ from app.models.proxy import ProxyProtocol, ProxyType
 class ProxyBase(BaseModel):
     host: str
     port: int
-    username: str
-    password: str
-    rotation_url: str
-    type: ProxyType
+    username: str = ""
+    password: str = ""
+    # optional with defaults so a per-account proxy can be added with just
+    # host/port/(creds). DB columns are NOT NULL, hence empty-string defaults.
+    rotation_url: str = ""
+    type: ProxyType = ProxyType.ORDINARY
     protocol: ProxyProtocol = ProxyProtocol.HTTP
 
 

@@ -5,7 +5,18 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routers import account, ai, auth, media, metrics, orchestrator, proxy, task, user
+from app.api.routers import (
+    account,
+    admin,
+    ai,
+    auth,
+    media,
+    metrics,
+    orchestrator,
+    proxy,
+    task,
+    user,
+)
 from app.core.config import settings
 
 app = FastAPI(
@@ -46,4 +57,5 @@ app.include_router(orchestrator.router)
 app.include_router(ai.router)
 app.include_router(media.router)
 app.include_router(metrics.router)
+app.include_router(admin.router)
 

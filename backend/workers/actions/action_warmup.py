@@ -1,642 +1,587 @@
 """
-warmup action.
-simulates a real user scrolling and looking at posts to keep the account active.
+warmup action v3.2 — smooth human-like instagram browsing.
+
+scroll: one smooth window.scrollBy per tick, variable distance (400-900px).
+reels: clicks div[aria-label="Navigate to next Reel"] button.
+tracks viewed posts — never returns to the same post.
+time split: ~5 min feed, ~10 min reels in a 15-min session.
+every action is double-verified.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
 import sys
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-# Allow `python action_warmup.py` from the actions/ dir for the smoke-test.
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
 from workers.core.behavior import (
     HumanBehaviorEngine,
-    ClickVerificationError,
     dismiss_instagram_modals,
     safe_coordinate_click,
+    _walk_up_to_clickable,
 )
 from workers.core.browser_core import InstagramBrowser
 
 logger = logging.getLogger(__name__)
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  CONSTANTS — tune these, not the logic
+# ═══════════════════════════════════════════════════════════════════════════
 
-# defaults
 DEFAULT_FEED_URL: str = "https://www.instagram.com/"
 DEFAULT_PAGE_LOAD_WAIT_S: float = 5.0
 DEFAULT_DURATION_MINUTES: float = 15.0
 
-# Weights are picked by ``random.choices`` — relative magnitudes only,
-# they don't have to sum to 1.0. Re-tune freely via the ``action_weights``
-# arg without code changes.
+# Action weights — heavily favour reels (user wants ~2/3 reels time)
 DEFAULT_WEIGHTS: Dict[str, float] = {
-    "scroll_feed": 60.0,
-    "watch_reels": 15.0,
-    "open_comments": 15.0,
-    "visit_profile": 10.0,
+    "scroll_feed":   20.0,   # ~5 min of 15
+    "watch_reels":   55.0,   # ~8-10 min of 15
+    "open_comments": 10.0,
+    "visit_profile": 15.0,
 }
 
-# css selectors
-PROFILE_LINK_LOCATOR = 'css:a[role="link"][href^="/"] span[dir="auto"]'
-PROFILE_FIRST_POST_LOCATOR = 'css:a[href*="/p/"], a[href*="/reel/"]'
-COMMENT_ICON_LOCATOR = 'css:svg[aria-label="Comment"][height="24"]'
-POST_LIKE_ICON_LOCATOR = 'css:svg[aria-label="Like"][height="24"]'
-CLOSE_ICON_LOCATOR = 'css:svg[aria-label="Close"]'
-REELS_TAB_LOCATOR = 'css:svg[aria-label="Reels"]'
-NEXT_REEL_LOCATOR = 'css:div[aria-label="Navigate to next Reel"] svg'
-# Comment hearts are smaller (12px or 16px) and we MUST NOT toggle a
-# heart that is already in the "Unlike" state — that would un-like a
-# real user's comment, which is observable and bad.
-COMMENT_LIKE_LOCATORS: List[str] = [
-    'css:svg[aria-label="Like"][height="12"]',
-    'css:svg[aria-label="Like"][height="16"]',
-]
+# ── Scroll ──
+# One smooth window.scrollBy call per tick. Distance varies randomly.
+_SCROLL_MIN_PX: int = 300
+_SCROLL_MAX_PX: int = 950
 
-# Parent-button locators
-# React click handlers are on the wrappers, not the SVGs. 
-# We need to click the parents for standard interactions, 
-# though coordinate clicks can sometimes hit the SVG directly.
-POST_LIKE_BUTTON_LOCATORS: List[str] = [
-    'xpath://*[(@role="button" or self::button) '
-    'and .//svg[@aria-label="Like" and @height="24"]]',
-    'xpath://*[(@role="button" or self::button) '
-    'and .//svg[@aria-label="Like"]]',
-    'xpath://*[@role="button" and @aria-label="Like"]',
-]
-COMMENT_BUTTON_LOCATORS: List[str] = [
-    'xpath://*[(@role="button" or self::button) '
-    'and .//svg[@aria-label="Comment" and @height="24"]]',
-    'xpath://*[(@role="button" or self::button) '
-    'and .//svg[@aria-label="Comment"]]',
-    'xpath://*[@role="button" and @aria-label="Comment"]',
-]
-COMMENT_LIKE_BUTTON_LOCATORS: List[str] = [
-    'xpath://*[(@role="button" or self::button) '
-    'and .//svg[@aria-label="Like" and (@height="12" or @height="16")]]',
-    'xpath://ul//*[(@role="button" or self::button) '
-    'and .//svg[@aria-label="Like"]]',
-    'xpath://div[@role="dialog"]//*[(@role="button" or self::button) '
-    'and .//svg[@aria-label="Like"]]',
-]
+# After scrolling, we pause to "read" the new visible post
+_READ_PAUSE_MIN_S: float = 2.5
+_READ_PAUSE_MAX_S: float = 8.0
 
-# Per-tick budgets — the loop stops cleanly between ticks so a long Reel
-# watch can't blow the overall duration_minutes budget by more than ~30s.
-_REEL_WATCH_S_RANGE: tuple[float, float] = (5.0, 30.0)
-_REELS_PER_VISIT_RANGE: tuple[int, int] = (2, 7)
-_PROFILE_DWELL_S_RANGE: tuple[float, float] = (3.0, 9.0)
-_POST_MODAL_DWELL_S_RANGE: tuple[float, float] = (4.0, 12.0)
+# ── Post interactions ──
+_LIKE_POST_PROB: float = 0.30
+_OPEN_COMMENTS_PROB: float = 0.35
 
-# probabilities for actions
-# Each post / reel rolls these INDEPENDENTLY:
-#   * 30% chance to like.
-#   * 45% chance to open the comments modal and engage.
-# When the comments modal IS opened (either via these per-element rolls
-# or because the dispatcher picked the open_comments action directly):
-#   * Try to like 3-4 different unliked comments.
-#   * Each attempt has a 60-70% chance of actually clicking — the
-#     specific threshold is drawn fresh per session via rng.uniform
-#     so two warmup runs don't have identical comment-like cadence.
-_LIKE_POST_PROBABILITY: float = 0.30
-_OPEN_COMMENTS_PROBABILITY: float = 0.45
-_COMMENT_LIKE_CHANCE_RANGE: tuple[float, float] = (0.60, 0.70)
-_COMMENT_ATTEMPTS_RANGE: tuple[int, int] = (3, 4) 
+# ── Comments ──
+_COMMENT_ATTEMPTS: Tuple[int, int] = (2, 4)
+_COMMENT_LIKE_CHANCE: Tuple[float, float] = (0.55, 0.75)
 
-# Short-timeout sweep used when a per-tick lookup fails — the regular
-# defaults (1.5s × 14 selectors) are too slow for in-loop usage. With
-# 0.5s × 14 the worst case is ~7s and most sweeps short-circuit on the
-# first or second match.
-_INLOOP_DISMISS_TIMEOUT_S: float = 0.5
+# ── Reels ──
+_REELS_PER_VISIT: Tuple[int, int] = (3, 8)
+_REEL_WATCH_S: Tuple[float, float] = (6.0, 22.0)
+
+# ── Profile ──
+_PROFILE_DWELL_S: Tuple[float, float] = (3.0, 8.0)
+
+# ── Inter-tick pauses (different vibe per action) ──
+_PAUSE: Dict[str, Tuple[float, float]] = {
+    "scroll_feed":   (1.5, 4.0),
+    "open_comments": (2.5, 6.0),
+    "watch_reels":   (0.8, 2.5),
+    "visit_profile": (3.0, 8.0),
+}
+
+# Reels next-button selector — confirmed from real DOM
+_REEL_NEXT_SEL = 'css:div[aria-label="Navigate to next Reel"]'
 
 
-# helpers
-# safe_coordinate_click is imported from workers.core.behavior
+# ═══════════════════════════════════════════════════════════════════════════
+#  UTILITY HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _r(a: float, b: float) -> float:
+    """random float in [a, b]."""
+    return random.uniform(a, b)
 
 
-def _safe_find(page: Any, selector: str, *, timeout: float = 2.5) -> Any | None:
-    """find element without throwing errors."""
+def _ri(a: int, b: int) -> int:
+    """random int in [a, b]."""
+    return random.randint(a, b)
+
+
+def _js(page: Any, code: str):
+    """run JS, return raw result."""
     try:
-        return page.ele(selector, timeout=timeout)
-    except Exception as exc:
-        logger.debug("[warmup] selector %r raised: %s", selector, exc)
+        return page.run_js(code)
+    except Exception:
         return None
 
 
-def _safe_find_all(page: Any, selector: str, *, timeout: float = 2.5) -> List[Any]:
-    """find all matching elements."""
-    try:
-        return list(page.eles(selector, timeout=timeout) or [])
-    except Exception as exc:
-        logger.debug("[warmup] eles(%r) raised: %s", selector, exc)
-        return []
+def _js_bool(page: Any, code: str) -> bool:
+    """run JS returning boolean, return Python bool."""
+    r = _js(page, code)
+    return r is True
 
 
-def _is_already_liked(ele: Any) -> bool:
-    """check if post is already liked."""
-    if ele is None:
-        return True
-    try:
-        # 1. Authoritative: the inner SVG (if any).
+def _js_str(page: Any, code: str) -> str:
+    """run JS returning string."""
+    r = _js(page, code)
+    return (r or "").strip() if isinstance(r, str) else ""
+
+
+def _js_json(page: Any, code: str):
+    """run JS returning JSON string, parse it."""
+    raw = _js(page, code)
+    if isinstance(raw, str) and raw and raw != "NF":
         try:
-            svg = ele.ele(
-                'xpath:.//svg[@aria-label="Like" or @aria-label="Unlike"]',
-                timeout=1,
-            )
+            return json.loads(raw)
         except Exception:
-            svg = None
-        if svg is not None:
-            inner_label = (svg.attr("aria-label") or "").strip().lower()
-            if inner_label in ("like", "unlike"):
-                return inner_label == "unlike"
-
-        # 2. Fallback: caller passed the SVG itself, or any other
-        # element whose own aria-label encodes state.
-        label = (ele.attr("aria-label") or "").strip().lower()
-        if label in ("like", "unlike"):
-            return label == "unlike"
-
-        # Unknown — fail closed.
-        return True
-    except Exception:
-        return True
+            pass
+    return None
 
 
+def _sweep(page: Any) -> None:
+    """quick modal sweep — only runs if dialog is present."""
+    if _js_bool(page, "return !!document.querySelector('div[role=\"dialog\"]')"):
+        dismiss_instagram_modals(page, per_selector_timeout_s=0.3, max_dismissals=2)
 
-def _sweep_modals_safely(browser: InstagramBrowser, *, label: str) -> int:
-    """close any popups quickly."""
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SCROLL
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _scroll_down(page: Any) -> int:
+    """One smooth scroll down. Returns px scrolled."""
+    px = _ri(_SCROLL_MIN_PX, _SCROLL_MAX_PX)
     try:
-        n = dismiss_instagram_modals(
-            browser.page,
-            per_selector_timeout_s=_INLOOP_DISMISS_TIMEOUT_S,
-            max_dismissals=2,
-        )
-        if n:
-            logger.info("[warmup] %s: dismissed %d modal(s)", label, n)
-        return n
-    except Exception as exc:
-        logger.debug("[warmup] %s: dismiss_instagram_modals raised (%s)", label, exc)
+        page.run_js(f"window.scrollBy({{top: {px}, behavior: 'smooth'}})")
+    except Exception:
+        try:
+            page.scroll.down(px)
+        except Exception:
+            return 0
+    time.sleep(1.2 + px / 700.0)
+    return px
+
+
+def _scroll_to_top(page: Any) -> None:
+    """Smooth scroll back to top."""
+    try:
+        page.run_js("window.scrollTo({top: 0, behavior: 'smooth'})")
+    except Exception:
+        pass
+    time.sleep(2.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  FIND VISIBLE POST (center of viewport, not viewed)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _get_post_href(article: Any) -> str:
+    """Extract /p/XXX or /reel/XXX from an article element."""
+    try:
+        el = article.ele('css:a[href*="/p/"], a[href*="/reel/"]', timeout=1)
+        if el:
+            return (el.attr("href") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _find_visible_article(page: Any, *, viewed: set) -> Any | None:
+    """Return the <article> closest to viewport center, not in viewed set."""
+
+    # JS: find article closest to screen center, return its href + position
+    data = _js_json(page, """
+    (()=>{
+        var arts=document.querySelectorAll('article');
+        var vh=window.innerHeight, center=vh/2, best=null, bestDist=1e9;
+        for(var a of arts){
+            var r=a.getBoundingClientRect();
+            if(r.bottom<80||r.top>vh-80) continue;
+            var mid=r.top+r.height/2, dist=Math.abs(mid-center);
+            if(dist<bestDist){
+                bestDist=dist;
+                var link=(a.querySelector('a[href*="/p/"],a[href*="/reel/"]')||{}).href||'';
+                best={href:link, top:Math.round(r.top)};
+            }
+        }
+        return JSON.stringify(best||null);
+    })()
+    """)
+
+    href = data.get("href", "") if data else ""
+
+    if not href or href in viewed:
+        return None
+
+    # Find matching DrissionPage element
+    try:
+        el = page.ele(f'css:a[href="{href}"]', timeout=2)
+        if el:
+            art = el.parent("tag:article") or el.parent(2)
+            if art and art.tag in ("article",):
+                return art
+    except Exception:
+        pass
+
+    # Fallback: any article not viewed
+    try:
+        for a in list(page.eles("css:article", timeout=2) or []):
+            link = _get_post_href(a)
+            if link and link not in viewed:
+                return a
+    except Exception:
+        pass
+
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  LIKE POST
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _like_post(page: Any) -> bool:
+    """Like visible post. Returns True if like confirmed."""
+    pos = _js_json(page, """
+    var s=document.querySelector('svg[aria-label="Like"][height="24"]');
+    if(!s) return 'NF';
+    var r=s.getBoundingClientRect();
+    return JSON.stringify({x:Math.round(r.x+r.width/2), y:Math.round(r.y+r.height/2)});
+    """)
+    if not pos:
+        return False
+
+    # Click parent button (JS click bypasses hydration overlay)
+    try:
+        svg = page.ele('css:svg[aria-label="Like"][height="24"]', timeout=2)
+        btn = _walk_up_to_clickable(svg) if svg else None
+        if btn:
+            btn.click(by_js=True)
+        else:
+            page.actions.move_to((pos["x"], pos["y"]))
+            time.sleep(0.2)
+            page.actions.click()
+    except Exception:
+        return False
+
+    time.sleep(1.8)
+    return _js_bool(page, "return !!document.querySelector('svg[aria-label=\"Unlike\"]')")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  COMMENTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _open_comments(page: Any) -> bool:
+    """Open comment modal on visible post. Returns True if dialog opened."""
+    svg = page.ele('css:svg[aria-label="Comment"]', timeout=3)
+    if not svg:
+        return False
+    btn = _walk_up_to_clickable(svg)
+    if not btn:
+        return False
+    btn.click(by_js=True)
+    time.sleep(3)
+    return _js_bool(page,
+        "var d=document.querySelector('div[role=\"dialog\"]');"
+        "return !!(d && d.querySelector('ul li'));")
+
+
+def _scroll_comments(page: Any) -> int:
+    """Scroll inside open comment dialog. Returns li count."""
+    n = _js(page, "var d=document.querySelector('div[role=\"dialog\"]');"
+                  "return d?d.querySelectorAll('ul li').length:0")
+    li_count = n if isinstance(n, int) else 0
+    if li_count > 0:
+        scrolls = min(8, max(1, li_count // 5))
+        for _ in range(scrolls):
+            _js(page,
+                "var d=document.querySelector('div[role=\"dialog\"]');"
+                "var ul=d&&d.querySelector('ul');"
+                "if(ul)ul.parentElement.scrollBy(0,400);")
+            time.sleep(_r(0.8, 2.0))
+    return li_count
+
+
+def _like_comments(page: Any, rng: random.Random) -> int:
+    """Like comments inside dialog. Returns how many were liked."""
+    hearts = _js_json(page, """
+    return JSON.stringify(
+        Array.from((document.querySelector('div[role="dialog"]')||[])
+                   .querySelectorAll('svg[aria-label="Like"]'))
+            .filter(h=>h.getAttribute('height')==='12')
+            .map(h=>{var r=h.getBoundingClientRect();
+                     return{x:Math.round(r.x+r.width/2), y:Math.round(r.y+r.height/2)};})
+    );
+    """)
+    if not hearts:
         return 0
 
+    target = _ri(*_COMMENT_ATTEMPTS)
+    chance = _r(*_COMMENT_LIKE_CHANCE)
+    rng.shuffle(hearts)
 
-def _try_like_visible_post(
-    browser: InstagramBrowser,
-    behavior: HumanBehaviorEngine,
-    counters: Dict[str, int],
-    *,
-    counter_key: str,
-) -> bool:
-    """try to click the like button on a post."""
-    # Check if the Like SVG is present and not already in Unlike state.
-    like_svg = _safe_find(browser.page, 'css:svg[aria-label="Like"]', timeout=2.0)
-    if like_svg is None:
-        _sweep_modals_safely(browser, label="like-button lookup miss")
-        like_svg = _safe_find(browser.page, 'css:svg[aria-label="Like"]', timeout=1.5)
-    if like_svg is None:
-        logger.debug("[warmup] no visible Like SVG — skipping")
-        return False
-    if _is_already_liked(like_svg):
-        logger.debug("[warmup] post already liked — skipping")
-        return False
-
-    if not safe_coordinate_click(browser.page, 'css:svg[aria-label="Like"]'):
-        logger.debug("[warmup] coordinate click on Like SVG failed")
-        return False
-
-    counters[counter_key] = counters.get(counter_key, 0) + 1
-    logger.info("[warmup] liked a %s (counter=%s now %d)",
-                counter_key.removesuffix("_liked") or "post",
-                counter_key, counters[counter_key])
-    behavior.idle(0.7, 1.6)
-    return True
-
-
-def _engage_with_comments(
-    browser: InstagramBrowser,
-    behavior: HumanBehaviorEngine,
-    rng: random.Random,
-    counters: Dict[str, int],
-    *,
-    modal_counter_key: str = "comment_modals_opened",
-    likes_counter_key: str = "comments_liked",
-) -> bool:
-    """open comments, maybe like some, then close."""
-    # Open comments via direct SVG coordinate click.
-    if not safe_coordinate_click(browser.page, 'css:svg[aria-label="Comment"]'):
-        _sweep_modals_safely(browser, label="comment-button lookup miss")
-        if not safe_coordinate_click(browser.page, 'css:svg[aria-label="Comment"]'):
-            logger.debug("[warmup] no visible Comment SVG — skipping engagement")
-            return False
-
-    counters[modal_counter_key] = counters.get(modal_counter_key, 0) + 1
-    logger.info("[warmup] opened comment modal (%s now %d)",
-                modal_counter_key, counters[modal_counter_key])
-    behavior.idle(1.4, 2.6)
-
-    # Read through — incremental scrolls inside the dialog.
-    for _ in range(rng.randint(2, 6)):
-        try:
-            browser.page.scroll.down(300)
-        except Exception:
-            pass
-        time.sleep(rng.uniform(0.9, 2.4))
-
-    # Per QA spec: 3-4 attempts at 60-70% per-comment chance.
-    target_attempts = rng.randint(*_COMMENT_ATTEMPTS_RANGE)
-    per_comment_chance = rng.uniform(*_COMMENT_LIKE_CHANCE_RANGE)
-    logger.info(
-        "[warmup] comments engaged: target_attempts=%d, per_comment_chance=%.2f",
-        target_attempts, per_comment_chance,
-    )
-
-    # Collect comment-like SVGs — the small hearts (12px / 16px).
-    candidates: List[Any] = []
-    for sel in COMMENT_LIKE_LOCATORS:
-        candidates.extend(_safe_find_all(browser.page, sel, timeout=2.0))
-    # Filter out already-liked hearts.
-    candidates = [c for c in candidates if not _is_already_liked(c)]
-    rng.shuffle(candidates)
-    logger.debug(
-        "[warmup] comment-like candidate pool: %d unliked SVG(s)",
-        len(candidates),
-    )
-
-    attempts = 0
-    for heart_svg in candidates:
-        if attempts >= target_attempts:
+    liked = 0
+    for h in hearts:
+        if liked >= target:
             break
-        attempts += 1
-        if rng.random() >= per_comment_chance:
-            logger.debug(
-                "[warmup] comment attempt %d/%d: chance roll missed — skip",
-                attempts, target_attempts,
-            )
+        if rng.random() >= chance:
             continue
-        # Coordinate click directly on the comment heart SVG.
         try:
-            heart_svg.scroll.to_see(center=True)
-            browser.page.wait(0.3)
-            x, y = heart_svg.rect.midpoint
-            browser.page.actions.move_to((x, y)).click()
-            counters[likes_counter_key] = counters.get(likes_counter_key, 0) + 1
-            logger.info(
-                "[warmup] liked a comment (attempt %d/%d, %s now %d)",
-                attempts, target_attempts, likes_counter_key,
-                counters[likes_counter_key],
-            )
-            behavior.idle(0.7, 1.7)
-        except Exception as exc:
-            logger.debug("[warmup] comment-like coordinate click failed: %s", exc)
-
-    # Close the modal — best effort via coordinate click on Close SVG.
-    safe_coordinate_click(browser.page, 'css:svg[aria-label="Close"]', timeout=2)
-    behavior.idle(0.6, 1.3)
-    return True
-
-
-# action: scroll the feed
-def _action_scroll_feed(
-    browser: InstagramBrowser,
-    behavior: HumanBehaviorEngine,
-    rng: random.Random,
-    counters: Dict[str, int],
-) -> None:
-    # Pre-scroll sweep to catch unexpected overlays
-    posts_visible = _safe_find(browser.page, "css:article", timeout=1.0)
-    if posts_visible is None:
-        _sweep_modals_safely(browser, label="scroll_feed pre-tick")
-
-    # Scroll down slightly and wait, triggering lazy loads
-    for _ in range(rng.randint(2, 5)):
-        try:
-            browser.page.scroll.down(500)
-        except Exception as exc:
-            logger.debug("[warmup] scroll.down(500) failed: %s", exc)
-        time.sleep(rng.uniform(1.0, 2.0))
-
-    if rng.random() < _LIKE_POST_PROBABILITY:
-        _try_like_visible_post(
-            browser, behavior, counters, counter_key="posts_liked",
-        )
-
-    if rng.random() < _OPEN_COMMENTS_PROBABILITY:
-        _engage_with_comments(browser, behavior, rng, counters)
-
-
-# action: open comments
-def _action_open_comments(
-    browser: InstagramBrowser,
-    behavior: HumanBehaviorEngine,
-    rng: random.Random,
-    counters: Dict[str, int],
-) -> None:
-    """dispatcher action to open comments."""
-    _engage_with_comments(browser, behavior, rng, counters)
-
-
-# action: watch reels
-def _action_watch_reels(
-    browser: InstagramBrowser,
-    behavior: HumanBehaviorEngine,
-    rng: random.Random,
-    counters: Dict[str, int],
-) -> None:
-    # Navigate left rail handles React hydration correctly
-    if not behavior.navigate_left_rail("reels"):
-        logger.debug("[warmup] navigate_left_rail('reels') failed; skipping tick")
-        return
-    behavior.idle(2.0, 4.0)
-    counters["reels_sessions"] += 1
-
-    n_reels = rng.randint(*_REELS_PER_VISIT_RANGE)
-    for _ in range(n_reels):
-        # Watch — sleep is the point, no scrolling.
-        watch_s = rng.uniform(*_REEL_WATCH_S_RANGE)
-        time.sleep(watch_s)
-        counters["reels_watched"] += 1
-        counters["reels_watch_seconds"] = int(
-            counters.get("reels_watch_seconds", 0) + watch_s
-        )
-
-        # Reels interactions: like and comments
-        if rng.random() < _LIKE_POST_PROBABILITY:
-            _try_like_visible_post(
-                browser, behavior, counters, counter_key="reels_liked",
-            )
-
-        if rng.random() < _OPEN_COMMENTS_PROBABILITY:
-            _engage_with_comments(
-                browser, behavior, rng, counters,
-                modal_counter_key="reels_comment_modals",
-                likes_counter_key="comments_liked",
-            )
-
-        if not safe_coordinate_click(browser.page, NEXT_REEL_LOCATOR, timeout=2):
-            # Fallback native scroll if next arrow is missing
-            try:
-                browser.page.scroll.down(800)
-            except Exception:
-                pass
-        behavior.idle(0.4, 1.2)
-
-
-# action: visit profile
-def _action_visit_profile(
-    browser: InstagramBrowser,
-    behavior: HumanBehaviorEngine,
-    rng: random.Random,
-    counters: Dict[str, int],
-) -> None:
-    candidates = _safe_find_all(browser.page, PROFILE_LINK_LOCATOR, timeout=3.0)
-    if not candidates:
-        return
-    target = rng.choice(candidates)
-    if not behavior.safe_click(target):
-        return
-    counters["profiles_visited"] += 1
-    behavior.idle(*_PROFILE_DWELL_S_RANGE)
-
-    # Skim the grid briefly — incremental scrolling.
-    for _ in range(rng.randint(1, 3)):
-        try:
-            browser.page.scroll.down(500)
+            page.actions.move_to((h["x"], h["y"]))
+            time.sleep(0.2)
+            page.actions.click()
+            liked += 1
+            time.sleep(_r(0.6, 1.5))
         except Exception:
             pass
-        time.sleep(rng.uniform(1.0, 2.0))
+    return liked
 
-    # Maybe open the first post / reel and look at it.
-    if rng.random() < 0.55:
-        first = _safe_find(browser.page, PROFILE_FIRST_POST_LOCATOR, timeout=2.0)
-        if first is not None and behavior.safe_click(first):
-            counters["profile_posts_opened"] += 1
-            behavior.idle(*_POST_MODAL_DWELL_S_RANGE)
 
-            # Scroll inside the modal a bit.
-            for _ in range(rng.randint(1, 3)):
-                try:
-                    browser.page.scroll.down(300)
-                except Exception:
-                    pass
-                time.sleep(rng.uniform(0.8, 1.5))
-
-            safe_coordinate_click(browser.page, 'css:svg[aria-label="Close"]', timeout=2)
-            behavior.idle(0.7, 1.6)
-
-    # Browser-Back to the feed.
+def _close_comments(page: Any) -> None:
+    """Close comment dialog."""
     try:
-        browser.page.back()
-    except Exception as exc:
-        logger.debug("[warmup] page.back() failed (%s); navigating home", exc)
+        _js(page,
+            "var c=document.querySelector('div[role=\"dialog\"] svg[aria-label=\"Close\"]');"
+            "if(c){var r=c.getBoundingClientRect();"
+            "document.elementFromPoint(r.x+8,r.y+8)?.click();}")
+    except Exception:
         try:
-            browser.page.get(DEFAULT_FEED_URL)
-        except Exception as exc2:
-            logger.debug("[warmup] feed-recovery nav also failed (%s)", exc2)
-    behavior.idle(1.4, 2.8)
+            safe_coordinate_click(page, 'css:svg[aria-label="Close"]', timeout=2)
+        except Exception:
+            pass
+    time.sleep(1.0)
 
 
-# dispatcher map
-_ActionFn = Callable[
-    [InstagramBrowser, HumanBehaviorEngine, random.Random, Dict[str, int]], None
-]
-_ACTIONS: Dict[str, _ActionFn] = {
-    "scroll_feed":   _action_scroll_feed,
-    "open_comments": _action_open_comments,
-    "watch_reels":   _action_watch_reels,
-    "visit_profile": _action_visit_profile,
-}
+# ═══════════════════════════════════════════════════════════════════════════
+#  REELS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _go_to_reels(page: Any, behavior: HumanBehaviorEngine) -> bool:
+    """Navigate to Reels tab."""
+    return behavior.navigate_left_rail("reels")
 
 
-def _pick_action(weights: Dict[str, float], rng: random.Random) -> str:
-    keys = list(weights.keys())
-    vals = [max(0.0, float(weights[k])) for k in keys]
-    if not any(vals):
-        return "scroll_feed"  # safest fallback if user zeroed everything
-    return rng.choices(keys, weights=vals, k=1)[0]
+def _reel_next(page: Any) -> bool:
+    """Click the 'Navigate to next Reel' button. Returns True if reel changed."""
+    old = _js_str(page, "return window.location.href")
+
+    btn = page.ele(_REEL_NEXT_SEL, timeout=3)
+    if not btn:
+        return False
+
+    btn.click(by_js=True)
+    time.sleep(2.5)
+
+    new = _js_str(page, "return window.location.href")
+    return bool(new) and new != old
 
 
-# main entry point
+def _reel_like(page: Any) -> bool:
+    """Like current reel. Returns True if confirmed."""
+    pos = _js_json(page, """
+    var s=document.querySelector('svg[aria-label="Like"]');
+    if(!s) return 'NF';
+    var r=s.getBoundingClientRect();
+    return JSON.stringify({x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)});
+    """)
+    if not pos:
+        return False
+    page.actions.move_to((pos["x"], pos["y"]))
+    time.sleep(0.2)
+    page.actions.click()
+    time.sleep(1.3)
+    return _js_bool(page, "return !!document.querySelector('svg[aria-label=\"Unlike\"]')")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PROFILE
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _visit_profile(page: Any, behavior: HumanBehaviorEngine) -> bool:
+    """Click a random profile name from the feed."""
+    try:
+        links = list(page.eles('css:a[role="link"] span[dir="auto"]', timeout=2) or [])
+        if not links:
+            return False
+        behavior.safe_click(random.choice(links))
+        time.sleep(3)
+        return True
+    except Exception:
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  MAIN — execute_warmup
+# ═══════════════════════════════════════════════════════════════════════════
+
 def execute_warmup(
     browser: InstagramBrowser,
     args: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """
-    starts warmup session.
-    returns session result.
+    """Run a human-like warmup session.
+
+    v3.2: smooth scrolling, reels-first time split, viewed-post tracking,
+    double-verify on every interaction.
     """
     args = args or {}
     rng = random.Random()
+    page = browser.page
 
     feed_url = str(args.get("feed_url", DEFAULT_FEED_URL))
-    page_load_wait_s = float(args.get("page_load_wait_s", DEFAULT_PAGE_LOAD_WAIT_S))
-    duration_minutes = float(args.get("duration_minutes", DEFAULT_DURATION_MINUTES))
-    if duration_minutes <= 0:
-        raise ValueError(f"duration_minutes must be > 0, got {duration_minutes}")
+    wait_s = float(args.get("page_load_wait_s", DEFAULT_PAGE_LOAD_WAIT_S))
+    duration_min = float(args.get("duration_minutes", DEFAULT_DURATION_MINUTES))
 
-    # Merge user overrides on top of defaults; unknown keys are ignored.
+    if duration_min <= 0:
+        raise ValueError(f"duration_minutes must be > 0, got {duration_min}")
+
     weights = dict(DEFAULT_WEIGHTS)
     for k, v in (args.get("action_weights") or {}).items():
         if k in weights:
             weights[k] = float(v)
 
-    end_time = time.monotonic() + duration_minutes * 60.0
+    end_time = time.monotonic() + duration_min * 60.0
 
-    logger.info(
-        "[warmup] navigating to %s (duration=%.1fmin, weights=%s)",
-        feed_url, duration_minutes, weights,
-    )
-    browser.page.get(feed_url)
-    time.sleep(page_load_wait_s)
+    logger.info("[warmup] v3.2 start — %.1f min, weights=%s", duration_min, weights)
 
-    # Initial sweep to clear any popups before starting the loop.
-    initial_dismissals = 0
-    try:
-        initial_dismissals = dismiss_instagram_modals(browser.page)
-    except Exception as exc:
-        logger.warning(
-            "[warmup] initial dismiss_instagram_modals raised (%s); continuing",
-            exc,
-        )
-    if initial_dismissals:
-        logger.info(
-            "[warmup] cleared %d pre-loop modal(s) (e.g. 'Turn on notifications')",
-            initial_dismissals,
-        )
+    # ── Setup ──────────────────────────────────────────────────────────────
+    page.get(feed_url)
+    time.sleep(wait_s)
+    dismiss_instagram_modals(page)
 
-    behavior = HumanBehaviorEngine(browser.page)
-    # Initial "I just opened the app" beat — humans don't engage instantly.
-    behavior.idle(2.0, 4.0)
+    behavior = HumanBehaviorEngine(page)
+    behavior.idle(2.0, 5.0)  # "just opened app"
 
-    counters: Dict[str, int] = {
-        "ticks":                  0,
-        "posts_liked":            0,
-        "comment_modals_opened":  0,
-        "comments_liked":         0,
-        "reels_sessions":         0,
-        "reels_watched":          0,
-        "reels_watch_seconds":    0,
-        "reels_liked":            0,
-        "reels_comment_modals":   0,
-        "profiles_visited":       0,
-        "profile_posts_opened":   0,
+    viewed: set[str] = set()
+    ticks_top = 0
+
+    c: Dict[str, int] = {
+        "ticks": 0, "posts_liked": 0, "comment_modals": 0, "comments_liked": 0,
+        "reel_sessions": 0, "reels_watched": 0, "reels_watch_s": 0,
+        "reels_liked": 0, "reel_comments": 0, "profiles": 0, "scroll_tops": 0,
     }
-    action_log: List[Dict[str, Any]] = []
+    log: List[Dict[str, Any]] = []
 
+    # ── Main loop ──────────────────────────────────────────────────────────
     while time.monotonic() < end_time:
-        # catch wrong url
-        # If a prior tick crashed and somehow re-navigated to the
-        # cookie-injection domain (/robots.txt), force recovery to the
-        # feed. Without this the entire remaining session runs against
-        # the wrong page and every locator silently fails.
-        try:
-            current_url = browser.page.url or ""
-            if "robots.txt" in current_url or not current_url.startswith("https://www.instagram.com"):
-                logger.warning(
-                    "[warmup] URL guard triggered (url=%r) — navigating back to feed",
-                    current_url,
-                )
-                browser.page.get(feed_url)
-                time.sleep(page_load_wait_s)
-                # Re-sweep modals after forced navigation.
-                try:
-                    dismiss_instagram_modals(browser.page)
-                except Exception:
-                    pass
-        except Exception as exc:
-            logger.debug("[warmup] URL guard check failed (%s); continuing", exc)
+        # Pick action by weighted random
+        keys, vals = list(weights), [max(0.0, float(weights[k])) for k in weights]
+        action = rng.choices(keys, weights=vals, k=1)[0] if any(vals) else "scroll_feed"
 
-        action_name = _pick_action(weights, rng)
-        action_fn = _ACTIONS[action_name]
-        tick_started_at = time.monotonic()
-        logger.info("[warmup] tick %d: %s", counters["ticks"] + 1, action_name)
+        t0 = time.monotonic()
+        logger.info("[warmup] #%d %s", c["ticks"] + 1, action)
+        ok, err = True, None
 
         try:
-            action_fn(browser, behavior, rng, counters)
-            ok = True
-            err: Optional[str] = None
+            # ── SCROLL FEED ───────────────────────────────────────────────
+            if action == "scroll_feed":
+                _sweep(page)
+                _scroll_down(page)
+                time.sleep(_r(_READ_PAUSE_MIN_S, _READ_PAUSE_MAX_S))
+
+                art = _find_visible_article(page, viewed=viewed)
+                if art:
+                    href = _get_post_href(art)
+                    viewed.add(href)
+
+                    if rng.random() < _LIKE_POST_PROB:
+                        if _like_post(page):
+                            c["posts_liked"] += 1
+                            behavior.idle(0.8, 2.0)
+
+                    if rng.random() < _OPEN_COMMENTS_PROB:
+                        if _open_comments(page):
+                            c["comment_modals"] += 1
+                            behavior.idle(1.2, 2.5)
+                            _scroll_comments(page)
+                            c["comments_liked"] += _like_comments(page, rng)
+                            _close_comments(page)
+
+                ticks_top += 1
+                if ticks_top >= _ri(8, 14):
+                    _scroll_to_top(page)
+                    c["scroll_tops"] += 1
+                    ticks_top = 0
+                    behavior.idle(2.0, 4.0)
+
+            # ── REELS ─────────────────────────────────────────────────────
+            elif action == "watch_reels":
+                _sweep(page)
+                if not _go_to_reels(page, behavior):
+                    ok, err = False, "reels_nav_fail"
+                else:
+                    c["reel_sessions"] += 1
+                    behavior.idle(2.0, 4.0)
+
+                    for _ in range(_ri(*_REELS_PER_VISIT)):
+                        if time.monotonic() >= end_time:
+                            break
+
+                        watch = _r(*_REEL_WATCH_S)
+                        time.sleep(watch)
+                        c["reels_watched"] += 1
+                        c["reels_watch_s"] += int(watch)
+
+                        act = rng.choices(["none","like","comment","both"],
+                                          weights=[55,30,10,5])[0]
+
+                        if act in ("like", "both") and _reel_like(page):
+                            c["reels_liked"] += 1
+                        if act in ("comment", "both"):
+                            if _open_comments(page):
+                                c["reel_comments"] += 1
+                                _scroll_comments(page)
+                                c["comments_liked"] += _like_comments(page, rng)
+                                _close_comments(page)
+
+                        if not _reel_next(page):
+                            break
+                        behavior.idle(0.4, 1.2)
+
+                    page.get(feed_url)
+                    time.sleep(wait_s)
+                    dismiss_instagram_modals(page)
+
+            # ── OPEN COMMENTS ──────────────────────────────────────────────
+            elif action == "open_comments":
+                _sweep(page)
+                art = _find_visible_article(page, viewed=viewed)
+                if art:
+                    href = _get_post_href(art)
+                    viewed.add(href)
+                    if _open_comments(page):
+                        c["comment_modals"] += 1
+                        behavior.idle(1.0, 2.5)
+                        _scroll_comments(page)
+                        c["comments_liked"] += _like_comments(page, rng)
+                        _close_comments(page)
+                else:
+                    _scroll_down(page)
+                    time.sleep(_r(_READ_PAUSE_MIN_S, _READ_PAUSE_MAX_S))
+
+            # ── VISIT PROFILE ─────────────────────────────────────────────
+            elif action == "visit_profile":
+                _sweep(page)
+                if _visit_profile(page, behavior):
+                    c["profiles"] += 1
+                    for _ in range(_ri(1, 3)):
+                        try:
+                            page.scroll.down(400)
+                        except Exception:
+                            pass
+                        time.sleep(_r(1.0, 2.5))
+                    try:
+                        page.back()
+                    except Exception:
+                        page.get(feed_url)
+                    time.sleep(3)
+                    dismiss_instagram_modals(page)
+
         except Exception as exc:
-            # Per-tick guard — a single missing locator must NOT end the
-            # session. We log it, count it, and roll again.
-            ok = False
-            err = f"{type(exc).__name__}: {exc}"
-            logger.warning("[warmup] tick %r failed (%s) — continuing", action_name, err)
+            ok, err = False, f"{type(exc).__name__}: {exc}"
+            logger.warning("[warmup] %s FAILED: %s", action, err)
 
-        counters["ticks"] += 1
-        action_log.append({
-            "action":     action_name,
-            "ok":         ok,
-            "elapsed_s":  round(time.monotonic() - tick_started_at, 2),
-            "error":      err,
-        })
+        c["ticks"] += 1
+        log.append({"action": action, "ok": ok, "elapsed_s": round(time.monotonic() - t0, 2),
+                     "error": err})
 
-        # Inter-tick breath. Long enough to break up timing fingerprints,
-        # short enough that we still hit the duration budget.
-        behavior.idle(1.2, 3.4)
+        lo, hi = _PAUSE.get(action, (1.5, 4.0))
+        behavior.idle(lo, hi)
 
-    logger.info(
-        "[warmup] session done after %d ticks: %s",
-        counters["ticks"], {k: v for k, v in counters.items() if v},
-    )
+    # ── Done ────────────────────────────────────────────────────────────────
+    logger.info("[warmup] done %d ticks: %s", c["ticks"],
+                {k: v for k, v in c.items() if v})
     return {
-        "action":            "warmup",
-        "version":           2,
-        "feed_url":          feed_url,
-        "duration_minutes":  duration_minutes,
-        "weights":           weights,
-        "counters":          counters,
-        "action_log":        action_log,
+        "action": "warmup", "version": 3,
+        "feed_url": feed_url, "duration_minutes": duration_min,
+        "weights": weights, "counters": c,
+        "viewed_posts": len(viewed), "action_log": log,
     }
-
-
-# smoke test
-_SMOKE_TEST_PROXY: str = "8d1f77cde74f6dffffea__cr.us:80fe1a46ee235b27@gw.dataimpulse.com:823"
-
-_SMOKE_TEST_USER_AGENT: str = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/122.0.0.0 Safari/537.36"
-)
-
-_SMOKE_TEST_COOKIES = [
-    {"domain": ".instagram.com", "name": "ps_n",       "value": "1",                                                                                                                                "path": "/"},
-    {"domain": ".instagram.com", "name": "datr",       "value": "4PnXaAUhBF6H4VaGhlf1j1g0",                                                                                                        "path": "/"},
-    {"domain": ".instagram.com", "name": "ds_user_id", "value": "77203602829",                                                                                                                      "path": "/"},
-    {"domain": ".instagram.com", "name": "csrftoken",  "value": "30jG0bFQ9XloSZWb1TK7BaoYs83jmkzU",                                                                                               "path": "/"},
-    {"domain": ".instagram.com", "name": "mid",        "value": "aNf54AAEAAGwnGqXcIkj68TtKnh4",                                                                                                    "path": "/"},
-    {"domain": ".instagram.com", "name": "sessionid",  "value": "77203602829%3ABV1b0aNRX4sWwg%3A12%3AAYhp6okkj6yOVAozVcwhIbkgh3bDMnloQ1mlUSz6Xzk", "path": "/"},
-    {"domain": ".instagram.com", "name": "ps_l",       "value": "1",                                                                                                                                "path": "/"},
-    {"domain": ".instagram.com", "name": "dpr",        "value": "1",                                                                                                                                "path": "/"},
-    {"domain": ".instagram.com", "name": "rur",        "value": '"NHA\\05477203602829\\0541808322467:01fe0b0984dcba8b6cc3f7dfa5743dd979aa75cc0cfba7d1c44eef3d301cffab39339cb7"', "path": "/"},
-]
-
-
-def _run_standalone_smoke_test() -> None:
-    print("=" * 55)
-    print("  Instagram Worker - Warmup 2.0 Smoke Test")
-    print("=" * 55)
-
-    browser: InstagramBrowser | None = None
-    try:
-        browser = InstagramBrowser(
-            proxy_string=_SMOKE_TEST_PROXY,
-            user_agent=_SMOKE_TEST_USER_AGENT,
-            headless=False,
-        )
-        browser.inject_cookies(_SMOKE_TEST_COOKIES)
-        result = execute_warmup(browser, args={"duration_minutes": 1.5})
-        print(f"[+] Warmup result: {result}")
-    except Exception as exc:
-        import traceback
-        print(f"[!] Smoke test failed: {exc}")
-        traceback.print_exc()
-    finally:
-        if browser is not None:
-            browser.close()
-        print("=" * 55)
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    _run_standalone_smoke_test()

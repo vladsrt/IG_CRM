@@ -27,8 +27,12 @@ class Settings(BaseSettings):
     CELERY_TASK_TIME_LIMIT: int = 60 * 30        # hard kill after 30 min
     CELERY_TASK_SOFT_TIME_LIMIT: int = 60 * 25   # SoftTimeLimitExceeded after 25 min
 
-    # openai
+    # llm (OpenAI-compatible: OpenAI, Ollama Cloud, z.ai/GLM, etc.)
     OPENAI_API_KEY: str = ""
+    # Base URL of the OpenAI-compatible API. Empty = OpenAI default.
+    #   Ollama Cloud: https://ollama.com/v1
+    #   z.ai / GLM:   https://api.z.ai/api/paas/v4
+    OPENAI_BASE_URL: str = ""
     OPENAI_MODEL: str = "gpt-4o-mini"
     OPENAI_TIMEOUT_SECONDS: float = 60.0
     OPENAI_MAX_RETRIES: int = 2
@@ -48,6 +52,38 @@ class Settings(BaseSettings):
 
     # cors
     CORS_ALLOWED_ORIGINS: list[str] = ["*"]
+
+    # allow running a browser task WITHOUT a proxy (direct connection from the
+    # host IP). Off by default — running real IG with no proxy burns accounts.
+    # When True, OR when the account owner is an admin, no-proxy runs are allowed
+    # (handy for testing the pipeline without residential proxies).
+    ALLOW_NO_PROXY: bool = False
+
+    # trust gate: minimum 0-100 score for fan-out to dispatch to an account.
+    # Set to 0 for testing without good proxies (lets no-proxy/weak-proxy runs
+    # through). Raise back to 50 for production.
+    MIN_TRUST_SCORE: int = 50
+
+    # capacity guard: protect the test box from being overloaded by browsers.
+    CAPACITY_CPU_PERCENT: float = 85.0      # don't start a task above this CPU%
+    CAPACITY_RAM_PERCENT: float = 85.0      # don't start a task above this RAM%
+    CAPACITY_MAX_BROWSERS: int = 4          # global ceiling of our Chromium instances
+    # default parallel agent slots per tier (admin can override per-subscription)
+    AGENTS_FREE: int = 1
+    AGENTS_PRO: int = 5
+    AGENTS_ENTERPRISE: int = 10
+
+    # admin access: comma-separated emails that get the admin role (stats panel,
+    # grant tiers/agents). Plain string to avoid pydantic-settings JSON parsing.
+    # e.g. ADMIN_EMAILS=me@x.com,you@y.com
+    ADMIN_EMAILS: str = ""
+
+    def is_admin(self, email: str | None) -> bool:
+        """True if the email is in the admin allow-list (case-insensitive)."""
+        if not email:
+            return False
+        allow = {e.strip().lower() for e in self.ADMIN_EMAILS.split(",") if e.strip()}
+        return email.lower() in allow
 
 
 # singleton, import `settings` instead of building a new one

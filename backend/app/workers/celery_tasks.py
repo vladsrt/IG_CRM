@@ -26,14 +26,19 @@ from typing import Any
 
 from celery import Task as CeleryTask
 from celery.exceptions import Retry, SoftTimeLimitExceeded
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
 
 from app.core.celery_app import celery_app
+from app.core.config import settings
 from app.core.database import SessionLocal
+from app.core.secrets import decrypt_cookies, decrypt_secret
 from app.models.account import InstagramAccount
 from app.models.proxy import Proxy
 from app.models.task import Task, TaskStatus
+from app.models.user import User
+from app.services.agents import agents_for_subscription
+from app.services.capacity import has_free_capacity
 from workers.core.executor import TaskExecutor
 from workers.core.observability import CheckpointException
 
@@ -61,6 +66,12 @@ _REAP_AFTER_SECONDS: int = 60 * 60
 # retry budget for the FOR UPDATE NOWAIT contention path.
 _LOCK_RETRY_MAX_ATTEMPTS: int = 5
 _LOCK_RETRY_BASE_BACKOFF_S: int = 30  # 30, 60, 120, 240, 480 seconds
+
+# retry budget for the agent-limit / capacity gate (Phase 4). Generous, because
+# slots free up as other tasks finish. Backoff is capped so waits stay sane.
+_GATE_RETRY_MAX_ATTEMPTS: int = 20
+_GATE_RETRY_BASE_BACKOFF_S: int = 15
+_GATE_RETRY_BACKOFF_CAP_S: int = 120
 
 
 # helpers
@@ -141,6 +152,66 @@ def _recover_orphan_if_needed(task_uuid: uuid.UUID) -> bool:
         return True
 
 
+def _check_agent_and_capacity_gate(self: CeleryTask, task_uuid: uuid.UUID) -> None:
+    """Phase 4 soft gate: hold the task back if the owner is out of agent
+    slots OR the host is over its CPU/RAM/browser budget.
+
+    Proceeds (returns None) on the happy path. Raises ``self.retry`` to wait
+    when blocked. Fail-open: any error computing the gate lets the task run,
+    so a metrics glitch can never freeze the whole fleet.
+    """
+    try:
+        with SessionLocal() as db:
+            task = db.get(Task, task_uuid)
+            if task is None:
+                return
+            account = db.get(InstagramAccount, task.account_id)
+            if account is None:
+                return
+            user = db.get(User, account.user_id)
+            limit = agents_for_subscription(user.subscription if user else None)
+            running = int(
+                db.execute(
+                    select(func.count(Task.id))
+                    .select_from(Task)
+                    .join(InstagramAccount, Task.account_id == InstagramAccount.id)
+                    .where(
+                        InstagramAccount.user_id == account.user_id,
+                        Task.status == TaskStatus.RUNNING.value,
+                        Task.id != task_uuid,
+                    )
+                ).scalar_one()
+            )
+        over_limit = running >= limit
+        cap_ok, cap_reason = has_free_capacity()
+    except Exception:
+        logger.exception("[gate] gate check failed, proceeding (fail-open)")
+        return
+
+    blocked_reason: str | None = None
+    if over_limit:
+        blocked_reason = f"agent slots full ({running}/{limit} running for this user)"
+    elif not cap_ok:
+        blocked_reason = f"host over capacity: {cap_reason}"
+
+    if blocked_reason is None:
+        return
+
+    backoff = min(
+        _GATE_RETRY_BASE_BACKOFF_S * (2 ** self.request.retries),
+        _GATE_RETRY_BACKOFF_CAP_S,
+    )
+    logger.info(
+        "[run_instagram_task] gate hold task=%s (%s), retry in %ds",
+        task_uuid, blocked_reason, backoff,
+    )
+    raise self.retry(
+        exc=RuntimeError(blocked_reason),
+        countdown=backoff,
+        max_retries=_GATE_RETRY_MAX_ATTEMPTS,
+    )
+
+
 # task: validate_account_session
 @celery_app.task(
     bind=True,
@@ -167,7 +238,7 @@ def validate_account_session(self: CeleryTask, account_id: str) -> dict[str, Any
             raise ValueError(f"InstagramAccount {acct_uuid} not found")
 
         proxy_string = _build_proxy_string(account.proxy)
-        cookies = account.cookies or {}
+        cookies = decrypt_cookies(account.cookies) or {}
 
         # browser logic stub.
         # TODO: pass proxy_string and cookies to a real validator action via
@@ -212,6 +283,10 @@ def run_instagram_task(self: CeleryTask, task_id: str) -> dict[str, Any]:
     # 0. orphan recovery
     if _recover_orphan_if_needed(task_uuid):
         return {"task_id": str(task_uuid), "status": "orphan_recovered"}
+
+    # 0.5 agent-limit + host-capacity gate (Phase 4). Holds the task back via
+    # self.retry while the owner has no free agent slot or the box is loaded.
+    _check_agent_and_capacity_gate(self, task_uuid)
 
     # 1. locked load, sibling check, switch to RUNNING.
     # everything in this block is one transaction. the row lock is released
@@ -299,6 +374,13 @@ def run_instagram_task(self: CeleryTask, task_id: str) -> dict[str, Any]:
         proxy = account.proxy
         account_uuid = account.id
 
+        # no-proxy runs allowed globally (ALLOW_NO_PROXY) or when the account
+        # owner is an admin (lets admins test the pipeline without a proxy).
+        owner = db.get(User, account.user_id)
+        allow_no_proxy = settings.ALLOW_NO_PROXY or settings.is_admin(
+            owner.email if owner else None
+        )
+
         # the AI parser saves the whole plan dict on Task.payload:
         #   {"summary": ..., "priority": ..., "commands": [{action, args}, ...]}
         # the executor wants payload["commands"] to be just the list, so we
@@ -310,11 +392,12 @@ def run_instagram_task(self: CeleryTask, task_id: str) -> dict[str, Any]:
             "task_id": str(task.id),
             "account_id": str(account.id),
             "ig_username": account.ig_username,
-            "ig_password": account.ig_password,
+            "ig_password": decrypt_secret(account.ig_password),
             "auth_method": account.auth_method,
             "proxy_string": _build_proxy_string(proxy),
+            "allow_no_proxy": allow_no_proxy,
             "proxy_session_id": account.proxy_session_id,
-            "cookies": account.cookies or {},
+            "cookies": decrypt_cookies(account.cookies) or {},
             "commands": commands_list,
             "plan_summary": plan.get("summary"),
             "plan_priority": plan.get("priority"),
@@ -553,7 +636,7 @@ def gather_account_metrics(self: CeleryTask, account_id: str) -> dict[str, Any]:
                 "account_id": str(account.id),
                 "ig_username": account.ig_username,
                 "proxy_string": _build_proxy_string(proxy),
-                "cookies": account.cookies or {},
+                "cookies": decrypt_cookies(account.cookies) or {},
                 "headless": True,
                 "user_agent": account.user_agent,
                 "commands": [

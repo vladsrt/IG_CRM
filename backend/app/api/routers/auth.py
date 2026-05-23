@@ -6,10 +6,14 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
+from app.api.dependencies import get_current_user
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import create_access_token, verify_password
 from app.crud import user as crud_user
-from app.schemas.user import UserCreate, UserRead
+from app.models.user import User
+from app.schemas.user import MeRead, UserCreate, UserRead
+from app.services.agents import agents_for_subscription
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -53,3 +57,29 @@ def login(
 
     token = create_access_token(data={"sub": str(user.id)})
     return {"access_token": token, "token_type": "bearer"}
+
+
+@router.get(
+    "/me",
+    response_model=MeRead,
+    summary="get the current authenticated user's profile",
+)
+def read_me(
+    current_user: User = Depends(get_current_user),
+) -> MeRead:
+    """Returns the logged-in user with billing tier and admin flag.
+
+    The frontend calls this right after login to learn the real user id
+    (used for scoping accounts, metrics and AI requests) and to decide
+    whether to show the admin panel.
+    """
+    sub = current_user.subscription
+    tier = sub.tier if sub is not None else "free"
+    return MeRead(
+        id=current_user.id,
+        email=current_user.email,
+        created_at=current_user.created_at,
+        tier=tier,
+        is_admin=settings.is_admin(current_user.email),
+        agents_limit=agents_for_subscription(sub),
+    )

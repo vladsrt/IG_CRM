@@ -1,0 +1,967 @@
+[
+  {
+    "section": "feed_url",
+    "url": "https://www.instagram.com/"
+  },
+  {
+    "article_count": 3,
+    "article_0": {
+      "tag": "article",
+      "html_class": ""
+    },
+    "article_1": {
+      "tag": "article",
+      "html_class": ""
+    },
+    "article_2": {
+      "tag": "article",
+      "html_class": ""
+    },
+    "svgs": [
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      }
+    ],
+    "comment_svg_count": 3,
+    "like_svg_count": 3,
+    "section": "feed_elements"
+  },
+  {
+    "section": "screenshot_feed",
+    "path": "/home/sk8ver/Documents/Projects/CRM/IG_CRM/vaults/dom_research/01_feed.png"
+  },
+  {
+    "section": "screenshot_comments",
+    "path": "/home/sk8ver/Documents/Projects/CRM/IG_CRM/vaults/dom_research/02_comments_modal.png"
+  },
+  {
+    "section": "dialog_svgs",
+    "svgs": [
+      {
+        "aria": "Tags",
+        "h": "12",
+        "w": "12"
+      },
+      {
+        "aria": "Verified",
+        "h": "12",
+        "w": "12"
+      },
+      {
+        "aria": "More options",
+        "h": "24",
+        "w": "24"
+      },
+      {
+        "aria": "Like",
+        "h": "24",
+        "w": "24"
+      },
+      {
+        "aria": "Comment",
+        "h": "24",
+        "w": "24"
+      },
+      {
+        "aria": "Repost",
+        "h": "24",
+        "w": "24"
+      },
+      {
+        "aria": "Share Post",
+        "h": "24",
+        "w": "24"
+      },
+      {
+        "aria": "Share Post",
+        "h": "24",
+        "w": "24"
+      },
+      {
+        "aria": "Save",
+        "h": "24",
+        "w": "24"
+      },
+      {
+        "aria": "Verified",
+        "h": "12",
+        "w": "12"
+      },
+      {
+        "aria": "Comment Options",
+        "h": "24",
+        "w": "24"
+      },
+      {
+        "aria": "Like",
+        "h": "12",
+        "w": "12"
+      },
+      {
+        "aria": "Verified",
+        "h": "12",
+        "w": "12"
+      },
+      {
+        "aria": "Comment Options",
+        "h": "24",
+        "w": "24"
+      },
+      {
+        "aria": "Like",
+        "h": "12",
+        "w": "12"
+      },
+      {
+        "aria": "Comment Options",
+        "h": "24",
+        "w": "24"
+      },
+      {
+        "aria": "Like",
+        "h": "12",
+        "w": "12"
+      },
+      {
+        "aria": "Comment Options",
+        "h": "24",
+        "w": "24"
+      },
+      {
+        "aria": "Like",
+        "h": "12",
+        "w": "12"
+      },
+      {
+        "aria": "Comment Options",
+        "h": "24",
+        "w": "24"
+      }
+    ]
+  },
+  {
+    "section": "screenshot_feed_scrolled",
+    "path": "/home/sk8ver/Documents/Projects/CRM/IG_CRM/vaults/dom_research/03_feed_scrolled.png"
+  },
+  {
+    "article_count": 5,
+    "article_0": {
+      "tag": "article",
+      "html_class": ""
+    },
+    "article_1": {
+      "tag": "article",
+      "html_class": ""
+    },
+    "article_2": {
+      "tag": "article",
+      "html_class": ""
+    },
+    "article_3": {
+      "tag": "article",
+      "html_class": ""
+    },
+    "article_4": {
+      "tag": "article",
+      "html_class": ""
+    },
+    "svgs": [
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      }
+    ],
+    "comment_svg_count": 5,
+    "like_svg_count": 5,
+    "section": "feed_scrolled_elements"
+  },
+  {
+    "section": "screenshot_comments_far",
+    "path": "/home/sk8ver/Documents/Projects/CRM/IG_CRM/vaults/dom_research/04_comments_far_post.png"
+  },
+  {
+    "section": "screenshot_reels",
+    "path": "/home/sk8ver/Documents/Projects/CRM/IG_CRM/vaults/dom_research/05_reels.png",
+    "nav_ok": true
+  },
+  {
+    "article_count": 0,
+    "svgs": [
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      }
+    ],
+    "comment_svg_count": 16,
+    "like_svg_count": 16,
+    "section": "reels_elements"
+  },
+  {
+    "section": "reels_interactive",
+    "like_count": 16,
+    "comment_count": 16
+  },
+  {
+    "section": "screenshot_reels_next",
+    "path": "/home/sk8ver/Documents/Projects/CRM/IG_CRM/vaults/dom_research/06_reels_next.png"
+  },
+  {
+    "article_count": 0,
+    "svgs": [
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      }
+    ],
+    "comment_svg_count": 16,
+    "like_svg_count": 16,
+    "section": "reels_next_elements"
+  },
+  {
+    "section": "screenshot_profile",
+    "path": "/home/sk8ver/Documents/Projects/CRM/IG_CRM/vaults/dom_research/07_profile.png"
+  },
+  {
+    "article_count": 0,
+    "svgs": [
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      },
+      {
+        "aria": "",
+        "h": "",
+        "w": ""
+      }
+    ],
+    "comment_svg_count": 16,
+    "like_svg_count": 16,
+    "section": "profile_elements"
+  }
+]

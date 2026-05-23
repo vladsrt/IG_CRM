@@ -7,6 +7,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 
+from app.api.dependencies import require_admin
 from app.core.database import get_db
 from app.crud import subscription as crud_subscription
 from app.crud import user as crud_user
@@ -14,7 +15,12 @@ from app.crud.user import UserUpdate
 from app.schemas.billing import SubscriptionRead, SubscriptionUpdate
 from app.schemas.user import UserCreate, UserRead
 
-router = APIRouter(prefix="/users", tags=["users"])
+# Admin-only: managing users and changing tiers must not be self-service
+# (a regular user could otherwise PATCH their own subscription to enterprise).
+# Public signup goes through /auth/register; self profile through /auth/me.
+router = APIRouter(
+    prefix="/users", tags=["users"], dependencies=[Depends(require_admin)]
+)
 
 
 @router.post(

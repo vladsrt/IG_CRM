@@ -55,16 +55,30 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "backend/README.md",
+                "file": "FULL_STACK_PLAN.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "README"
+              "title": "FULL_STACK_PLAN"
+            }
+          },
+          {
+            "id": "29af54dfa0a2e20a",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "TODO PLAN.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "TODO PLAN"
             }
           }
         ],
-        "currentTab": 3
+        "currentTab": 4
       }
     ],
     "direction": "vertical"
@@ -226,26 +240,43 @@
       "bases:Create new base": false
     }
   },
-  "active": "192ff289638d4f60",
+  "active": "29af54dfa0a2e20a",
   "lastOpenFiles": [
+    "PRECALL_CHECKLIST.md.tmp.39009.c01bcebb214a",
+    "PRECALL_CHECKLIST.md",
+    "PRECALL_CHECKLIST.md.tmp.39009.abf08461b52a",
+    "IMPROVEMENTS.md",
+    "IMPROVEMENTS.md.tmp.39009.aaf287abd7d3",
+    "SECURITY_AUDIT.md",
+    "SECURITY_AUDIT.md.tmp.39009.5661b33eef8b",
+    "FULL_STACK_PLAN.md",
+    "TODO PLAN.md",
+    "DEPLOY_RUNBOOK.md.tmp.39009.ecfb4dc494a5",
+    "FULL_STACK_PLAN.md.tmp.39009.f4649b1a9c9e",
+    "FULL_STACK_PLAN.md.tmp.39009.b5afcadeba07",
+    "DEPLOY_RUNBOOK.md.tmp.39009.b1be844a8e3a",
+    "DEPLOY_RUNBOOK.md.tmp.39009.ba3b3cbd6dfb",
+    "DEPLOY_RUNBOOK.md.tmp.39009.694be4891f8b",
+    "DEPLOY_RUNBOOK.md",
+    "Ideas/Удаление нежелательный комментариев с видосов с помощью ИИ.md",
+    "frontend/README.md",
+    "frontend/frontend_api_docs.md",
+    "frontend/FRONTEND_ARCHITECTURE.md",
+    "project-index.md",
+    "backend/Backend (NOT DONE).md",
+    "WARMUP_AUDIT.md",
+    "WARMUP_FIX_PLAN.md",
+    "backend/README.md",
     "TESTS.md",
     "backend/STATS.md",
     "backend/worker-runbook.md",
-    "Ideas/Удаление нежелательный комментариев с видосов с помощью ИИ.md",
     "Ideas",
-    "project-index.md",
     "backend/api-reference.md",
     "backend/architecture-overview.md",
-    "backend/Backend (NOT DONE).md",
     "backend/Backend (READY).md",
     "backend/backend-summary.md",
     "backend/JWT.md",
-    "backend/README.md",
     "backend/security-auth.md",
-    "frontend/ARCHITECTURE.md",
-    "frontend/frontend_api_docs.md",
-    "frontend/README.md",
-    "backend",
-    "frontend"
+    "frontend/ARCHITECTURE.md"
   ]
 }

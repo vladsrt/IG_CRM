@@ -44,6 +44,11 @@ class AssetRead(AssetBase):
     id: uuid.UUID
     user_id: uuid.UUID
     created_at: datetime
+    # Read the ORM column `metadata_` (NOT `metadata`, which is SQLAlchemy's
+    # MetaData object on the mapped class) and serialize it back as "metadata".
+    metadata_: dict[str, Any] | None = Field(
+        default=None, validation_alias="metadata_", serialization_alias="metadata"
+    )
 
 
 class UniqueizeRequest(BaseModel):

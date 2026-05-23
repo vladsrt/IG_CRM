@@ -116,6 +116,72 @@ def _arm_file_upload(browser: InstagramBrowser, abs_path: str) -> None:
     logger.info("[upload] file-dialog interception armed for %s", abs_path)
 
 
+def _log_visible_clickables(page: Any, limit: int = 40) -> None:
+    """Dump text/aria-label of visible clickable elements — invaluable when a
+    button can't be found, since IG's class names are obfuscated and dynamic."""
+    try:
+        eles = page.eles(
+            'xpath://*[@role="button" or @role="link" or self::button]', timeout=2
+        )
+    except Exception as exc:
+        logger.warning("[upload][diag] could not enumerate clickables: %s", exc)
+        return
+    found: list[str] = []
+    for e in eles:
+        try:
+            txt = (e.text or "").strip().replace("\n", " ")
+            aria = e.attr("aria-label") or ""
+            if txt or aria:
+                found.append(f"{txt[:40]!r}{(' aria=' + aria[:30]) if aria else ''}")
+        except Exception:
+            continue
+        if len(found) >= limit:
+            break
+    logger.warning(
+        "[upload][diag] %d visible clickables: %s", len(found), " | ".join(found)
+    )
+
+
+def _dismiss_dialog_nags(page: Any) -> None:
+    """Dismiss in-dialog INFO modals (e.g. 'Video posts are now shared as reels')
+    by clicking their explicit button ONLY. Never backdrop-click or ESC inside
+    the Create dialog — that closes it and triggers a 'Discard post?' prompt."""
+    for txt in ("OK", "Not Now", "Not now", "Continue"):
+        try:
+            if page.ele(f'xpath://button[normalize-space()="{txt}"]', timeout=0.6):
+                safe_coordinate_click(
+                    page, f'xpath://button[normalize-space()="{txt}"]', timeout=2,
+                )
+                time.sleep(0.8)
+        except Exception:
+            continue
+
+
+def _cancel_discard_if_present(page: Any) -> bool:
+    """If a 'Discard post?' modal is up, STAY in the flow by clicking Cancel /
+    Keep editing — NOT 'Discard' (which would abandon the upload)."""
+    try:
+        has_discard = page.ele(
+            'xpath://*[contains(normalize-space(),"Discard")]', timeout=0.8
+        )
+    except Exception:
+        has_discard = None
+    if not has_discard:
+        return False
+    for txt in ("Cancel", "Keep editing", "Keep"):
+        try:
+            if page.ele(f'xpath://button[normalize-space()="{txt}"]', timeout=0.6):
+                logger.info("[upload] Discard prompt — staying via %r", txt)
+                safe_coordinate_click(
+                    page, f'xpath://button[normalize-space()="{txt}"]', timeout=2,
+                )
+                time.sleep(1.0)
+                return True
+        except Exception:
+            continue
+    return False
+
+
 # steps
 def _navigate_home(browser: InstagramBrowser, behavior: HumanBehaviorEngine) -> None:
     browser.page.get(_HOME_URL)
@@ -165,20 +231,31 @@ def _open_create_dialog_via_left_rail(
         )
 
     # Optional Post / Reel / Story submenu — click "Post" if it shows.
+    # Newer IG: dropdown is a fixed-position panel of plain <div>/<span> elements
+    # with NO aria roles. The ONLY reliable way: find the <span> with exact
+    # text "Post" that appeared AFTER the Create click, then click its parent.
     submenu_post = _find_first(
         browser.page,
         [
-            'xpath://*[@role="menuitem"][.//span[normalize-space()="Post"]]',
+            # Most reliable: <span> with exact text "Post" (the label in the dropdown)
             'xpath://span[normalize-space()="Post"]',
+            # Fallback: any element containing just "Post" text in the dropdown area
+            'xpath://div[@data-visualcompletion]/descendant::span[normalize-space()="Post"]',
+            # Old IG: <a role="link"> or <div role="menuitem">
+            'xpath://a[@role="link"][contains(.,"Post")]',
+            'xpath://*[@role="menuitem"][.//span[normalize-space()="Post"]]',
         ],
-        timeout=3.0,
+        timeout=4.0,
     )
     if submenu_post is not None:
         try:
-            behavior.safe_click(submenu_post)
-            behavior.idle(0.5, 1.1)
+            # Click the element itself — IG's React handles the click on the span directly
+            submenu_post.click(by_js=True)
         except Exception as exc:
-            logger.debug("[upload] submenu Post click failed (%s); ignoring", exc)
+            # Fallback: coordinate click
+            logger.debug("[upload] Post submenu JS click failed (%s); using coordinate click", exc)
+            safe_coordinate_click(browser.page, 'xpath://span[normalize-space()="Post"]')
+        behavior.idle(0.8, 1.6)
 
     if not _wait_for_create_modal(browser, timeout_s=10.0):
         raise UploadActionError(
@@ -412,11 +489,11 @@ def _wait_for_completion(browser: InstagramBrowser, timeout_s: float) -> str:
 def _click_done(
     browser: InstagramBrowser, behavior: HumanBehaviorEngine
 ) -> None:
-    """click done."""
+    """click done — same pattern as Next: JS-click avoids scroll side effects."""
     done_btn = _find_first(
         browser.page,
         [
-            'xpath://div[@role="button" and normalize-space()="Done"]',
+            'xpath://div[@role="button"][normalize-space()="Done"]',
             'xpath://button[normalize-space()="Done"]',
             'css:div[role="button"]:has-text("Done")',
         ],
@@ -426,9 +503,17 @@ def _click_done(
         logger.info("[upload] no Done button to dismiss (modal probably auto-closed)")
         return
     try:
-        behavior.safe_click_button(done_btn)
+        done_btn.click(by_js=True)
+        logger.info("[upload] Done clicked via JS")
     except Exception as exc:
-        logger.debug("[upload] Done click failed (%s); ignoring", exc)
+        logger.debug("[upload] Done JS-click failed (%s); trying coordinate", exc)
+        try:
+            x, y = done_btn.rect.midpoint
+            browser.page.actions.move_to((x, y))
+            time.sleep(0.2)
+            browser.page.actions.click()
+        except Exception as exc2:
+            logger.debug("[upload] Done coordinate click also failed (%s); ignoring", exc2)
 
 
 # main entry point
@@ -488,25 +573,52 @@ def execute_upload(
             "[upload] post-home dismiss_interruptions raised (%s); continuing", exc
         )
 
-    # Step 1: Open the create modal
-    logger.info("[upload] step 1: Click Create (verified)")
-    _VERIFY_CREATE_MODAL = (
-        'xpath://div[@role="heading" and contains(.,"Create new post")]'
-    )
-    try:
-        safe_coordinate_click(
-            page,
-            'css:svg[aria-label="New post"]',
-            timeout=10,
-            verify_locator=_VERIFY_CREATE_MODAL,
-            max_retries=3,
-            verify_timeout=5.0,
+    # Step 1: open Create, then choose "Post"
+    # Newer IG: the left-rail "New post" opens a Post/Reel/Story dropdown — you
+    # must click "Post" first. The real clickable is the <a role="link" href="#">
+    # that WRAPS the "Post" <span> (the span itself has no click handler), so we
+    # coordinate-click the anchor and verify the modal. Older IG opens it directly.
+    logger.info("[upload] step 1: Create → Post")
+
+    if not safe_coordinate_click(page, 'css:svg[aria-label="New post"]', timeout=12):
+        logger.info("[upload] 'New post' svg click failed — trying left-rail hover")
+        if not behavior.navigate_left_rail("create"):
+            _log_visible_clickables(page)
+            raise UploadActionError("Step 1 FAILED: could not click Create (New post)")
+    behavior.idle(0.9, 1.6)
+
+    if _wait_for_create_modal(browser, timeout_s=3.0):
+        logger.info("[upload] Create modal opened directly (no submenu)")
+    else:
+        # coordinate-click "Post" via the wrapping anchor; verify the modal opened
+        _select_from_computer = (
+            'xpath://button[normalize-space()="Select from computer"]'
         )
-    except ClickVerificationError:
-        raise UploadActionError(
-            "Step 1 FAILED: clicked 'New post' but 'Create new post' modal "
-            "never appeared after 3 retries"
-        )
+        post_locators = [
+            'xpath://a[@role="link" and @href="#"][.//span[normalize-space()="Post"]]',
+            'xpath://a[@role="link"][.//span[normalize-space()="Post"]]',
+            'xpath://span[normalize-space()="Post"]/ancestor::a[1]',
+            'xpath://div[@role="button"][.//span[normalize-space()="Post"]]',
+            'xpath://*[@role="menuitem"][.//span[normalize-space()="Post"]]',
+            'xpath://span[normalize-space()="Post"]',
+        ]
+        clicked = False
+        for loc in post_locators:
+            if safe_coordinate_click(
+                page, loc, timeout=5,
+                verify_locator=_select_from_computer,
+                verify_timeout=5.0, max_retries=2,
+            ):
+                logger.info("[upload] 'Post' selected via %s", loc)
+                clicked = True
+                break
+            logger.debug("[upload] Post locator failed/unverified: %s", loc)
+        if not clicked and not _wait_for_create_modal(browser, timeout_s=4.0):
+            _log_visible_clickables(page)
+            raise UploadActionError(
+                "Step 1 FAILED: clicked Create but could not select 'Post' / reach "
+                "the Create modal — see the [upload][diag] clickable dump above"
+            )
     behavior.idle(1.0, 2.0)
 
     # Step 2: Set up native file upload and click select
@@ -520,14 +632,10 @@ def execute_upload(
     # IG processes the upload client-side before the crop UI appears.
     behavior.idle(*_FILE_UPLOAD_PROCESSING_S)
 
-    # Sweep — fresh accounts hit a "Video posts are now shared as
-    # reels" informational modal right after upload processing.
-    try:
-        behavior.dismiss_interruptions()
-    except Exception as exc:
-        logger.debug(
-            "[upload] post-processing dismiss raised (%s); continuing", exc,
-        )
+    # Fresh accounts hit a "Video posts are now shared as reels" info modal
+    # right after upload. Dismiss it by its OK button only — NOT backdrop/ESC
+    # (those close the Create dialog and trigger a Discard prompt).
+    _dismiss_dialog_nags(page)
 
     # Step 3-4: Crop to original if needed
     logger.info("[upload] step 3: Click Crop icon")
@@ -540,58 +648,53 @@ def execute_upload(
             logger.warning("[upload] 'Original' not found — leaving default AR")
         behavior.idle(0.5, 1.0)
 
-    # Step 5: Advance past crop screen
-    logger.info("[upload] step 5: Click Next (post-crop, verified)")
-    _VERIFY_POST_CROP = (
-        'xpath://div[@role="heading" and ('
-        'contains(.,"Edit") or contains(.,"Filter") or '
-        'contains(.,"Cover photo") or contains(.,"Adjustments")'
-        ')]'
-    )
-    try:
-        safe_coordinate_click(
-            page,
-            't:div@text()=Next',
-            timeout=10,
-            verify_locator=_VERIFY_POST_CROP,
-            max_retries=3,
-            verify_timeout=5.0,
-        )
-    except ClickVerificationError:
-        raise UploadActionError(
-            "Step 5 FAILED: clicked 'Next' but did not advance past crop "
-            "screen (no Edit/Filter/Cover heading found)"
-        )
-    behavior.idle(*_AFTER_NEXT_PAUSE_S)
+    # ── Step 5: Advance crop → edit → caption (two "Next" clicks) ──
+    # The reel flow is: crop (Next) → edit/audio (Next) → caption (Share).
+    # Next is a small <div role="button">Next</div> top-right. We COORDINATE-click
+    # it (real mouse — IG ignores JS clicks on these), and if a "Discard post?"
+    # prompt slips in we click Cancel to STAY (never Discard). The caption editor
+    # appearing is the signal we've arrived.
+    logger.info("[upload] step 5: crop → caption (coordinate Next)")
 
-    # Step 6-7: Next past filters to caption screen
-    logger.info("[upload] step 6-7: Click Next to caption (verified)")
-    _VERIFY_CAPTION_SCREEN = 'css:div[aria-label="Write a caption..."]'
-    page.wait(2.0)  # Let React render the optional panel
+    _CAPTION_SEL = 'css:div[aria-label="Write a caption..."]'
+    _NEXT_LOCATORS = [
+        'xpath://div[@role="button"][normalize-space()="Next"]',
+        't:div@text()=Next',
+        'xpath://button[normalize-space()="Next"]',
+    ]
 
-    # Try clicking Next — if it's there, we need it. If not, we might
-    # already be on the caption screen.
-    try:
-        safe_coordinate_click(
-            page,
-            't:div@text()=Next',
-            timeout=6,
-            verify_locator=_VERIFY_CAPTION_SCREEN,
-            max_retries=3,
-            verify_timeout=5.0,
-        )
-    except ClickVerificationError:
-        # Next was clicked but caption didn't appear — fatal desync.
-        raise UploadActionError(
-            "Step 7 FAILED: clicked 'Next' but caption textarea never appeared"
-        )
+    for click_num in range(1, 5):
+        # arrived?
+        if _find_first(page, [_CAPTION_SEL], timeout=1.0) is not None:
+            break
 
-    # Double-check: even if we didn't click Next (it wasn't there),
-    # the caption box MUST be visible before we proceed.
-    caption_box = _find_first(page, [_VERIFY_CAPTION_SCREEN], timeout=5.0)
+        _cancel_discard_if_present(page)   # stay in the flow if a prompt slipped in
+        _dismiss_dialog_nags(page)         # OK/Not Now info modals (no backdrop/ESC)
+
+        logger.info("[upload] clicking Next #%d (coordinate)", click_num)
+        clicked = False
+        for loc in _NEXT_LOCATORS:
+            if safe_coordinate_click(page, loc, timeout=4, max_retries=2):
+                clicked = True
+                break
+        if not clicked:
+            logger.debug("[upload] Next not found/clickable on attempt %d", click_num)
+
+        time.sleep(2.5)
+        _cancel_discard_if_present(page)
+        _dismiss_dialog_nags(page)
+
+        if _find_first(page, [_CAPTION_SEL], timeout=2.0) is not None:
+            logger.info("[upload] caption screen reached after %d Next click(s)", click_num)
+            break
+
+    # Final guard — caption editor MUST be visible now
+    caption_box = _find_first(page, [_CAPTION_SEL], timeout=4.0)
     if caption_box is None:
+        _log_visible_clickables(page)
         raise UploadActionError(
-            "Step 7 GUARD FAILED: caption textarea not visible — UI is desynchronized"
+            "Step 5 FAILED: caption textarea not visible after Next — see the "
+            "[upload][diag] clickable dump to identify the current screen"
         )
     logger.info("[upload] caption screen confirmed visible")
     behavior.idle(*_AFTER_NEXT_PAUSE_S)
@@ -599,7 +702,7 @@ def execute_upload(
     # Step 8: Write caption
     logger.info("[upload] step 8: Write Caption")
     if caption:
-        if not safe_coordinate_click(page, _VERIFY_CAPTION_SCREEN, timeout=5):
+        if not safe_coordinate_click(page, _CAPTION_SEL, timeout=5):
             raise UploadActionError("Caption editor click failed")
         behavior.idle(0.3, 0.7)
         page.actions.type(caption)
@@ -667,10 +770,9 @@ def execute_upload(
     logger.info("[upload] step 11: Click Share (verified)")
     page.wait(2.0)  # Mandatory pre-wait for React state
 
-    try:
-        behavior.dismiss_interruptions()
-    except Exception as exc:
-        logger.debug("[upload] pre-Share dismiss raised (%s); continuing", exc)
+    # safe in-dialog dismiss only (no backdrop/ESC — would close the dialog)
+    _cancel_discard_if_present(page)
+    _dismiss_dialog_nags(page)
 
     # Verification: the post/reel shared confirmation or the Share
     # button disappearing (which means IG accepted and is processing).

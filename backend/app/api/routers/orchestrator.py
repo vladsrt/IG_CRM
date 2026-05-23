@@ -9,11 +9,13 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.api.dependencies import get_current_user
 from app.core.database import get_db
 from app.crud import account as crud_account
 from app.crud import task as crud_task
 from app.models.account import InstagramAccount
 from app.models.task import Task, TaskStatus
+from app.models.user import User
 from app.schemas.orchestrator import (
     FanOutDispatchedTask,
     FanOutResponse,
@@ -60,10 +62,11 @@ class DispatchResponse(BaseModel):
 )
 def trigger_account_validation(
     account_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> DispatchResponse:
     account = crud_account.get_account(db, account_id)
-    if account is None:
+    if account is None or account.user_id != current_user.id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="InstagramAccount not found",
@@ -91,10 +94,16 @@ _DISPATCHABLE_STATUSES: frozenset[str] = frozenset(
 )
 def trigger_task_start(
     task_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> DispatchResponse:
     task = crud_task.get_task(db, task_id)
     if task is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
+        )
+    owner = crud_account.get_account(db, task.account_id)
+    if owner is None or owner.user_id != current_user.id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
         )
@@ -134,18 +143,19 @@ def trigger_task_start(
 def _resolve_target_accounts(
     db: Session,
     request: FanOutTaskRequest,
+    user_id: uuid.UUID,
 ) -> tuple[dict[uuid.UUID, InstagramAccount], list[uuid.UUID]]:
     """Returns (resolved_by_id, missing_explicit_ids).
 
-    We use dict[id, account] (not a set) so dedupe is O(1) and iteration order
-    stays stable. Tag matches go first, then the explicit ids.
+    Scoped to the caller: tag matches and explicit ids only resolve to
+    accounts owned by ``user_id``. Tag matches go first, then explicit ids.
     """
     resolved: dict[uuid.UUID, InstagramAccount] = {}
 
     if request.plan.target_tags:
         try:
             tag_accounts = crud_account.list_accounts_by_tags(
-                db, tags=request.plan.target_tags
+                db, tags=request.plan.target_tags, user_id=user_id
             )
         except Exception as exc:
             logger.exception("[fan_out] tag query failed: %s", exc)
@@ -158,7 +168,7 @@ def _resolve_target_accounts(
         if acct_id in resolved:
             continue
         acct = crud_account.get_account(db, acct_id)
-        if acct is None:
+        if acct is None or acct.user_id != user_id:
             missing.append(acct_id)
         else:
             resolved.setdefault(acct.id, acct)
@@ -263,6 +273,7 @@ def _create_and_dispatch_one(
 )
 def fan_out_plan(
     request: FanOutTaskRequest,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> FanOutResponse:
     """Send the approved plan to every matching account.
@@ -291,8 +302,8 @@ def fan_out_plan(
             detail="Plan has no commands, nothing to dispatch.",
         )
 
-    # find target accounts
-    resolved, missing_explicit = _resolve_target_accounts(db, request)
+    # find target accounts (scoped to the caller)
+    resolved, missing_explicit = _resolve_target_accounts(db, request, current_user.id)
 
     if not resolved:
         raise HTTPException(

@@ -11,10 +11,14 @@ from pydantic import BaseModel, ConfigDict
 class DashboardResponse(BaseModel):
     """Aggregated totals across the authenticated user's account fleet."""
 
-    total_accounts: int
+    accounts_total: int
+    accounts_active: int
+    accounts_checkpoint: int
     total_followers: int
     total_reel_views: int
-    total_tasks_running: int
+    tasks_running: int
+    tasks_completed_24h: int
+    tasks_failed_24h: int
 
 
 class AccountMetricRead(BaseModel):

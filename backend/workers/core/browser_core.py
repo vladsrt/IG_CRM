@@ -268,21 +268,66 @@ class InstagramBrowser:
         except Exception as exc:
             print(f"[!] Could not set --no-proxy-server flag: {exc}")
 
+    @staticmethod
+    def _sanitize_cookie(raw: Dict) -> Dict | None:
+        """Normalize an exported cookie into something CDP Network.setCookie
+        accepts. Browser-extension exports (Cookie-Editor etc.) carry fields CDP
+        rejects: sameSite='no_restriction', expirationDate, hostOnly,
+        firstPartyDomain, partitionKey, storeId. We keep only the valid subset.
+        """
+        name = raw.get("name")
+        if not name:
+            return None
+        out: Dict = {
+            "name": name,
+            "value": raw.get("value") or "",
+            "path": raw.get("path") or "/",
+        }
+        if raw.get("domain"):
+            out["domain"] = raw["domain"]
+        if "secure" in raw:
+            out["secure"] = bool(raw["secure"])
+        if "httpOnly" in raw:
+            out["httpOnly"] = bool(raw["httpOnly"])
+        # sameSite: CDP wants Strict/Lax/None; exports use no_restriction/lax/...
+        ss = {"no_restriction": "None", "none": "None", "lax": "Lax",
+              "strict": "Strict"}.get(str(raw.get("sameSite", "")).lower())
+        if ss:
+            out["sameSite"] = ss
+            if ss == "None":
+                out["secure"] = True  # SameSite=None requires Secure
+        # expiry: accept expirationDate / expiry / expires
+        exp = raw.get("expirationDate") or raw.get("expiry") or raw.get("expires")
+        if exp:
+            try:
+                out["expires"] = float(exp)
+            except (TypeError, ValueError):
+                pass
+        return out
+
     def inject_cookies(self, cookies_list: List[Dict[str, str]]) -> None:
         """Set cookies in the browser. We navigate to the target domain first.
 
-        Args:
-            cookies_list: list of cookie dicts.
+        Each cookie is sanitized for CDP and injected independently, so one bad
+        cookie can't abort the whole session.
         """
         print("[*] Navigating to robots.txt to set domain context...")
         self.page.get("https://www.instagram.com/robots.txt")
         time.sleep(2)
 
         print("[*] Injecting session cookies...")
-        for cookie in cookies_list:
-            self.page.set.cookies(cookie)
+        injected = 0
+        for raw in cookies_list:
+            clean = self._sanitize_cookie(raw)
+            if clean is None:
+                continue
+            try:
+                self.page.set.cookies(clean)
+                injected += 1
+            except Exception as e:
+                print(f"[!] Skipped cookie {clean.get('name')!r}: {e}")
 
-        print(f"[*] Injected {len(cookies_list)} cookies.")
+        print(f"[*] Injected {injected}/{len(cookies_list)} cookies.")
         time.sleep(2)
 
     def close(self) -> None:

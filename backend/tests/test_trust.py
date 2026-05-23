@@ -52,7 +52,7 @@ class TestTrustFailures:
 
         assert report.proxy_ok is False
         assert report.score == USER_AGENT_WEIGHT + HYGIENE_WEIGHT  # 25 + 15 = 40
-        assert report.score < DEFAULT_MIN_TRUST_SCORE
+        assert report.score < 50  # below production threshold (independent of .env)
         assert report.passed is False
         assert any("no proxy" in reason.lower() for reason in report.reasons)
 

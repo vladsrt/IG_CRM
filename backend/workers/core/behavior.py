@@ -8,6 +8,7 @@ speed, and human-like pauses.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import random
@@ -291,9 +292,14 @@ class HumanBehaviorEngine:
             'xpath://nav//span[normalize-space()="Home"]',
         ],
         "profile": [
+            # profile picture inside nav link
             'xpath://nav//a[@role="link"][.//img[contains(@alt," profile picture")]]',
+            # profile picture img (alt ends with "profile picture")
             'css:nav img[alt$=" profile picture"]',
+            # "Profile" text label in left rail
             'xpath://nav//span[normalize-space()="Profile"]',
+            # Fallback: last link in nav (profile is usually last)
+            'xpath:(//nav//a)[last()]',
         ],
         "explore": [
             'xpath://a[contains(@href,"/explore/")]',
@@ -1162,6 +1168,193 @@ def _ensure_clickable(ele: Any) -> Any:
 # same source of truth. STRICTLY no class-hash selectors (``_a9--``,
 # etc.) — IG rotates those every few months and any locator that
 # depends on them rots fast.
+
+
+# ── Warmup 3.0 helpers (importable from behavior, no engine required) ──
+
+def has_dialog(page: Any) -> bool:
+    """Return True if a ``<div role="dialog">`` is present in the DOM.
+
+    Uses a single fast JS query — much cheaper than a full modal sweep.
+    ``page.run_js`` returns native Python bool, not a string.
+    """
+    try:
+        return page.run_js("return !!document.querySelector('div[role=\"dialog\"]')") is True
+    except Exception:
+        return False
+
+
+def quick_sweep(page: Any) -> int:
+    """Dismiss modals only when a dialog is actually present.
+
+    If no dialog is in the DOM, return 0 immediately. Otherwise run the
+    full 3-layer dismissal with short per-selector timeouts suitable
+    for in-loop usage. Saves ~5-7 s per call compared to always running
+    the full sweep.
+    """
+    if not has_dialog(page):
+        return 0
+    return dismiss_instagram_modals(
+        page,
+        per_selector_timeout_s=0.3,
+        max_dismissals=2,
+    )
+
+
+def find_visible_comment_svg(page: Any) -> Any | None:
+    """Return a ``Comment`` SVG that is inside the viewport.
+
+    DrissionPage's .eles() returns elements in DOM order, which means
+    the **first** result is usually scrolled above the fold. We walk
+    the list and pick the first one whose ``y`` midpoint sits between
+    100 and (vh-100) px so we interact with the post the user is
+    actually looking at.
+    """
+    try:
+        vh = int(page.run_js("return window.innerHeight") or "900")
+    except Exception:
+        vh = 900
+    try:
+        all_svgs = list(page.eles('css:svg[aria-label="Comment"]', timeout=3) or [])
+    except Exception:
+        return None
+    for svg in all_svgs:
+        try:
+            y = svg.rect.midpoint[1]
+            if 100 < y < vh - 100:
+                return svg
+        except Exception:
+            continue
+    return all_svgs[-1] if all_svgs else None
+
+
+def find_visible_like_svg(page: Any, *, height: str = "24") -> Any | None:
+    """Return a ``Like`` SVG of *height* that sits inside the viewport.
+
+    Uses JS to reliably read SVG attributes (DrissionPage's ``attr()``
+    sometimes returns empty strings for SVG height/fill).
+    """
+    try:
+        vh = int(page.run_js("return window.innerHeight") or "900")
+    except Exception:
+        vh = 900
+    try:
+        all_svgs = list(page.eles('css:svg[aria-label="Like"]', timeout=3) or [])
+    except Exception:
+        return None
+    for svg in all_svgs:
+        try:
+            # Read height via JS — the ONLY reliable way with DrissionPage
+            h = page.run_js(
+                "var e=document.evaluate("
+                f"'//svg[@aria-label=\"Like\" and @height=\"{height}\"]',"
+                "document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null"
+                ").singleNodeValue;"
+                "return e ? e.getBoundingClientRect().y : -1"
+            )
+            # If JS found the element and it's in the viewport
+            try:
+                h_int = int(h) if isinstance(h, str) else (h if isinstance(h, int) else -1)
+            except (ValueError, TypeError):
+                continue
+            if 50 < h_int < vh - 50:
+                # Now find the actual DrissionPage element at this position
+                y = svg.rect.midpoint[1]
+                if 50 < y < vh - 50:
+                    return svg
+        except Exception:
+            continue
+    return None
+
+
+def find_comment_hearts_in_dialog(page: Any) -> list[dict]:
+    """Return coordinates of un-liked comment hearts inside the open dialog.
+
+    Uses a single-line JS call that is robust across DrissionPage's
+    run_js quirks.  Only returns hearts with ``height=\"12\"`` and
+    ``aria-label=\"Like\"`` (NOT already liked).
+    """
+    try:
+        raw = page.run_js(
+            "return JSON.stringify("
+            "Array.from(document.querySelector('div[role=\"dialog\"]')"
+            "?.querySelectorAll('svg[aria-label=\"Like\"]')||[])"
+            ".filter(h=>h.getAttribute('height')==='12')"
+            ".map(h=>{var r=h.getBoundingClientRect();"
+            "return{x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)};})"
+            ");"
+        )
+        if isinstance(raw, str) and raw:
+            return json.loads(raw)
+        return []
+    except Exception:
+        return []
+
+
+def verify_like_worked(page: Any, *, timeout: float = 3.0) -> bool:
+    """Return True if a like took effect.
+
+    Instagram flips ``aria-label`` from ``"Like"`` to ``"Unlike"`` AND
+    adds a red ``fill`` (e.g. ``"#ff3040"``).  Either signal is sufficient.
+    We check both because sometimes React batches the aria-label update
+    behind the fill change.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            # Check aria-label swap (most reliable)
+            r = page.run_js(
+                "return !!document.querySelector('svg[aria-label=\"Unlike\"]')"
+            )
+            if r is True:
+                return True
+            # Check fill change as fallback (red heart = liked)
+            r2 = page.run_js(
+                "var s=document.querySelector('svg[aria-label=\"Like\"]');"
+                "return !!(s && (s.getAttribute('fill')||'').includes('ff3040'));"
+            )
+            if r2 is True:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.3)
+    return False
+
+
+def verify_dialog_opened(page: Any, *, timeout: float = 5.0) -> bool:
+    """Return True when a ``<div role=\"dialog\">`` contains ``<ul><li>``.
+
+    Waits up to *timeout* seconds for the dialog to render and populate
+    with comment items.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            r = page.run_js(
+                "var d=document.querySelector('div[role=\"dialog\"]');"
+                "return !!(d && d.querySelector('ul li'));"
+            )
+            if r is True:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def verify_reel_changed(page: Any, *, prev_url: str | None = None) -> bool:
+    """Return True when the Reels URL changed (i.e. we moved to another reel).
+
+    If *prev_url* is None we snapshot the current URL and return False
+    (caller should call again after the scroll/click to compare).
+    """
+    try:
+        current = (page.run_js("return window.location.href") or "").strip()
+    except Exception:
+        return False
+    if prev_url is None:
+        return False
+    return bool(current) and current != prev_url
 _MODAL_DISMISS_SELECTORS: Tuple[str, ...] = (
     # "Not Now" — Turn on Notifications, Save login info?, etc.
     't:button@text()=Not Now',

@@ -27,6 +27,10 @@ def _patch_session_factory(mocker, *, fake_task, fake_account, sibling=None):
         ],
     )
     mocker.patch("app.workers.celery_tasks.SessionLocal", return_value=cm)
+    # The Phase-4 agent/capacity gate opens its own SessionLocal + queries; it
+    # has its own tests (test_security.py). Neutralize it here so it doesn't
+    # consume this mock's execute sequence meant for the lock flow.
+    mocker.patch("app.workers.celery_tasks._check_agent_and_capacity_gate")
     return cm, db
 
 
@@ -237,6 +241,8 @@ class TestLockContention:
             execute_results=[OperationalError("SELECT FOR UPDATE", {}, Exception("locked"))],
         )
         mocker.patch("app.workers.celery_tasks.SessionLocal", return_value=cm)
+        # neutralize the Phase-4 gate so it doesn't consume the lock-flow mock
+        mocker.patch("app.workers.celery_tasks._check_agent_and_capacity_gate")
 
         executor_class = mocker.patch(
             "app.workers.celery_tasks.TaskExecutor"

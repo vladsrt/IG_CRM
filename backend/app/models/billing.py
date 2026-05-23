@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -31,9 +31,14 @@ class Subscription(Base):
         unique=True,  # one user, one active subscription
     )
     tier: Mapped[str] = mapped_column(
-        String(50), 
-        nullable=False, 
+        String(50),
+        nullable=False,
         default="free",  # free, pro, enterprise
+    )
+    # Admin-set override for parallel agent slots. NULL = derive from tier.
+    agents_limit: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
     )
     valid_until: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),

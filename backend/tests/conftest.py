@@ -127,19 +127,56 @@ def failing_trust_report(reason: str = "proxy probe failed"):
     )
 
 
+# keep the trust gate at the production default during tests, independent of
+# whatever MIN_TRUST_SCORE is set in backend/.env (it may be 0 for live testing).
+@pytest.fixture(autouse=True)
+def _stable_trust_threshold(monkeypatch):
+    from app.core.config import settings
+    from app.services import trust
+    monkeypatch.setattr(settings, "MIN_TRUST_SCORE", 50, raising=False)
+    # the module constant is snapshotted at import; patch it too for tests that
+    # compare against it directly.
+    monkeypatch.setattr(trust, "DEFAULT_MIN_TRUST_SCORE", 50, raising=False)
+
+
+# a stand-in authenticated user for route tests (routers now require JWT auth)
+def make_fake_user(**overrides: Any) -> SimpleNamespace:
+    base: dict[str, Any] = dict(
+        id=uuid.uuid4(),
+        email="tester@example.com",
+        created_at=None,
+        subscription=SimpleNamespace(tier="enterprise", agents_limit=None),
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
 # fastapi test client
 @pytest.fixture
-def client():
-    """test client with fake db."""
+def current_user():
+    """The fake user injected into protected routes by the `client` fixture."""
+    return make_fake_user()
+
+
+@pytest.fixture
+def client(current_user):
+    """Test client with a fake db AND a logged-in user.
+
+    Routers are JWT-protected now, so we override get_current_user /
+    require_admin to bypass token checks and inject `current_user`.
+    """
     from fastapi.testclient import TestClient
 
     from app.api.main import app
+    from app.api.dependencies import get_current_user, require_admin
     from app.core.database import get_db
 
     def _fake_get_db():
         yield MagicMock(name="RouteDBSession")
 
     app.dependency_overrides[get_db] = _fake_get_db
+    app.dependency_overrides[get_current_user] = lambda: current_user
+    app.dependency_overrides[require_admin] = lambda: current_user
     try:
         yield TestClient(app)
     finally:
