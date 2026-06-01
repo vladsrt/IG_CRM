@@ -54,8 +54,17 @@ Rules:
 7. Populate `target_tags` (lowercase single words) ONLY when the operator
    groups accounts by attribute ("all my crypto accounts" -> ["crypto"]).
    Otherwise use an empty list.
-8. CLARIFICATION (most important): if the request is ambiguous or missing info
-   you need (upload with no file, "post to my accounts" with no tag/target, a
+8. MEDIA REFERENCES (CRITICAL): for upload_reels / upload_post / upload_story
+   you MUST reference media by `media_asset_id` (a UUID from the inventory the
+   user message provides), NEVER invent a `file_path`. The orchestrator will
+   resolve the id to a per-account unique copy before dispatch.
+     - Example: {"key":"media_asset_id","value":"3f9b...-uuid"}
+     - If the operator names a file but it is not in the inventory, ASK for
+       clarification (do not guess an id).
+     - If the inventory is empty and the user asks for an upload, ASK them to
+       upload media first.
+9. CLARIFICATION (most important): if the request is ambiguous or missing info
+   you need (upload with no media, "post to my accounts" with no tag/target, a
    DM/comment with no text or recipient, any required arg you cannot infer):
      - set `clarification_needed` to ONE polite question ending in '?'
      - set `commands` to []
@@ -63,9 +72,9 @@ Rules:
      - still write `summary`.
    When the request is unambiguous, set `clarification_needed` to null and
    produce a complete `commands` list.
-9. If the request cannot be expressed with the available actions at all and no
-   clarification would help: empty `commands`, `clarification_needed` null,
-   explain why in `summary`.
+10. If the request cannot be expressed with the available actions at all and no
+    clarification would help: empty `commands`, `clarification_needed` null,
+    explain why in `summary`.
 
 The JSON object MUST have exactly these top-level keys:
   "summary" (string),
@@ -78,12 +87,13 @@ Example of a ready plan:
 {"summary":"Warm up crypto accounts then post the reel","priority":"high",
  "target_tags":["crypto"],"clarification_needed":null,
  "commands":[{"action":"warmup","args":[{"key":"duration_minutes","value":"15"}]},
- {"action":"upload_reels","args":[{"key":"file_path","value":"/media/r.mp4"},
- {"key":"caption","value":"gm"}]}]}
+ {"action":"upload_reels","args":[
+   {"key":"media_asset_id","value":"3f9b1c52-bb47-4a1f-9d20-6c4d8b1e9e10"},
+   {"key":"caption","value":"gm"}]}]}
 
 Example asking for clarification:
-{"summary":"Operator wants to post a reel but gave no file","priority":"normal",
- "target_tags":[],"clarification_needed":"Which video file should I post?",
+{"summary":"Operator wants to post a reel but no media is available","priority":"normal",
+ "target_tags":[],"clarification_needed":"Which video do you want me to post?",
  "commands":[]}
 """
 
@@ -163,15 +173,24 @@ class AIParser:
             raise AIParserError("Model returned an empty response")
         return content
 
-    def parse(self, user_prompt: str) -> ParsedTaskPlan:
-        """Turn user_prompt into a validated ParsedTaskPlan (one retry)."""
+    def parse(
+        self,
+        user_prompt: str,
+        media_inventory: str | None = None,
+    ) -> ParsedTaskPlan:
+        """Turn user_prompt into a validated ParsedTaskPlan (one retry).
+
+        media_inventory: optional pre-formatted listing of the caller's media
+        assets. Injected as a system message so the LLM can pick a real
+        media_asset_id instead of hallucinating a file path.
+        """
         if not user_prompt or not user_prompt.strip():
             raise AIParserError("user_prompt must not be empty")
 
-        messages: list[dict] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt.strip()},
-        ]
+        messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        if media_inventory:
+            messages.append({"role": "system", "content": media_inventory})
+        messages.append({"role": "user", "content": user_prompt.strip()})
 
         last_error: Exception | None = None
         for attempt in range(2):
