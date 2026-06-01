@@ -157,6 +157,9 @@ CAPACITY_CPU_PERCENT=85.0
 CAPACITY_RAM_PERCENT=85.0
 CAPACITY_MAX_BROWSERS=2
 
+# Server has no display — Chrome MUST run headless or it won't start.
+BROWSER_HEADLESS=true
+
 # ── trust gate (0 = accept any proxy; raise to 50 in prod once stable) ──
 MIN_TRUST_SCORE=0
 ALLOW_NO_PROXY=false

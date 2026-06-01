@@ -497,6 +497,9 @@ def run_instagram_task(self: CeleryTask, task_id: str) -> dict[str, Any]:
             "plan_summary": plan.get("summary"),
             "plan_priority": plan.get("priority"),
             "priority": task.priority,
+            # Drives browser_core's --headless=new flag. Comes from .env
+            # (BROWSER_HEADLESS) — must be True on a GUI-less server.
+            "headless": settings.BROWSER_HEADLESS,
         }
 
         # set RUNNING inside the locked tx, so a concurrent worker's sibling

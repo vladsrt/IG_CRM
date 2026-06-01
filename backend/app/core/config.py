@@ -68,6 +68,12 @@ class Settings(BaseSettings):
     CAPACITY_CPU_PERCENT: float = 85.0      # don't start a task above this CPU%
     CAPACITY_RAM_PERCENT: float = 85.0      # don't start a task above this RAM%
     CAPACITY_MAX_BROWSERS: int = 4          # global ceiling of our Chromium instances
+
+    # Run the browser in --headless=new mode by default. MUST be True on a
+    # GUI-less VPS / Docker container or Chrome refuses to start. Override
+    # to False only on a local dev machine when you want to watch the
+    # browser do its thing.
+    BROWSER_HEADLESS: bool = False
     # default parallel agent slots per tier (admin can override per-subscription)
     AGENTS_FREE: int = 1
     AGENTS_PRO: int = 5

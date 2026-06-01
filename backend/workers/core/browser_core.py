@@ -328,6 +328,21 @@ class InstagramBrowser:
             else:
                 self.co.headless(False)
 
+            # Server / container flags — apply when running as root.
+            # On a headless VPS or inside a Docker container the worker runs
+            # as root; Chrome's setuid sandbox doesn't work there and Chrome
+            # refuses to start without --no-sandbox. We also throw in
+            # --disable-dev-shm-usage as belt-and-suspenders even though our
+            # docker-compose already raises shm_size to 2gb.
+            try:
+                if os.geteuid() == 0:
+                    self.co.set_argument("--no-sandbox")
+                    self.co.set_argument("--disable-dev-shm-usage")
+                    print("[*] Detected root — added --no-sandbox + --disable-dev-shm-usage")
+            except Exception as exc:
+                # geteuid() doesn't exist on Windows; not our concern but be safe.
+                print(f"[*] could not detect euid ({exc}), skipping root flags")
+
             # launch the Page. this is the heavy step. if it raises after
             # the Chrome subprocess is spawned, the except branch below
             # cleans up the orphan via self.close().
