@@ -19,7 +19,7 @@ import socket
 import subprocess
 import sys
 import time
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from DrissionPage import ChromiumPage, ChromiumOptions
 
@@ -229,10 +229,6 @@ def dump_page_artifacts(page: Any, *, reason: str) -> str:  # type: ignore[no-un
             print(f"[!] could not write artifacts to {base}: {exc}", flush=True)
             continue
     return "(failed to write artifacts to any path)"
-
-
-# Any is forward-referenced — define before InstagramBrowser uses it.
-from typing import Any  # noqa: E402  (placement intentional)
 
 
 class InstagramBrowser:
