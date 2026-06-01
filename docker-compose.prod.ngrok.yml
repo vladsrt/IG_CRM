@@ -1,0 +1,128 @@
+# Production stack for hosts that can't forward port 80/443.
+#
+# Same as docker-compose.prod.yml but WITHOUT caddy — instead, ngrok runs on
+# the host (outside docker) and tunnels its public HTTPS URL to the api
+# container's port 8000, which is bound to 127.0.0.1 (loopback) for security.
+#
+# Bring up:
+#   docker compose -f docker-compose.prod.ngrok.yml up -d --build
+#
+# Then in a separate terminal / systemd unit:
+#   ngrok http --domain=<your-static-domain>.ngrok-free.app 8000
+#
+# DOMAIN in .env should be your ngrok static domain (without https://) — the
+# app uses it only for log lines / health checks, no SSL handshake on our side.
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: ig_crm_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ig_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-ig_crm}
+    volumes:
+      - ig_crm_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ig_user} -d ${POSTGRES_DB:-ig_crm}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: ig_crm_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ig_crm_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: ig_crm_migrate
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["sh", "-c", "uv run --no-sync python -m alembic -c alembic.ini upgrade head"]
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    image: ig_crm_backend:latest
+    container_name: ig_crm_api
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ig_crm_media:/app/media
+      - ig_crm_logs:/var/log/ig_crm
+    # Expose api on the host's loopback ONLY. ngrok runs on the host
+    # (outside docker) and tunnels this to its public HTTPS URL.
+    # External traffic from the public IP can NOT reach 127.0.0.1:8000 —
+    # only ngrok-tunneled requests do.
+    ports:
+      - "127.0.0.1:8000:8000"
+    command:
+      - "sh"
+      - "-c"
+      - "uv run --no-sync python -m uvicorn app.api.main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS:-1} --proxy-headers --forwarded-allow-ips=*"
+
+  worker:
+    image: ig_crm_backend:latest
+    container_name: ig_crm_worker
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      api:
+        condition: service_started
+    volumes:
+      - ig_crm_media:/app/media
+      - ig_crm_logs:/var/log/ig_crm
+    shm_size: "2gb"
+    command:
+      - "sh"
+      - "-c"
+      - "uv run --no-sync python -m celery -A app.core.celery_app.celery_app worker
+         --loglevel=info -Q ig_crm.default
+         --concurrency=${WORKER_CONCURRENCY:-2}
+         --include=app.workers.celery_tasks,app.workers.media_tasks"
+
+  beat:
+    image: ig_crm_backend:latest
+    container_name: ig_crm_beat
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      api:
+        condition: service_started
+    volumes:
+      - ig_crm_logs:/var/log/ig_crm
+      - ig_crm_beatdata:/var/lib/celerybeat
+    working_dir: /var/lib/celerybeat
+    command:
+      - "sh"
+      - "-c"
+      - "uv run --no-sync python -m celery -A app.core.celery_app.celery_app beat --loglevel=info"
+
+volumes:
+  ig_crm_pgdata:
+  ig_crm_redisdata:
+  ig_crm_media:
+  ig_crm_logs:
+  ig_crm_beatdata:
