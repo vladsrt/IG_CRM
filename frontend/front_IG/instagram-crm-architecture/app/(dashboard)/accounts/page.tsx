@@ -26,7 +26,12 @@ import { api, type Account, type Proxy, type CreateProxyPayload } from '@/lib/ap
 import { useAuth } from '@/lib/auth-context'
 import { cn } from '@/lib/utils'
 
-type ProxyProto = 'http' | 'https' | 'socks4' | 'socks5'
+// Only http/https are wired through the local pproxy auth-forwarder right
+// now (verified routes browser traffic with the proxy's exit IP). socks4/5
+// upstream paths exist in the schema but haven't been verified end-to-end —
+// hiding them from the UI prevents users from picking a protocol that may
+// silently leak the home IP.
+type ProxyProto = 'http' | 'https'
 
 interface FormState {
   username: string
@@ -402,7 +407,7 @@ export default function AccountsPage() {
                 <Select value={form.proxyProtocol} onValueChange={(v) => set({ proxyProtocol: v as ProxyProto })}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
-                    {(['http', 'https', 'socks4', 'socks5'] as ProxyProto[]).map((p) => <SelectItem key={p} value={p}>{p}</SelectItem>)}
+                    {(['http', 'https'] as ProxyProto[]).map((p) => <SelectItem key={p} value={p}>{p}</SelectItem>)}
                   </SelectContent>
                 </Select>
               </div>

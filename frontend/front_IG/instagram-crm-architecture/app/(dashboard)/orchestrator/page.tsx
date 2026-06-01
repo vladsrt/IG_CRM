@@ -19,7 +19,7 @@ import {
 } from '@/components/ui/sheet'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Users as UsersIcon, RotateCcw, Film } from 'lucide-react'
-import { api, type Account, type Asset, type ParsedTaskPlan, type FanOutResponse, type ActionArg } from '@/lib/api'
+import { api, type Account, type Asset, type ParsedTaskPlan, type FanOutResponse, type ActionArg, type Task } from '@/lib/api'
 import { cn } from '@/lib/utils'
 
 const INPUT_KEY = 'orch_input'
@@ -125,6 +125,110 @@ function CommandCard({
     </div>
   )
 }
+
+// ---- Live per-account dispatch panel ---------------------------------------
+// After Approve & Fan-Out, show each target account with a live status pill.
+// Polls /tasks every 3s while any row is still pending/running.
+function DispatchPanel({
+  result, accounts,
+}: { result: FanOutResponse; accounts: Account[] }) {
+  const [taskMap, setTaskMap] = useState<Record<string, Task>>({})
+
+  const dispatchedIds = result.dispatched.map((d) => d.task_id)
+
+  useEffect(() => {
+    if (dispatchedIds.length === 0) return
+    let cancelled = false
+
+    const fetchOnce = async () => {
+      try {
+        const all = await api.getTasks()
+        if (cancelled) return
+        const wanted = new Set(dispatchedIds)
+        const next: Record<string, Task> = {}
+        for (const t of all) if (wanted.has(t.id)) next[t.id] = t
+        setTaskMap(next)
+      } catch {
+        // best-effort: a single poll miss is fine
+      }
+    }
+
+    fetchOnce()
+    const id = window.setInterval(() => {
+      // stop polling once every dispatched task is in a terminal state
+      const stillBusy = dispatchedIds.some((tid) => {
+        const t = taskMap[tid]
+        return !t || t.status === 'pending' || t.status === 'running'
+      })
+      if (!stillBusy) return
+      fetchOnce()
+    }, 3000)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(id)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dispatchedIds.join(',')])
+
+  const acctById = (id: string) => accounts.find((a) => a.id === id)
+  const pill = (status: string | undefined) => {
+    if (!status) return <Badge variant="secondary">queued</Badge>
+    if (status === 'running') return <Badge className="bg-blue-500/15 text-blue-400 border-blue-500/30">running</Badge>
+    if (status === 'completed') return <Badge className="bg-success/15 text-success border-success/30">done</Badge>
+    if (status === 'failed') return <Badge variant="destructive">failed</Badge>
+    return <Badge variant="secondary">{status}</Badge>
+  }
+
+  return (
+    <div className="rounded-lg border border-border bg-card p-4 space-y-3">
+      <div className="flex items-center gap-2 text-success">
+        <Check className="w-4 h-4" />
+        <span className="font-medium">Dispatched to {result.dispatched_count} account(s)</span>
+      </div>
+
+      <div className="space-y-2">
+        {result.dispatched.map((d) => {
+          const acc = acctById(d.account_id)
+          const task = taskMap[d.task_id]
+          return (
+            <div key={d.task_id} className="flex items-center justify-between gap-3 rounded-md border border-border/60 bg-background/40 px-3 py-2">
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-medium text-foreground truncate">
+                  @{acc?.ig_username || d.account_id.slice(0, 8)}
+                </div>
+                {task?.error_log && (
+                  <div className="text-xs text-destructive truncate" title={task.error_log}>
+                    {task.error_log}
+                  </div>
+                )}
+              </div>
+              {pill(task?.status)}
+            </div>
+          )
+        })}
+
+        {result.skipped.map((s, i) => {
+          const acc = acctById(s.account_id)
+          return (
+            <div key={`skip-${i}`} className="flex items-center justify-between gap-3 rounded-md border border-border/60 bg-background/40 px-3 py-2">
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-medium text-foreground truncate">
+                  @{acc?.ig_username || s.account_id.slice(0, 8)}
+                </div>
+                <div className="text-xs text-muted-foreground truncate" title={s.reason}>
+                  {s.reason}
+                </div>
+              </div>
+              <Badge variant="secondary">skipped</Badge>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 
 // ---- Plan preview / editor -------------------------------------------------
 function TaskPlanPreview({
@@ -235,6 +339,36 @@ function TaskPlanPreview({
                 </div>
               </div>
             )}
+
+            {/* Resolved-target preview: which accounts the task will actually go to */}
+            {(() => {
+              const resolved =
+                targetMode === 'all'
+                  ? accounts
+                  : targetMode === 'select'
+                    ? accounts.filter((a) => selectedIds.has(a.id))
+                    : plan.target_tags.length > 0
+                      ? accounts.filter((a) => (a.tags || []).some((t) => plan.target_tags.includes(t.toLowerCase())))
+                      : []
+              if (resolved.length === 0) return null
+              return (
+                <div className="pt-2 border-t border-border/60 space-y-1.5">
+                  <div className="text-[11px] uppercase tracking-wide text-muted-foreground">
+                    Will dispatch to {resolved.length} account{resolved.length === 1 ? '' : 's'}
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {resolved.map((a) => (
+                      <span
+                        key={a.id}
+                        className="inline-flex items-center gap-1 rounded-full bg-secondary/70 border border-border px-2 py-0.5 text-[11px] text-foreground"
+                      >
+                        @{a.ig_username}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )
+            })()}
           </div>
 
           {/* Commands (editable) */}
@@ -272,29 +406,7 @@ function TaskPlanPreview({
           </div>
 
           {dispatchResult && (
-            <div className="rounded-lg border border-border bg-card p-4 space-y-3">
-              <div className="flex items-center gap-2 text-success">
-                <Check className="w-4 h-4" />
-                <span className="font-medium">Dispatched</span>
-              </div>
-              <div className="grid grid-cols-2 gap-4 text-sm">
-                <div>
-                  <span className="text-muted-foreground">Dispatched</span>
-                  <p className="text-foreground font-medium">{dispatchResult.dispatched_count} accounts</p>
-                </div>
-                <div>
-                  <span className="text-muted-foreground">Skipped</span>
-                  <p className="text-foreground font-medium">{dispatchResult.skipped_count} accounts</p>
-                </div>
-              </div>
-              {dispatchResult.skipped.length > 0 && (
-                <div className="text-xs text-muted-foreground">
-                  {dispatchResult.skipped.map((s, i) => (
-                    <div key={i}>· {s.reason}</div>
-                  ))}
-                </div>
-              )}
-            </div>
+            <DispatchPanel result={dispatchResult} accounts={accounts} />
           )}
         </div>
       </ScrollArea>
@@ -338,7 +450,7 @@ export default function OrchestratorPage() {
   const [dispatchResult, setDispatchResult] = useState<FanOutResponse | null>(null)
   const [accounts, setAccounts] = useState<Account[]>([])
   const [assets, setAssets] = useState<Asset[]>([])
-  const [targetMode, setTargetMode] = useState<TargetMode>('tags')
+  const [targetMode, setTargetMode] = useState<TargetMode>('select')
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [selectedMediaIds, setSelectedMediaIds] = useState<Set<string>>(new Set())
   const [sheetOpen, setSheetOpen] = useState(false)
@@ -391,7 +503,10 @@ export default function OrchestratorPage() {
         setCurrentPlan(null)
       } else {
         setCurrentPlan(plan)
-        setTargetMode(plan.target_tags.length > 0 ? 'tags' : 'all')
+        // Default to manual pick — safer than 'all' (the old default), which
+        // would fan-out to every account in the fleet on the first Approve.
+        // Only fall into 'tags' when the LLM actually grouped by tag.
+        setTargetMode(plan.target_tags.length > 0 ? 'tags' : 'select')
         addMessage(
           'assistant',
           `Plan ready: ${plan.commands.length} step(s)${
