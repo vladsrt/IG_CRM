@@ -85,8 +85,18 @@ else
 fi
 echo "==> updated DOMAIN in .env -> $NGROK_DOMAIN"
 
+# detect where ngrok actually landed. Debian apt repo puts it under
+# /usr/local/bin/ but other distros may use /usr/bin/. Hard-coding either
+# breaks systemd with status=203/EXEC when guessed wrong.
+NGROK_BIN="$(command -v ngrok || true)"
+if [[ -z "$NGROK_BIN" || ! -x "$NGROK_BIN" ]]; then
+    echo "!! ngrok binary not on PATH right after install — bailing." >&2
+    exit 1
+fi
+echo "==> ngrok binary: $NGROK_BIN"
+
 # ── systemd unit so ngrok restarts on reboot / crash ────────────────────
-cat > /etc/systemd/system/ngrok.service <<'EOF'
+cat > /etc/systemd/system/ngrok.service <<EOF
 [Unit]
 Description=ngrok tunnel for ig_crm_api (port 8000 -> public https)
 After=docker.service network-online.target
@@ -96,7 +106,7 @@ Wants=network-online.target
 Type=simple
 # Run as root because /etc/ngrok/ngrok.yml has chmod 600. Acceptable here
 # because ngrok itself is a single trusted binary.
-ExecStart=/usr/bin/ngrok start --all --config=/etc/ngrok/ngrok.yml --log=stdout --log-format=logfmt
+ExecStart=$NGROK_BIN start --all --config=/etc/ngrok/ngrok.yml --log=stdout --log-format=logfmt
 Restart=always
 RestartSec=5
 StandardOutput=append:/var/log/ngrok.log

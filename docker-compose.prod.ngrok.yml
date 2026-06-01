@@ -114,11 +114,16 @@ services:
     volumes:
       - ig_crm_logs:/var/log/ig_crm
       - ig_crm_beatdata:/var/lib/celerybeat
-    working_dir: /var/lib/celerybeat
+    # Stay in /app (the Dockerfile's WORKDIR) so `uv run` can find the
+    # project. The schedule file goes to the dedicated volume via --schedule.
+    # Previous attempt to set working_dir=/var/lib/celerybeat broke uv with
+    # "No module named celery" because uv lost the project context.
     command:
       - "sh"
       - "-c"
-      - "uv run --no-sync python -m celery -A app.core.celery_app.celery_app beat --loglevel=info"
+      - "uv run --no-sync python -m celery -A app.core.celery_app.celery_app beat
+         --loglevel=info
+         --schedule=/var/lib/celerybeat/celerybeat-schedule"
 
 volumes:
   ig_crm_pgdata:
