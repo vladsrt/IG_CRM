@@ -233,7 +233,33 @@ backend/browser_profiles/
 
 # System files for Mac/Windows (just in case)
 .DS_Store
-Thumbs.dbmedia/
+Thumbs.db
 media/
 runtime_proxy_plugin_*
+dp_proxy_ext_*
 .venv/
+.vercel
+
+# runtime artifacts
+backend/celerybeat-schedule*
+celerybeat-schedule*
+*.log
+logs/
+
+# local-only debug scripts
+research_*.py
+test_cli.py
+test_proxy.py
+
+# typescript build artifacts
+*.tsbuildinfo
+
+# editor/IDE
+.vscode/
+.idea/
+
+# secrets — NEVER commit real .env, only the .example template
+.env
+backend/.env
+!.env.example
+!.env.production.example
