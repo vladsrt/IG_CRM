@@ -39,9 +39,31 @@ echo "==> running migrations"
   echo "!! migrations failed"; exit 1; }
 
 echo "==> starting api + worker + beat + web (Ctrl+C to stop all)"
-# kill the whole process group on exit. `trap - ...` first so this runs ONCE
-# (otherwise SIGINT + SIGTERM + EXIT each re-trigger it -> the "stopping" spam).
-cleanup() { trap - INT TERM EXIT; echo; echo "==> stopping all..."; kill 0 2>/dev/null; }
+# Graceful shutdown on Ctrl+C:
+#   1. SIGTERM the whole group → celery starts warm shutdown, finishes running
+#      tasks, calls browser.close() which rmtree's the proxy plugin dir.
+#   2. Wait up to 12s for processes to drain. Long enough for one Chromium
+#      teardown + plugin cleanup + ack-late commit; short enough so the user
+#      doesn't think the script hung.
+#   3. SIGKILL anything still alive.
+# Without this, a plain `kill 0` SIGTERMs everything at once and Chrome's
+# subprocess gets cut off mid-extension-write → next launch trips Chrome's
+# "Failed to load extension from: ." popup because the manifest is half-gone.
+cleanup() {
+  trap - INT TERM EXIT
+  echo
+  echo "==> stopping all (graceful, up to 12s)..."
+  kill -TERM 0 2>/dev/null
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    sleep 1
+    # if no children left in our group, break early
+    if ! pgrep -P $$ >/dev/null 2>&1; then
+      break
+    fi
+  done
+  # force-kill any holdouts
+  kill -KILL 0 2>/dev/null
+}
 trap cleanup INT TERM EXIT
 
 cd "$ROOT/backend"
@@ -49,7 +71,8 @@ cd "$ROOT/backend"
   | sed -u 's/^/[api]  /' &
 
 "$PY" -m celery -A app.core.celery_app.celery_app worker --loglevel=info \
-  -Q ig_crm.default --include=app.workers.celery_tasks,app.workers.media_tasks 2>&1 \
+  -Q ig_crm.default --concurrency=2 \
+  --include=app.workers.celery_tasks,app.workers.media_tasks 2>&1 \
   | sed -u 's/^/[wrk]  /' &
 
 "$PY" -m celery -A app.core.celery_app.celery_app beat --loglevel=info 2>&1 \

@@ -19,9 +19,19 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# cmdline markers that identify a browser WE launched (see browser_core.py:
-# user_data_dir="fresh" -> tempfile prefix; proxy plugin folder per task).
-_OUR_BROWSER_MARKERS = ("ig_crm_chrome_profile_", "runtime_proxy_plugin")
+# cmdline markers that identify a browser WE launched. As of the auto_port
+# rewrite, each of our Chrome processes carries:
+#   --user-data-dir=/tmp/DrissionPage/autoPortData/<port>
+# which never appears in the operator's everyday Chrome. We also count the
+# local pproxy auth-forwarder we spawn alongside each browser, so the gate
+# sees the FULL footprint (Chrome ~500MB + pproxy ~30MB) when deciding
+# whether to allow another task in.
+_OUR_BROWSER_MARKERS = (
+    "DrissionPage/autoPortData",     # current Chrome profile path
+    "ig_crm_chrome_profile_",        # legacy, kept for back-compat
+    "dp_proxy_ext_",                 # legacy, kept for back-compat
+    "runtime_proxy_plugin",          # legacy, kept for back-compat
+)
 
 
 def count_our_browsers() -> int:

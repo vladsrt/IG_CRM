@@ -2,28 +2,161 @@
 
 Wraps DrissionPage Chromium instances with proxies and custom user agents.
 Makes sure we do not leak temp extension folders if something crashes.
+
+Proxy auth strategy:
+  We spawn a tiny local HTTP forwarder (pproxy) per browser, on a random
+  127.0.0.1 port. The forwarder holds the upstream proxy credentials and
+  presents itself as a NO-AUTH HTTP proxy to Chrome. Chrome is told via
+  --proxy-server=http://127.0.0.1:<port> — so Chrome never sees a 407,
+  never pops the auth dialog, never has the MV3 service-worker boot race.
+  The forwarder process is owned by the InstagramBrowser instance and
+  killed in close().
 """
 
 import os
-import re
 import shutil
-import tempfile
+import socket
+import subprocess
+import sys
 import time
-import uuid
 from typing import Dict, List, Optional
 
 from DrissionPage import ChromiumPage, ChromiumOptions
-from workers.utils.proxy_builder import create_proxy_extension
 
 
-# constants
-_PLUGIN_FOLDER_PREFIX: str = "runtime_proxy_plugin"
-_SAFE_TOKEN_RE = re.compile(r"[^A-Za-z0-9_\-]")
+# Chrome binary candidates, in order of preference.
+# We pick the FIRST one that exists and is NOT a snap wrapper. snap-confined
+# Chromium can't read /tmp/ (confinement=strict, only `home` + `removable-media`
+# plugs), so passing --load-extension=/tmp/dp_proxy_ext_XXX silently fails
+# with "Failed to load extension from: . Manifest file is missing or unreadable"
+# and the proxy is NEVER applied → user IP leaks via direct connection.
+# DrissionPage's default `which('chrome') or which('chromium')` picks
+# /snap/bin/chromium first on Ubuntu, so we override it explicitly.
+_CHROME_BINARY_CANDIDATES: tuple[str, ...] = (
+    "/opt/google/chrome/google-chrome",   # deb-installed Google Chrome (no snap)
+    "/opt/google/chrome/chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/chromium-browser",           # deb-installed Chromium, NOT snap
+)
 
 
-def _sanitize_token(token: str) -> str:
-    """Drop any char that is not safe in a filename (keep alnum, _ and -)."""
-    return _SAFE_TOKEN_RE.sub("", token)
+def _resolve_chrome_binary() -> Optional[str]:
+    """Return the first non-snap Chrome binary on disk, or None.
+
+    /usr/bin/chromium-browser on Ubuntu can be the snap shim — we detect that
+    via the shebang/grep and skip it. /snap/bin/chromium is always snap.
+    """
+    for path in _CHROME_BINARY_CANDIDATES:
+        if not os.path.isfile(path):
+            continue
+        # /usr/bin/chromium-browser on Ubuntu is a wrapper shell script that
+        # `exec /snap/bin/chromium "$@"`. Skip it if so.
+        try:
+            with open(path, "rb") as f:
+                head = f.read(512)
+            if b"/snap/bin/chromium" in head or b"snap install chromium" in head:
+                continue
+        except OSError:
+            continue
+        return path
+    return None
+
+
+def _pick_free_local_port() -> int:
+    """Ask the kernel for an unused TCP port on 127.0.0.1."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _spawn_local_auth_forwarder(
+    upstream_proxy_url: str,
+) -> tuple[int, "subprocess.Popen[bytes]"]:
+    """Start a localhost HTTP proxy that forwards to upstream with auth.
+
+    Architecture:
+        Chrome --no-auth--> 127.0.0.1:<port>  --(adds Proxy-Auth header)--> upstream
+
+    Why this exists:
+        Chrome 147 + MV3 has a fatal race for AUTHENTICATED proxies:
+        the proxy is applied at Chrome startup, but the service worker
+        that should answer 407 challenges (via webRequestAuthProvider)
+        boots LAZILY. The first request through the proxy fires before
+        the SW has registered onAuthRequired → Chrome shows the native
+        login dialog → user IP leaks if the dialog is dismissed.
+
+        By moving auth OFF Chrome entirely and into a local pproxy
+        subprocess, Chrome only ever sees an unauthenticated localhost
+        proxy. No 407, no dialog, no race.
+
+    Args:
+        upstream_proxy_url: "scheme://user:pass@host:port" — the original
+            proxy URL as parsed by parse_proxy_url().
+
+    Returns:
+        (local_port, popen) — the port Chrome should point at, and the
+        Popen handle the caller owns (terminate it in close()).
+
+    Raises:
+        RuntimeError: forwarder failed to bind within 3s.
+    """
+    from workers.utils.proxy_builder import parse_proxy_url
+
+    scheme, user, password, host, port = parse_proxy_url(upstream_proxy_url)
+    if scheme not in ("http", "https"):
+        # SOCKS upstream — pproxy supports it too, but we mark scheme so
+        # the upstream URL is correct.
+        upstream_scheme = scheme
+    else:
+        upstream_scheme = scheme
+
+    # pproxy upstream URL: protocol://host:port#user:pass
+    # (auth uses # as separator, not standard URL @ format)
+    if user or password:
+        upstream = f"{upstream_scheme}://{host}:{port}#{user}:{password}"
+    else:
+        upstream = f"{upstream_scheme}://{host}:{port}"
+
+    local_port = _pick_free_local_port()
+    # `-l http://127.0.0.1:N`  = listen as HTTP (no auth) on localhost
+    # `-r <upstream>`          = forward everything to upstream w/ auth
+    cmd = [
+        sys.executable, "-m", "pproxy",
+        "-l", f"http://127.0.0.1:{local_port}",
+        "-r", upstream,
+    ]
+    # discard stdout/stderr so a long-running browser doesn't fill the
+    # worker log with proxy access lines.
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        # new session so the forwarder survives if our caller is
+        # interrupted with Ctrl+C and gets a chance to clean up via close().
+        start_new_session=True,
+    )
+
+    # Wait up to 3s for the port to actually accept connections — if
+    # pproxy crashed on bad args, we don't want Chrome to launch and
+    # try a dead proxy.
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(
+                f"local proxy forwarder died on launch (exit={proc.returncode}, "
+                f"upstream={host}:{port})"
+            )
+        try:
+            with socket.create_connection(("127.0.0.1", local_port), timeout=0.3):
+                return local_port, proc
+        except OSError:
+            time.sleep(0.05)
+    # didn't start in time
+    proc.terminate()
+    raise RuntimeError(
+        f"local proxy forwarder failed to bind 127.0.0.1:{local_port} within 3s "
+        f"(upstream={host}:{port})"
+    )
 
 
 class InstagramBrowser:
@@ -76,99 +209,99 @@ class InstagramBrowser:
         # constructor blew up half way through.
         self.page: Optional[ChromiumPage] = None
         self.co: Optional[ChromiumOptions] = None
-        self.plugin_path: str = ""
-        self.plugin_folder: str = ""
-        # _owned_user_data_dir is the path we made for this instance,
-        # close() removes it. _user_data_dir is the path we actually
-        # pointed Chromium at (it can be caller-supplied, in that case
-        # we leave it alone on close).
-        self._owned_user_data_dir: str = ""
+        self.plugin_path: str = ""  # legacy MV3 ext path (unused, kept for janitor)
+        # local pproxy forwarder lifecycle handles
+        self._local_proxy_proc: Optional["subprocess.Popen[bytes]"] = None
+        self._local_proxy_port: Optional[int] = None
+        # caller-supplied user_data_dir path (set when explicit path passed).
         self._user_data_dir: str = ""
 
-        # pre-build a unique proxy folder path so close() can clean it later.
-        if task_id:
-            token = _sanitize_token(str(task_id))
-            if not token:
-                # task_id was non-empty but only had unsafe chars. fall back
-                # to a random token so we never write to a shared dir.
-                token = uuid.uuid4().hex
-        else:
-            token = uuid.uuid4().hex
-
-        self.plugin_folder = f"{_PLUGIN_FOLDER_PREFIX}_{token}"
-
         try:
-            # build ChromiumOptions and clear any cached proxy
+            # janitor: sweep dp_proxy_ext_* + runtime_proxy_plugin_* folders
+            # left in /tmp by a previous worker that died before close()
+            # (Ctrl+C from dev.sh, OOM, etc). Older than 1h so we never touch
+            # a folder a sibling worker just created.
+            try:
+                import tempfile
+                self.cleanup_orphaned_extensions(
+                    root=tempfile.gettempdir(), older_than_seconds=3600
+                )
+            except Exception as janitor_exc:
+                print(f"[*] tempfile janitor: skipped ({janitor_exc})")
+
+            # build ChromiumOptions
             self.co = ChromiumOptions()
 
-            # DrissionPage sometimes caches proxies in ~/.DrissionPage/.
-            # we clear it here so it does not fight our setup.
-            try:
-                self.co.set_proxy("")  # type: ignore[arg-type]
-            except Exception as exc:
+            # Pin Chrome binary to a non-snap install. DrissionPage's default
+            # path resolution (which('chrome') or which('chromium')) picks
+            # /snap/bin/chromium first on Ubuntu, and snap-confined Chromium
+            # can't read /tmp/ → MV3 proxy extension never loads → home IP
+            # leaks. Falling back to DP default if no candidate exists keeps
+            # the worker bootable on hosts where Chrome isn't installed yet.
+            chrome_bin = _resolve_chrome_binary()
+            if chrome_bin:
+                try:
+                    self.co.set_browser_path(chrome_bin)
+                    print(f"[*] Chrome binary pinned: {chrome_bin}")
+                except Exception as exc:
+                    print(f"[!] set_browser_path({chrome_bin!r}) failed: {exc}")
+            else:
                 print(
-                    f"[*] DP set_proxy('') not available ({exc}), relying on "
-                    "the downstream guards"
+                    "[!] No non-snap Chrome found on standard paths. "
+                    "DrissionPage may fall back to snap chromium, which "
+                    "CANNOT load /tmp/ extensions — proxy plugin will silently "
+                    "fail. Install google-chrome-stable (deb)."
                 )
 
-            # optional fresh / explicit user data dir.
-            # in tests, "fresh" makes Chromium start with a clean profile
-            # every launch: no cached proxy decisions, no old cookies, no
-            # stale ServiceWorker state. in prod the caller can pin a
-            # specific dir so cookies and UA stick across runs. mostly we
-            # use the DP default, this is just a hook.
-            if user_data_dir == "fresh":
-                self._owned_user_data_dir = tempfile.mkdtemp(
-                    prefix="ig_crm_chrome_profile_"
-                )
-                self._user_data_dir = self._owned_user_data_dir
-            elif user_data_dir:
-                self._user_data_dir = os.path.abspath(user_data_dir)
-            if self._user_data_dir:
-                applied = False
-                for setter in ("set_user_data_path", "set_paths"):
-                    fn = getattr(self.co, setter, None)
-                    if not callable(fn):
-                        continue
-                    try:
-                        if setter == "set_paths":
-                            fn(user_data_path=self._user_data_dir)
-                        else:
-                            fn(self._user_data_dir)
-                        applied = True
-                        break
-                    except Exception as exc:
-                        print(
-                            f"[*] DP {setter}({self._user_data_dir!r}) failed ({exc})"
-                        )
-                if not applied:
-                    # last try: pass the flag directly
-                    try:
-                        self.co.set_argument(
-                            f"--user-data-dir={self._user_data_dir}"
-                        )
-                        applied = True
-                    except Exception as exc:
-                        print(f"[!] could not pin user_data_dir via CLI flag: {exc}")
-                if applied:
+            # auto_port=True → DrissionPage picks a free CDP port in the
+            # 9600..59600 range AND creates a unique temporary profile.
+            # Without this, parallel workers connect to the same Chromium on
+            # the default port 9222, and the proxy plugin of the second
+            # worker never loads.
+            self.co.auto_port(True)
+
+            # optional explicit user data dir (pin a profile across runs).
+            # auto_port(True) already gives a fresh temp profile — the
+            # explicit path hook is for future per-account profile pinning.
+            if user_data_dir and user_data_dir != "fresh":
+                try:
+                    self.co.set_user_data_path(os.path.abspath(user_data_dir))
+                    self._user_data_dir = os.path.abspath(user_data_dir)
                     print(f"[*] Chromium user-data-dir set to {self._user_data_dir}")
+                except Exception as exc:
+                    print(f"[*] DP set_user_data_path({user_data_dir!r}) failed: {exc}")
 
             if self._uses_proxy:
-                # build the MV3 extension for proxy auth
-                generated = create_proxy_extension(
-                    self.proxy_string, self.plugin_folder
+                # Spawn the local auth-forwarder. Chrome will be told to
+                # use 127.0.0.1:<port> as a NO-AUTH HTTP proxy; the forwarder
+                # holds the upstream creds and adds Proxy-Authorization for
+                # every request. No 407 ever reaches Chrome → no native
+                # auth dialog, no MV3 SW boot race, no IP leak.
+                self._local_proxy_port, self._local_proxy_proc = (
+                    _spawn_local_auth_forwarder(self.proxy_string)  # type: ignore[arg-type]
                 )
-                if not generated:
-                    raise RuntimeError(
-                        "create_proxy_extension returned None even though "
-                        "proxy_string was set, this is a bug"
-                    )
-                self.plugin_path = generated
                 print(
-                    f"[*] Proxy extension generated at {self.plugin_path} "
-                    f"(proxy={self._redacted_proxy()})"
+                    f"[*] Local proxy forwarder up at 127.0.0.1:{self._local_proxy_port} "
+                    f"-> {self._redacted_proxy()}"
                 )
-                self.co.add_extension(self.plugin_path)
+                # Point Chrome at the forwarder. CRITICAL: bypass loopback
+                # so CDP / devtools traffic (also on 127.0.0.1) doesn't
+                # ricochet back into the proxy and deadlock.
+                try:
+                    self.co.set_argument(
+                        f"--proxy-server=http://127.0.0.1:{self._local_proxy_port}"
+                    )
+                    # bypass everything on localhost EXCEPT our forwarder port.
+                    # `<-loopback>` is Chromium-specific: it un-bypasses
+                    # loopback so the proxy DOES handle 127.0.0.1:<port>;
+                    # we still need it because Chrome auto-bypasses loopback.
+                    self.co.set_argument("--proxy-bypass-list=<-loopback>")
+                    print(
+                        f"[*] Chrome proxy-server flag set: "
+                        f"http://127.0.0.1:{self._local_proxy_port} (no auth)"
+                    )
+                except Exception as exc:
+                    print(f"[!] Could not set --proxy-server flag: {exc}")
             else:
                 # no proxy: hard-disable any cached proxy
                 self.plugin_path = ""  # keep close() happy
@@ -184,14 +317,34 @@ class InstagramBrowser:
             # block browser notifications
             self.co.set_pref("profile.default_content_setting_values.notifications", 2)
 
-            # headless on/off
-            self.co.headless(headless)
+            # headless on/off. Use the NEW headless mode — the old --headless
+            # silently DROPS extensions, so the MV3 proxy-auth extension never
+            # loads and the proxy is never applied. --headless=new loads it.
+            if headless:
+                try:
+                    self.co.set_argument("--headless=new")
+                except Exception:
+                    self.co.headless(True)
+            else:
+                self.co.headless(False)
 
             # launch the Page. this is the heavy step. if it raises after
             # the Chrome subprocess is spawned, the except branch below
             # cleans up the orphan via self.close().
             self.page = ChromiumPage(self.co)
             print("[*] Browser launched.")
+
+            # MV3 proxy-auth race fix.
+            # Chrome's MV3 service workers boot lazily. If a request fires
+            # before the SW has registered its onAuthRequired listener, Chrome
+            # falls back to the native proxy auth dialog and the page hangs
+            # behind a modal nobody can dismiss in headed mode.
+            # 5 seconds gives Chrome time to unpack the extension, run
+            # background.js once, register chrome.proxy.settings.set, and
+            # commit the proxy config before our first nav.
+            if self._uses_proxy:
+                time.sleep(5)
+                self._verify_proxy_or_raise()
         except Exception:
             # constructor failed in the middle. clean up whatever made it
             # onto disk or into a subprocess before re-raising. the inner
@@ -249,6 +402,106 @@ class InstagramBrowser:
             return f"{scheme}://***@{after_at}"
         after_at = self.proxy_string.split("@", 1)[1]
         return f"***@{after_at}"
+
+    def _verify_proxy_or_raise(self) -> None:
+        """Confirm the proxy is actually routing browser traffic.
+
+        Strategy:
+          1. Get the HOST's direct public IP via Python urllib (no browser,
+             no proxy — this is the "home IP" we must NOT see in the browser).
+          2. Get the browser's effective IP by navigating to api.ipify.org.
+          3. If browser_ip == home_ip → proxy DID NOT apply, abort task.
+             If they differ → proxy is routing somewhere else (good).
+
+        This is the only reliable test: comparing against the user-configured
+        proxy host fails for residential/rotating proxies whose exit IPs
+        differ from the gateway. Comparing against the actual home IP catches
+        the leak even when the proxy uses a totally different exit pool.
+        """
+        # Step 1: get home IP without any proxy
+        import urllib.request
+
+        home_ip: Optional[str] = None
+        for echo_url in ("https://api.ipify.org", "https://ifconfig.me/ip",
+                         "https://icanhazip.com"):
+            try:
+                # Build an opener that explicitly REFUSES any system proxy
+                # (HTTP_PROXY/HTTPS_PROXY env vars, gsettings, etc).
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({}),  # disable env proxies
+                )
+                with opener.open(echo_url, timeout=8) as resp:
+                    home_ip = (resp.read().decode("utf-8", "replace")
+                               .strip().split()[0])
+                if home_ip:
+                    break
+            except Exception:
+                continue
+        if not home_ip:
+            print(
+                "[proxy-verify] WARN: could not establish HOME ip from any "
+                "echo service — falling back to RFC1918 / loopback check only."
+            )
+
+        # Step 2: get browser's observed IP through the proxy chain
+        print("[proxy-verify] checking effective browser IP via api.ipify.org ...")
+        try:
+            self.page.get("https://api.ipify.org?format=json", timeout=20)
+            time.sleep(1)
+            try:
+                body = self.page.ele("tag:body", timeout=5).text  # type: ignore[arg-type]
+            except Exception:
+                body = (self.page.html or "")[:300]
+        except Exception as exc:
+            raise RuntimeError(
+                f"proxy verify: could not reach api.ipify.org through the "
+                f"browser (proxy={self._redacted_proxy()}): {exc}"
+            ) from exc
+
+        import re as _re
+        ip_match = _re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", body or "")
+        if not ip_match:
+            raise RuntimeError(
+                f"proxy verify: api.ipify.org returned no parseable IP. "
+                f"Body head: {(body or '')[:200]!r}"
+            )
+        observed_ip = ip_match.group(1)
+
+        # Step 3: RFC1918 / loopback sanity
+        is_private = (
+            observed_ip.startswith("127.")
+            or observed_ip.startswith("10.")
+            or observed_ip.startswith("192.168.")
+            or any(observed_ip.startswith(f"172.{i}.") for i in range(16, 32))
+        )
+        if is_private:
+            raise RuntimeError(
+                f"proxy verify FAILED: observed browser IP is private "
+                f"({observed_ip}). Proxy did not apply — traffic going direct."
+            )
+
+        # Step 4: the strict leak test
+        if home_ip and observed_ip == home_ip:
+            raise RuntimeError(
+                f"proxy verify FAILED: observed browser IP ({observed_ip}) "
+                f"EQUALS the host's home IP ({home_ip}). The proxy is NOT "
+                f"routing browser traffic — task refused to avoid IP leak. "
+                f"Likely cause: --proxy-server flag dropped by Chrome, proxy "
+                f"server unreachable, or proxy returned a 407 the SW didn't "
+                f"answer."
+            )
+
+        # All checks passed — log the outcome
+        if home_ip:
+            print(
+                f"[proxy-verify] OK — browser exit IP {observed_ip} differs "
+                f"from home IP {home_ip}. Proxy is routing."
+            )
+        else:
+            print(
+                f"[proxy-verify] OK (no home-ip oracle) — browser exit IP "
+                f"{observed_ip} is public, not loopback/RFC1918."
+            )
 
     @staticmethod
     def _apply_no_proxy_settings(co: ChromiumOptions) -> None:
@@ -310,6 +563,12 @@ class InstagramBrowser:
 
         Each cookie is sanitized for CDP and injected independently, so one bad
         cookie can't abort the whole session.
+
+        After injection we navigate to instagram.com and HARD-VERIFY the home
+        feed actually rendered. Without this, a slow/dead proxy can leave the
+        browser stuck on robots.txt forever — every downstream action then
+        spends its retry budget hunting for IG DOM elements that simply
+        aren't there. Failing fast with a clear error here is much better.
         """
         print("[*] Navigating to robots.txt to set domain context...")
         self.page.get("https://www.instagram.com/robots.txt")
@@ -328,10 +587,58 @@ class InstagramBrowser:
                 print(f"[!] Skipped cookie {clean.get('name')!r}: {e}")
 
         print(f"[*] Injected {injected}/{len(cookies_list)} cookies.")
-        time.sleep(2)
+
+        # navigate AWAY from robots.txt to home feed and confirm IG bundle
+        # actually rendered. If proxy is dead/slow this raises with a clear
+        # message instead of letting the action handler grind for minutes on
+        # selectors that can't match.
+        print("[*] Navigating to home feed to confirm logged-in session...")
+        try:
+            self.page.get("https://www.instagram.com/", timeout=25)
+        except Exception as exc:
+            raise RuntimeError(
+                f"home feed navigation failed (proxy too slow / dead?): "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if not self._wait_for_ig_home_ready(timeout_s=20):
+            raise RuntimeError(
+                "Instagram home feed did NOT render after cookie injection. "
+                "Common causes (in order of likelihood): (1) proxy is too slow "
+                "and the JS bundle never finished loading, (2) cookies are "
+                "expired or for a different account, (3) IG returned a "
+                "checkpoint/challenge page. Task aborted to avoid running "
+                "actions against a blank page."
+            )
+        print("[*] Home feed ready, proceeding to commands.")
+
+    def _wait_for_ig_home_ready(self, *, timeout_s: float = 20.0) -> bool:
+        """Return True once the IG home DOM has the main left-rail nav.
+
+        We look for a generic anchor in the side navigation — IG rotates the
+        exact icons and labels but the <nav> with role-based links is stable.
+        Polls every 500ms until found or timeout.
+        """
+        deadline = time.monotonic() + max(1.0, timeout_s)
+        # Multiple selectors in order — IG has shipped both old (<nav>) and
+        # new (<div role="navigation">) shells. We accept ANY match.
+        candidates = (
+            'xpath://nav//a[@href="/"]',
+            'xpath://div[@role="navigation"]//a[@href="/"]',
+            'xpath://a[@href="/"][.//svg[@aria-label]]',
+        )
+        while time.monotonic() < deadline:
+            for sel in candidates:
+                try:
+                    el = self.page.ele(sel, timeout=1)
+                    if el:
+                        return True
+                except Exception:
+                    pass
+            time.sleep(0.5)
+        return False
 
     def close(self) -> None:
-        """Close the browser and clean up the plugin folder."""
+        """Close the browser, kill the local proxy forwarder, clean temp dirs."""
         print("[*] Shutting down browser...")
         page = getattr(self, "page", None)
         if page is not None:
@@ -342,6 +649,26 @@ class InstagramBrowser:
             finally:
                 # drop the ref so a later close() call is cheap
                 self.page = None
+
+        # Tear down the local pproxy auth forwarder. SIGTERM first, give it
+        # half a second, then SIGKILL. We do NOT want a parade of orphaned
+        # pproxy subprocesses on the host.
+        proc = getattr(self, "_local_proxy_proc", None)
+        port = getattr(self, "_local_proxy_port", None)
+        if proc is not None:
+            print(f"[*] Stopping local proxy forwarder (port={port}, pid={proc.pid})")
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=1.0)
+            except Exception as e:
+                print(f"[!] Error stopping local proxy forwarder: {e}")
+            finally:
+                self._local_proxy_proc = None
+                self._local_proxy_port = None
 
         plugin_path = getattr(self, "plugin_path", "")
         if plugin_path:
@@ -354,20 +681,6 @@ class InstagramBrowser:
                 print(f"[!] Error cleaning proxy directory: {e}")
             finally:
                 self.plugin_path = ""
-
-        # only delete the user-data-dir if WE made it (user_data_dir="fresh").
-        # caller-supplied paths stay where they are.
-        owned = getattr(self, "_owned_user_data_dir", "")
-        if owned:
-            print(f"[*] Cleaning up Chromium profile directory: {owned}")
-            try:
-                if os.path.exists(owned):
-                    shutil.rmtree(owned, ignore_errors=True)
-            except Exception as e:
-                print(f"[!] Error cleaning profile directory: {e}")
-            finally:
-                self._owned_user_data_dir = ""
-                self._user_data_dir = ""
 
     # context manager
     # callers that use `with InstagramBrowser(...) as browser:` get clean
@@ -392,7 +705,7 @@ class InstagramBrowser:
         *,
         older_than_seconds: float = 0.0,
     ) -> int:
-        """Delete runtime_proxy_plugin_* folders left behind by crashed runs.
+        """Delete dp_proxy_ext_* and runtime_proxy_plugin_* folders left behind by crashed runs.
 
         Args:
             root: directory to scan.
@@ -402,6 +715,8 @@ class InstagramBrowser:
             int: how many folders were removed.
         """
         import time as _time
+
+        _prefixes = ("dp_proxy_ext_", "runtime_proxy_plugin_")
         removed = 0
         try:
             entries = os.listdir(root)
@@ -409,7 +724,7 @@ class InstagramBrowser:
             return 0
         cutoff = _time.time() - max(0.0, older_than_seconds)
         for name in entries:
-            if not name.startswith(_PLUGIN_FOLDER_PREFIX + "_"):
+            if not any(name.startswith(p) for p in _prefixes):
                 continue
             path = os.path.join(root, name)
             if not os.path.isdir(path):
