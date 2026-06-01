@@ -125,16 +125,33 @@ def _spawn_local_auth_forwarder(
         "-l", f"http://127.0.0.1:{local_port}",
         "-r", upstream,
     ]
-    # discard stdout/stderr so a long-running browser doesn't fill the
-    # worker log with proxy access lines.
+    # Capture stderr to a temp file so if pproxy dies on launch we know
+    # WHY — without this, the only error you ever see is the generic
+    # "died on launch (exit=1)" with no clue about pproxy's complaint
+    # (missing module, bad upstream URL, port collision, etc).
+    import tempfile
+    err_log = tempfile.NamedTemporaryFile(
+        prefix=f"pproxy_{local_port}_", suffix=".err",
+        delete=False, mode="w+b",
+    )
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=err_log,
         # new session so the forwarder survives if our caller is
         # interrupted with Ctrl+C and gets a chance to clean up via close().
         start_new_session=True,
     )
+
+    def _read_stderr_tail() -> str:
+        """Read whatever pproxy wrote to its stderr file, trimmed."""
+        try:
+            err_log.flush()
+            err_log.seek(0)
+            data = err_log.read().decode("utf-8", "replace").strip()
+            return data[-800:] if data else "(empty stderr)"
+        except Exception as exc:
+            return f"(stderr read failed: {exc})"
 
     # Wait up to 3s for the port to actually accept connections — if
     # pproxy crashed on bad args, we don't want Chrome to launch and
@@ -142,12 +159,17 @@ def _spawn_local_auth_forwarder(
     deadline = time.time() + 3.0
     while time.time() < deadline:
         if proc.poll() is not None:
+            err = _read_stderr_tail()
             raise RuntimeError(
-                f"local proxy forwarder died on launch (exit={proc.returncode}, "
-                f"upstream={host}:{port})"
+                f"local proxy forwarder died on launch "
+                f"(exit={proc.returncode}, upstream={host}:{port}). "
+                f"pproxy stderr: {err}"
             )
         try:
             with socket.create_connection(("127.0.0.1", local_port), timeout=0.3):
+                # success path — leave err_log open; if pproxy spews errors
+                # later, we keep capturing them. Tempfile is auto-cleaned by
+                # the OS eventually; we don't strictly need to manage it.
                 return local_port, proc
         except OSError:
             time.sleep(0.05)
