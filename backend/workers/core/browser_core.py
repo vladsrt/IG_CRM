@@ -631,20 +631,48 @@ class InstagramBrowser:
         # selectors that can't match.
         print("[*] Navigating to home feed to confirm logged-in session...")
         try:
-            self.page.get("https://www.instagram.com/", timeout=25)
+            self.page.get("https://www.instagram.com/", timeout=30)
         except Exception as exc:
             raise RuntimeError(
                 f"home feed navigation failed (proxy too slow / dead?): "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
-        if not self._wait_for_ig_home_ready(timeout_s=20):
+        if not self._wait_for_ig_home_ready(timeout_s=30):
+            # Diagnostic info — where DID we end up?
+            try:
+                cur_url = str(self.page.url)
+            except Exception:
+                cur_url = "?"
+            try:
+                cur_title = str(self.page.title)
+            except Exception:
+                cur_title = "?"
+            try:
+                html_preview = (self.page.html or "")[:400].replace("\n", " ")
+            except Exception:
+                html_preview = "?"
+            # Pattern-match the URL to give a CONCRETE cause string.
+            cause: str
+            if "/challenge/" in cur_url or "/auth_platform/" in cur_url:
+                cause = "IG returned a CHECKPOINT/CHALLENGE page (resolve it manually in a real browser with these cookies, then re-export and retry)."
+            elif "/accounts/login" in cur_url or "/accounts/onetap" in cur_url:
+                cause = "IG redirected to LOGIN — cookies are expired or for a different account. Re-export fresh cookies and update the account."
+            elif "/accounts/suspended" in cur_url or "/accounts/disabled" in cur_url:
+                cause = "Account is SUSPENDED / DISABLED on IG side."
+            elif cur_url.endswith("/robots.txt") or cur_url == "?":
+                cause = "Navigation NEVER happened — proxy is dead/blocked or timed out. Try `curl -x ...` from server to verify the proxy responds."
+            else:
+                cause = (
+                    "Page loaded but no known nav selector matched. Either IG "
+                    "shipped a new DOM (selectors need updating) OR a modal is "
+                    "blocking. HTML preview below."
+                )
             raise RuntimeError(
-                "Instagram home feed did NOT render after cookie injection. "
-                "Common causes (in order of likelihood): (1) proxy is too slow "
-                "and the JS bundle never finished loading, (2) cookies are "
-                "expired or for a different account, (3) IG returned a "
-                "checkpoint/challenge page. Task aborted to avoid running "
-                "actions against a blank page."
+                "Instagram home feed did NOT render after cookie injection.\n"
+                f"  current URL : {cur_url!r}\n"
+                f"  current title: {cur_title!r}\n"
+                f"  diagnosis    : {cause}\n"
+                f"  html preview : {html_preview[:300]!r}"
             )
         print("[*] Home feed ready, proceeding to commands.")
 
@@ -656,12 +684,17 @@ class InstagramBrowser:
         Polls every 500ms until found or timeout.
         """
         deadline = time.monotonic() + max(1.0, timeout_s)
-        # Multiple selectors in order — IG has shipped both old (<nav>) and
-        # new (<div role="navigation">) shells. We accept ANY match.
+        # Multiple selectors — IG has shipped MANY shell variants over the
+        # years (<nav>, <div role="navigation">, <header>, mobile-first…).
+        # We accept ANY match. Order is hot-path first.
         candidates = (
             'xpath://nav//a[@href="/"]',
             'xpath://div[@role="navigation"]//a[@href="/"]',
+            'xpath://header//a[@href="/"]',
             'xpath://a[@href="/"][.//svg[@aria-label]]',
+            'xpath://a[@href="/"]',                  # any home link at all
+            'xpath://main[@role="main"]',            # logged-in main view
+            'xpath://*[@aria-label="Home"]',         # icon button by aria-label
         )
         while time.monotonic() < deadline:
             for sel in candidates:
