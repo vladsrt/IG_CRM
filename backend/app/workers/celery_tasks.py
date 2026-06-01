@@ -58,10 +58,11 @@ _RUNNABLE_STATUSES: frozenset[str] = frozenset(
     {TaskStatus.PENDING.value, TaskStatus.DRAFT.value}
 )
 
-# reaper threshold. tasks stuck in RUNNING longer than this are treated as
-# dead and force-failed by the periodic janitor. 1h matches the spec, can be
-# tuned per call with stale_after_seconds.
-_REAP_AFTER_SECONDS: int = 60 * 60
+# reaper threshold. Tasks stuck in RUNNING longer than this are treated as
+# dead and force-failed by the periodic janitor. 15 min covers a long warmup
+# or upload chain while still freeing the account fast when a worker dies.
+# Tunable per call via stale_after_seconds.
+_REAP_AFTER_SECONDS: int = 15 * 60
 
 # retry budget for the FOR UPDATE NOWAIT contention path.
 _LOCK_RETRY_MAX_ATTEMPTS: int = 5
@@ -76,14 +77,23 @@ _GATE_RETRY_BACKOFF_CAP_S: int = 120
 
 # helpers
 def _build_proxy_string(proxy: Proxy | None) -> str | None:
-    """Turn a proxy orm row into a user:pass@host:port string.
+    """Turn a proxy orm row into a proxy URL for proxy_builder.
 
-    Note: InstagramBrowser and proxy_builder.create_proxy_extension parse
-    this format directly, no scheme prefix.
+    Includes the SCHEME (http/https/socks4/socks5) — without it SOCKS proxies
+    were silently treated as HTTP and failed. Format:
+        scheme://user:pass@host:port   (with creds)
+        scheme://host:port             (no creds — e.g. IP-whitelisted SOCKS)
     """
     if proxy is None:
         return None
-    return f"{proxy.username}:{proxy.password}@{proxy.host}:{proxy.port}"
+    scheme = (getattr(proxy, "protocol", None) or "http").strip().lower()
+    user = (proxy.username or "").strip()
+    pwd = (proxy.password or "").strip()
+    host = proxy.host
+    port = proxy.port
+    if user or pwd:
+        return f"{scheme}://{user}:{pwd}@{host}:{port}"
+    return f"{scheme}://{host}:{port}"
 
 
 def _set_task_status(
@@ -152,6 +162,53 @@ def _recover_orphan_if_needed(task_uuid: uuid.UUID) -> bool:
         return True
 
 
+def _reap_stale_siblings_for_account(
+    account_id: uuid.UUID,
+    stale_after_seconds: int = _REAP_AFTER_SECONDS,
+) -> int:
+    """Force-fail any RUNNING task on this account older than the threshold.
+
+    Plugs a real-world failure mode: a worker dies hard (SIGKILL/OOM) while
+    holding a RUNNING row. The same Celery message is NOT retried (acks_late
+    only requeues if the worker process disappears mid-ack, which doesn't fire
+    on all death paths). The DB row stays RUNNING until reap_stale_tasks runs
+    (was every 5 min, threshold 1h). Meanwhile every NEW task on the same
+    account hits the sibling-RUNNING check and retries forever.
+
+    By calling this from run_instagram_task at the start, the new task
+    eagerly reaps zombies older than the threshold and proceeds, instead of
+    waiting for the periodic beat to do it.
+
+    Returns the number of siblings reaped.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_after_seconds)
+    reaped = 0
+    with SessionLocal() as db:
+        stmt = select(Task).where(
+            Task.account_id == account_id,
+            Task.status == TaskStatus.RUNNING.value,
+            Task.created_at < cutoff,
+        )
+        for task in db.execute(stmt).scalars():
+            task.status = TaskStatus.FAILED.value
+            timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            reap_line = (
+                f"[{timestamp}] eager sibling reap: stuck in RUNNING for "
+                f">{stale_after_seconds}s, worker treated as dead."
+            )
+            task.error_log = (
+                f"{task.error_log}\n{reap_line}" if task.error_log else reap_line
+            )
+            reaped += 1
+        if reaped:
+            db.commit()
+            logger.warning(
+                "[run_instagram_task] eager-reaped %d stale sibling(s) on account=%s",
+                reaped, account_id,
+            )
+    return reaped
+
+
 def _check_agent_and_capacity_gate(self: CeleryTask, task_uuid: uuid.UUID) -> None:
     """Phase 4 soft gate: hold the task back if the owner is out of agent
     slots OR the host is over its CPU/RAM/browser budget.
@@ -169,6 +226,8 @@ def _check_agent_and_capacity_gate(self: CeleryTask, task_uuid: uuid.UUID) -> No
             if account is None:
                 return
             user = db.get(User, account.user_id)
+            if user is not None and settings.is_admin(user.email):
+                return
             limit = agents_for_subscription(user.subscription if user else None)
             running = int(
                 db.execute(
@@ -284,6 +343,22 @@ def run_instagram_task(self: CeleryTask, task_id: str) -> dict[str, Any]:
     if _recover_orphan_if_needed(task_uuid):
         return {"task_id": str(task_uuid), "status": "orphan_recovered"}
 
+    # 0.1 eager-reap stale RUNNING siblings on the same account.
+    # If a previous worker died hard, its Task row stays RUNNING until the
+    # periodic beat (reap_stale_tasks) catches it. Without this, every new
+    # task on the same account would just keep retrying behind the zombie.
+    # We need to peek at task.account_id first; if the Task itself is gone
+    # (deleted), fall through to the graceful not-found handling below.
+    try:
+        with SessionLocal() as db:
+            _peek_task = db.get(Task, task_uuid)
+            if _peek_task is not None:
+                _reap_stale_siblings_for_account(_peek_task.account_id)
+    except Exception:
+        logger.exception(
+            "[run_instagram_task] eager sibling reap raised, proceeding (fail-open)"
+        )
+
     # 0.5 agent-limit + host-capacity gate (Phase 4). Holds the task back via
     # self.retry while the owner has no free agent slot or the box is loaded.
     _check_agent_and_capacity_gate(self, task_uuid)
@@ -297,7 +372,14 @@ def run_instagram_task(self: CeleryTask, task_id: str) -> dict[str, Any]:
     with SessionLocal() as db:
         task = db.get(Task, task_uuid)
         if task is None:
-            raise ValueError(f"Task {task_uuid} not found")
+            # The Task row was deleted between enqueue and run (the user
+            # deleted the account → cascade, or a manual SQL reset). Do NOT
+            # raise — that would trigger the autoretry path and loop forever.
+            logger.warning(
+                "[run_instagram_task] task=%s row gone from DB, dropping message",
+                task_uuid,
+            )
+            return {"task_id": str(task_uuid), "status": "task_not_found"}
 
         if task.status not in _RUNNABLE_STATUSES:
             logger.warning(
@@ -336,9 +418,22 @@ def run_instagram_task(self: CeleryTask, task_id: str) -> dict[str, Any]:
             ) from exc
 
         if account is None:
-            raise ValueError(
-                f"InstagramAccount {task.account_id} not found for task {task_uuid}"
+            # Account was deleted after the task was enqueued. Mark the task
+            # FAILED in-place and return — raising would re-loop the message.
+            logger.warning(
+                "[run_instagram_task] account=%s gone, failing task=%s",
+                task.account_id, task_uuid,
             )
+            task.status = TaskStatus.FAILED.value
+            task.error_log = (
+                f"InstagramAccount {task.account_id} no longer exists "
+                "(deleted before the worker picked this task up)."
+            )
+            db.commit()
+            return {
+                "task_id": str(task_uuid),
+                "status": "account_not_found",
+            }
 
         # extra safety: even with the row lock, skip if a sibling Task for
         # this account is already RUNNING. covers the case where the sibling

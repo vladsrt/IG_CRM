@@ -36,8 +36,18 @@ process imported this module.
 from __future__ import annotations
 
 from celery import Celery
+from celery.signals import worker_process_init
 
 from app.core.config import settings
+from app.core.logging_config import setup_logging
+
+
+@worker_process_init.connect
+def _init_worker_logging(**_kwargs) -> None:  # type: ignore[no-untyped-def]
+    """Each forked Celery worker child re-runs logging setup so it writes to
+    the same rotating file the master uses. Without this, only the parent
+    process's stdout gets captured."""
+    setup_logging(component="worker")
 
 celery_app: Celery = Celery(
     "ig_crm",
@@ -74,12 +84,13 @@ celery_app.conf.task_routes = {
 
 # beat schedule
 celery_app.conf.beat_schedule = {
-    # janitor: sweep stuck RUNNING tasks every 5 minutes. together with the
-    # at-start recovery inside run_instagram_task, this stops any task from
-    # being stuck in RUNNING after a worker dies.
-    "reap-stale-tasks-every-5-min": {
+    # janitor: sweep stuck RUNNING tasks every minute. With the 15 min
+    # staleness threshold (_REAP_AFTER_SECONDS in celery_tasks.py) this means
+    # a dead worker's RUNNING row frees the account within ~16 min worst-case.
+    # Paired with the eager sibling reap inside run_instagram_task itself.
+    "reap-stale-tasks-every-min": {
         "task": "ig_crm.reap_stale_tasks",
-        "schedule": 300.0,  # seconds
+        "schedule": 60.0,  # seconds
         "args": (),
     },
     # stats dispatcher: fetch all active accounts and dispatch a
