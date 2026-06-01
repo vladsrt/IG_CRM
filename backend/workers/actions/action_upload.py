@@ -20,7 +20,7 @@ from workers.core.behavior import (
     ClickVerificationError,
     safe_coordinate_click,
 )
-from workers.core.browser_core import InstagramBrowser
+from workers.core.browser_core import InstagramBrowser, dump_page_artifacts
 from workers.core.safety import UnsafePathError, resolve_within_media_root
 
 logger = logging.getLogger(__name__)
@@ -656,16 +656,53 @@ def execute_upload(
     # appearing is the signal we've arrived.
     logger.info("[upload] step 5: crop → caption (coordinate Next)")
 
-    _CAPTION_SEL = 'css:div[aria-label="Write a caption..."]'
+    # CAPTION editor candidates. IG rotates the aria-label and element type
+    # frequently; we accept any of these as proof we're on the caption row.
+    _CAPTION_SELECTORS = [
+        'css:div[aria-label="Write a caption..."]',
+        'css:div[aria-label="Write a caption"]',
+        'xpath://div[contains(@aria-label, "caption")]',
+        'xpath://div[contains(@aria-label, "Caption")]',
+        # Slate / Lexical contenteditable typically used by IG for the new
+        # rich-text caption editor:
+        'xpath://div[@contenteditable="true"][@role="textbox"]',
+        'css:div[data-text="true"][contenteditable="true"]',
+        # textarea fallback (very old IG):
+        'css:textarea[placeholder*="aption"]',
+    ]
+    # If the caption EDITOR can't be located, we still want to detect
+    # "we're on the Share/Caption screen" because other markers are
+    # present. The Share button + Add-location text both appear ONLY on
+    # this screen.
+    _SHARE_SCREEN_INDICATORS = [
+        'xpath://div[@role="button"][normalize-space()="Share"]',
+        'xpath://button[normalize-space()="Share"]',
+        'xpath://*[normalize-space()="Add location"]',
+        'xpath://*[normalize-space()="Accessibility"]',
+        'xpath://*[normalize-space()="Advanced settings"]',
+    ]
     _NEXT_LOCATORS = [
         'xpath://div[@role="button"][normalize-space()="Next"]',
         't:div@text()=Next',
         'xpath://button[normalize-space()="Next"]',
     ]
 
+    def _arrived_at_caption_screen() -> tuple[Any, Any]:
+        """Return (caption_editor_or_None, share_marker_or_None)."""
+        cap = _find_first(page, _CAPTION_SELECTORS, timeout=1.0)
+        if cap is not None:
+            return cap, None
+        share = _find_first(page, _SHARE_SCREEN_INDICATORS, timeout=1.0)
+        return None, share
+
+    caption_box: Any = None
+    on_share_screen = False
     for click_num in range(1, 5):
         # arrived?
-        if _find_first(page, [_CAPTION_SEL], timeout=1.0) is not None:
+        cap, share = _arrived_at_caption_screen()
+        if cap is not None or share is not None:
+            caption_box = cap
+            on_share_screen = (share is not None) or (cap is not None)
             break
 
         _cancel_discard_if_present(page)   # stay in the flow if a prompt slipped in
@@ -684,29 +721,74 @@ def execute_upload(
         _cancel_discard_if_present(page)
         _dismiss_dialog_nags(page)
 
-        if _find_first(page, [_CAPTION_SEL], timeout=2.0) is not None:
-            logger.info("[upload] caption screen reached after %d Next click(s)", click_num)
+        cap, share = _arrived_at_caption_screen()
+        if cap is not None or share is not None:
+            caption_box = cap
+            on_share_screen = True
+            logger.info(
+                "[upload] caption/share screen reached after %d Next click(s) "
+                "(editor_found=%s)", click_num, cap is not None,
+            )
             break
 
     # Final guard — caption editor MUST be visible now
-    caption_box = _find_first(page, [_CAPTION_SEL], timeout=4.0)
     if caption_box is None:
+        caption_box = _find_first(page, _CAPTION_SELECTORS, timeout=4.0)
+        if caption_box is not None:
+            on_share_screen = True
+
+    if caption_box is None and not on_share_screen:
+        # We're NOT on the caption/share screen at all. Real failure.
         _log_visible_clickables(page)
+        artifacts = dump_page_artifacts(page, reason="upload_step5_no_screen")
         raise UploadActionError(
-            "Step 5 FAILED: caption textarea not visible after Next — see the "
-            "[upload][diag] clickable dump to identify the current screen"
+            "Step 5 FAILED: not on caption/share screen after Next clicks. "
+            "Neither the caption editor nor the Share button is present. "
+            f"Artifacts saved: {artifacts}"
         )
-    logger.info("[upload] caption screen confirmed visible")
+    if caption_box is None and on_share_screen:
+        # We ARE on the share screen but IG renamed the caption editor's
+        # aria-label and our selectors miss it. Log + dump for offline
+        # debug, but DON'T abort — caption typing will be skipped, Share
+        # still works.
+        logger.warning(
+            "[upload] Step 5: share screen reached but caption editor selector "
+            "no longer matches. Proceeding with NO caption typing."
+        )
+        _log_visible_clickables(page)
+        dump_page_artifacts(page, reason="upload_step5_editor_missing")
+
+    logger.info("[upload] caption/share screen confirmed (editor=%s)", caption_box is not None)
     behavior.idle(*_AFTER_NEXT_PAUSE_S)
 
     # Step 8: Write caption
     logger.info("[upload] step 8: Write Caption")
     if caption:
-        if not safe_coordinate_click(page, _CAPTION_SEL, timeout=5):
-            raise UploadActionError("Caption editor click failed")
-        behavior.idle(0.3, 0.7)
-        page.actions.type(caption)
-        behavior.read_pause(content_length=len(caption))
+        if caption_box is None:
+            logger.warning(
+                "[upload] Step 8: caption='%s' was requested but the editor "
+                "selector did not match this version of IG's DOM. SKIPPING "
+                "caption typing. Update _CAPTION_SELECTORS based on the saved "
+                "HTML artifact and redeploy.",
+                caption[:40] + ("..." if len(caption) > 40 else ""),
+            )
+        else:
+            # click into editor — try every known selector until one works
+            clicked = False
+            for sel in _CAPTION_SELECTORS:
+                if safe_coordinate_click(page, sel, timeout=3):
+                    clicked = True
+                    break
+            if not clicked:
+                logger.warning(
+                    "[upload] Step 8: could not click the caption editor "
+                    "(found in DOM but coordinate click failed). Skipping "
+                    "caption typing — Share will proceed without text."
+                )
+            else:
+                behavior.idle(0.3, 0.7)
+                page.actions.type(caption)
+                behavior.read_pause(content_length=len(caption))
 
     # Step 9: Optional location
     if location:

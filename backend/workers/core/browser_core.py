@@ -181,6 +181,60 @@ def _spawn_local_auth_forwarder(
     )
 
 
+def dump_page_artifacts(page: Any, *, reason: str) -> str:  # type: ignore[no-untyped-def]
+    """Save screenshot + full HTML of `page` to a stable location.
+
+    Called from any action handler that hits a fail-stop condition (upload
+    Step 5 caption-not-found, warmup nav-not-resolvable, etc) so the operator
+    can debug offline. Files go to /var/log/ig_crm/ (a docker volume on the
+    host in production); falls back to /tmp/ if that path isn't writable.
+
+    Returns a one-line summary string suitable for inclusion in the raised
+    error message — tells the user where to find the artifacts.
+    """
+    import datetime as _dt
+    for base in ("/var/log/ig_crm", "/tmp"):
+        try:
+            os.makedirs(base, exist_ok=True)
+            ts = _dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            stem = f"fail_{reason}_{ts}"
+            png = os.path.join(base, f"{stem}.png")
+            html = os.path.join(base, f"{stem}.html")
+            ok_png = False
+            ok_html = False
+            # screenshot — DrissionPage has a few API variants by version
+            try:
+                try:
+                    page.get_screenshot(path=png, full_page=True)
+                except TypeError:
+                    page.get_screenshot(path=png)
+                ok_png = os.path.isfile(png) and os.path.getsize(png) > 0
+            except Exception as exc:
+                print(f"[!] screenshot save failed: {exc}", flush=True)
+            # full html
+            try:
+                full_html = page.html or ""
+                with open(html, "w", encoding="utf-8") as f:
+                    f.write(full_html)
+                ok_html = os.path.isfile(html) and os.path.getsize(html) > 0
+            except Exception as exc:
+                print(f"[!] html dump failed: {exc}", flush=True)
+            summary = (
+                f"screenshot={'OK' if ok_png else 'FAIL'} {png}, "
+                f"html={'OK' if ok_html else 'FAIL'} {html}"
+            )
+            print(f"[*] page artifacts: {summary}", flush=True)
+            return summary
+        except Exception as exc:
+            print(f"[!] could not write artifacts to {base}: {exc}", flush=True)
+            continue
+    return "(failed to write artifacts to any path)"
+
+
+# Any is forward-referenced — define before InstagramBrowser uses it.
+from typing import Any  # noqa: E402  (placement intentional)
+
+
 class InstagramBrowser:
     """Chromium browser set up for IG automation, with safe shutdown."""
 
@@ -629,16 +683,31 @@ class InstagramBrowser:
         # actually rendered. If proxy is dead/slow this raises with a clear
         # message instead of letting the action handler grind for minutes on
         # selectors that can't match.
-        print("[*] Navigating to home feed to confirm logged-in session...")
+        print("[*] Navigating to home feed to confirm logged-in session...", flush=True)
         try:
-            self.page.get("https://www.instagram.com/", timeout=30)
+            self.page.get("https://www.instagram.com/", timeout=45)
         except Exception as exc:
+            self._dump_home_fail_artifacts(reason="navigation_failed")
             raise RuntimeError(
                 f"home feed navigation failed (proxy too slow / dead?): "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
-        if not self._wait_for_ig_home_ready(timeout_s=30):
-            # Diagnostic info — where DID we end up?
+
+        # Give the JS bundle a couple of seconds to settle before our first
+        # selector probe. On slow proxies IG's first paint is HTML-only and
+        # the React tree mounts later — racing the first ele() loses.
+        time.sleep(3)
+
+        # Try to dismiss common "Save your login info?" / "Turn on
+        # notifications?" / cookie-consent modals BEFORE checking nav. These
+        # don't block the DOM (so our selectors would still match), but
+        # leaving them up will break later steps in warmup/upload anyway.
+        self._try_dismiss_known_modals()
+
+        if not self._wait_for_ig_home_ready(timeout_s=45):
+            # Save everything we can about the page so we can debug offline:
+            # screenshot, full HTML, console log if available.
+            dump = self._dump_home_fail_artifacts(reason="no_nav_match")
             try:
                 cur_url = str(self.page.url)
             except Exception:
@@ -651,30 +720,63 @@ class InstagramBrowser:
                 html_preview = (self.page.html or "")[:400].replace("\n", " ")
             except Exception:
                 html_preview = "?"
-            # Pattern-match the URL to give a CONCRETE cause string.
             cause: str
             if "/challenge/" in cur_url or "/auth_platform/" in cur_url:
-                cause = "IG returned a CHECKPOINT/CHALLENGE page (resolve it manually in a real browser with these cookies, then re-export and retry)."
+                cause = "IG returned a CHECKPOINT/CHALLENGE page. Open the saved screenshot to see what challenge (phone/email/captcha), resolve it manually in a real browser with these cookies, then re-export and retry."
             elif "/accounts/login" in cur_url or "/accounts/onetap" in cur_url:
-                cause = "IG redirected to LOGIN — cookies are expired or for a different account. Re-export fresh cookies and update the account."
+                cause = "IG redirected to LOGIN — cookies were not accepted. Re-export FRESH cookies from a real browser that's currently logged in to this account."
             elif "/accounts/suspended" in cur_url or "/accounts/disabled" in cur_url:
                 cause = "Account is SUSPENDED / DISABLED on IG side."
             elif cur_url.endswith("/robots.txt") or cur_url == "?":
-                cause = "Navigation NEVER happened — proxy is dead/blocked or timed out. Try `curl -x ...` from server to verify the proxy responds."
+                cause = "Navigation NEVER happened — proxy is dead/blocked or timed out."
             else:
                 cause = (
-                    "Page loaded but no known nav selector matched. Either IG "
-                    "shipped a new DOM (selectors need updating) OR a modal is "
-                    "blocking. HTML preview below."
+                    "Page loaded but no known nav selector matched. Look at "
+                    "the saved screenshot to see what's actually on screen."
                 )
             raise RuntimeError(
                 "Instagram home feed did NOT render after cookie injection.\n"
                 f"  current URL : {cur_url!r}\n"
                 f"  current title: {cur_title!r}\n"
                 f"  diagnosis    : {cause}\n"
+                f"  artifacts    : {dump}\n"
                 f"  html preview : {html_preview[:300]!r}"
             )
-        print("[*] Home feed ready, proceeding to commands.")
+        print("[*] Home feed ready, proceeding to commands.", flush=True)
+
+    def _try_dismiss_known_modals(self) -> None:
+        """Best-effort click on common IG modal dismiss buttons.
+
+        These appear after a fresh login and would otherwise block clicks
+        later in the action handlers. We silently swallow failures — if
+        none of these modals are present, the selectors just won't match.
+        """
+        button_texts = (
+            "Not now", "Not Now",
+            "Save info", "Save Info",
+            "Decline optional cookies", "Allow all cookies",
+            "Accept", "Accept all",
+            "Allow essential and optional cookies",
+        )
+        dismissed = 0
+        for text in button_texts:
+            try:
+                el = self.page.ele(f'xpath://button[normalize-space()="{text}"]', timeout=0.5)
+                if el:
+                    try:
+                        el.click()
+                        dismissed += 1
+                        time.sleep(0.5)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        if dismissed:
+            print(f"[*] Dismissed {dismissed} modal(s) before home-feed check", flush=True)
+
+    def _dump_home_fail_artifacts(self, *, reason: str) -> str:
+        """Compat wrapper around the module-level helper for this instance."""
+        return dump_page_artifacts(self.page, reason=f"home_{reason}")
 
     def _wait_for_ig_home_ready(self, *, timeout_s: float = 20.0) -> bool:
         """Return True once the IG home DOM has the main left-rail nav.

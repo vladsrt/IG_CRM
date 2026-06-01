@@ -36,18 +36,16 @@ process imported this module.
 from __future__ import annotations
 
 from celery import Celery
-from celery.signals import worker_process_init
 
 from app.core.config import settings
-from app.core.logging_config import setup_logging
 
-
-@worker_process_init.connect
-def _init_worker_logging(**_kwargs) -> None:  # type: ignore[no-untyped-def]
-    """Each forked Celery worker child re-runs logging setup so it writes to
-    the same rotating file the master uses. Without this, only the parent
-    process's stdout gets captured."""
-    setup_logging(component="worker")
+# NOTE: we DO NOT call our own setup_logging() inside a Celery worker
+# process. Celery installs its own stdout-redirect handler (so child
+# worker's print() output lands in `docker logs` / the celery log). Our
+# setup_logging() removed all root handlers, which silently broke that
+# redirect — child print()s went to /dev/null and we couldn't debug ANY
+# task failure. Celery's default setup already covers stdout + file
+# (--logfile flag on the worker command in docker-compose).
 
 celery_app: Celery = Celery(
     "ig_crm",

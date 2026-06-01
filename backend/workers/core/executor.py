@@ -173,7 +173,26 @@ class TaskExecutor:
                     len(self.commands),
                     action,
                 )
-                command_result = handler(browser, args) or {}
+                try:
+                    command_result = handler(browser, args) or {}
+                except CheckpointException:
+                    raise
+                except Exception as handler_exc:
+                    # On any action failure, snap the current page so the
+                    # operator can see what was on screen. The artifacts
+                    # land in /var/log/ig_crm/ (a docker volume in prod).
+                    # We do NOT swallow the exception — re-raise after dump.
+                    try:
+                        from workers.core.browser_core import dump_page_artifacts
+                        dump_page_artifacts(
+                            browser.page,
+                            reason=f"{action}_cmd{index}_{type(handler_exc).__name__}",
+                        )
+                    except Exception as dump_exc:
+                        logger.warning(
+                            "[TaskExecutor] artifact dump failed: %s", dump_exc
+                        )
+                    raise
                 results.append(
                     {"index": index, "action": action, "result": command_result}
                 )

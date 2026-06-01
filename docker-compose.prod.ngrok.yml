@@ -101,6 +101,7 @@ services:
       - "uv run --no-sync python -m celery -A app.core.celery_app.celery_app worker
          --loglevel=info -Q ig_crm.default
          --concurrency=${WORKER_CONCURRENCY:-2}
+         --logfile=/var/log/ig_crm/worker.log
          --include=app.workers.celery_tasks,app.workers.media_tasks"
 
   beat:
@@ -123,6 +124,7 @@ services:
       - "-c"
       - "uv run --no-sync python -m celery -A app.core.celery_app.celery_app beat
          --loglevel=info
+         --logfile=/var/log/ig_crm/beat.log
          --schedule=/var/lib/celerybeat/celerybeat-schedule"
 
 volumes:
