@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
@@ -14,6 +16,7 @@ from app.core.database import get_db
 from app.crud import account as crud_account
 from app.crud import task as crud_task
 from app.models.account import InstagramAccount
+from app.models.asset import Asset
 from app.models.task import Task, TaskStatus
 from app.models.user import User
 from app.schemas.orchestrator import (
@@ -132,10 +135,100 @@ def trigger_task_start(
             detail=f"Could not dispatch task to worker queue: {exc}",
         ) from exc
 
+    # Persist for cancel-ability later (same as fan_out flow).
+    task.celery_task_id = async_result.id
+    db.commit()
+
     return DispatchResponse(
         celery_task_id=async_result.id,
         status=TaskStatus.PENDING.value,
         detail=f"Task {task.id} dispatched to worker queue",
+    )
+
+
+# cancel a running / pending task
+_CANCELLABLE_STATUSES: frozenset[str] = frozenset(
+    {TaskStatus.PENDING.value, TaskStatus.RUNNING.value}
+)
+
+
+@router.post(
+    "/tasks/{task_id}/cancel",
+    response_model=DispatchResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Stop a running or queued Task — revoke + mark FAILED",
+)
+def cancel_task(
+    task_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> DispatchResponse:
+    """Revoke the Celery message and mark the Task FAILED.
+
+    - If the task is RUNNING in a worker child: SIGTERM kills the child, which
+      tears down Chrome + the local pproxy via InstagramBrowser.close().
+    - If the task is still PENDING (queued, no worker holding it yet): the
+      revoke flag in Redis ensures it never runs.
+    - DB status is set to FAILED immediately so the UI reflects the cancel
+      without waiting for the worker to ack.
+    """
+    task = crud_task.get_task(db, task_id)
+    if task is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
+        )
+    owner = crud_account.get_account(db, task.account_id)
+    if owner is None or owner.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
+        )
+
+    if task.status not in _CANCELLABLE_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Task {task.id} status is '{task.status}', only "
+                f"{sorted(_CANCELLABLE_STATUSES)} can be cancelled."
+            ),
+        )
+
+    revoked = False
+    if task.celery_task_id:
+        try:
+            from app.core.celery_app import celery_app as _celery_app
+            # terminate=True sends SIGTERM to the worker child running this
+            # task. signal='SIGTERM' is explicit; pool worker will then call
+            # browser.close() via the finally block in run_instagram_task.
+            _celery_app.control.revoke(
+                task.celery_task_id,
+                terminate=True,
+                signal="SIGTERM",
+            )
+            revoked = True
+        except Exception as exc:
+            logger.warning(
+                "[cancel_task] revoke failed for task=%s celery_id=%s: %s",
+                task.id, task.celery_task_id, exc,
+            )
+
+    task.status = TaskStatus.FAILED.value
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    cancel_note = (
+        f"[{timestamp}] cancelled by user {current_user.email} "
+        f"(revoke_sent={revoked})"
+    )
+    task.error_log = (
+        f"{task.error_log}\n{cancel_note}" if task.error_log else cancel_note
+    )
+    db.commit()
+
+    return DispatchResponse(
+        celery_task_id=task.celery_task_id or "",
+        status=TaskStatus.FAILED.value,
+        detail=(
+            f"Task {task.id} cancelled "
+            f"(revoke_sent={revoked}). Worker will tear down browser shortly."
+        ),
     )
 
 
@@ -174,6 +267,61 @@ def _resolve_target_accounts(
             resolved.setdefault(acct.id, acct)
 
     return resolved, missing
+
+
+_MEDIA_UPLOAD_ACTIONS: frozenset[str] = frozenset(
+    {"upload_reels", "upload_post", "upload_story"}
+)
+
+
+def _resolve_media_for_account(
+    db: Session,
+    payload: dict[str, Any],
+    account: InstagramAccount,
+) -> str | None:
+    """Replace media_asset_id with a per-account file_path inside payload['commands'].
+
+    Walks each upload command, looks up the named Asset, picks one of its
+    uniqueized children (so two accounts in the same fan-out get different
+    bytes), and writes the chosen absolute path into args['file_path']. The
+    media_asset_id key is removed once resolved.
+
+    Returns None on success, or an error string if any command names an asset
+    the caller does not own / does not exist / is not ready.
+    """
+    commands = payload.get("commands") or []
+    for cmd in commands:
+        if not isinstance(cmd, dict):
+            continue
+        if cmd.get("action") not in _MEDIA_UPLOAD_ACTIONS:
+            continue
+        args = cmd.get("args")
+        if not isinstance(args, dict):
+            continue
+
+        raw_id = args.pop("media_asset_id", None)
+        if raw_id is None:
+            # back-compat: caller already passed file_path directly
+            continue
+        try:
+            asset_uuid = uuid.UUID(str(raw_id))
+        except (TypeError, ValueError):
+            return f"media_asset_id {raw_id!r} is not a valid UUID"
+
+        asset = db.get(Asset, asset_uuid)
+        if asset is None or asset.user_id != account.user_id:
+            return f"media_asset_id {raw_id} not found in your library"
+
+        # pick a variant. children are the uniqueized copies; fall back to the
+        # parent file when uniqueization has not run yet.
+        variants = list(asset.children) if asset.children else []
+        if variants:
+            chosen = variants[hash(account.id) % len(variants)]
+            args["file_path"] = chosen.file_path
+        else:
+            args["file_path"] = asset.file_path
+
+    return None
 
 
 def _evaluate_account_trust(account: InstagramAccount) -> TrustReport:
@@ -226,6 +374,13 @@ def _create_and_dispatch_one(
     # this rewrites the plan dict with spintax variants and link obfuscation,
     # so two cloned tasks never end up with the same payload.
     base_payload = request.plan.to_payload_dict()
+
+    # resolve media_asset_id -> per-account file_path BEFORE spintax so any
+    # downstream pipeline only deals with concrete paths.
+    media_err = _resolve_media_for_account(db, base_payload, account)
+    if media_err is not None:
+        return None, None, media_err
+
     unique_payload = uniqueize_plan_payload(base_payload)
 
     # save and dispatch
@@ -261,6 +416,17 @@ def _create_and_dispatch_one(
                 task.id,
             )
         return task, None, f"celery dispatch failed: {type(exc).__name__}: {exc}"
+
+    # Persist celery_task_id so the UI can cancel/revoke later. Save errors
+    # don't block dispatch — worst case the user can't hit Stop on this one.
+    try:
+        task.celery_task_id = async_result.id
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.warning(
+            "[fan_out] could not persist celery_task_id for task=%s", task.id
+        )
 
     return task, async_result.id, None
 

@@ -23,4 +23,6 @@ class TaskRead(TaskBase):
     id: uuid.UUID
     account_id: uuid.UUID
     error_log: str | None = None
+    # exposed so the UI's Stop button can confirm a cancellable task exists
+    celery_task_id: str | None = None
     created_at: datetime

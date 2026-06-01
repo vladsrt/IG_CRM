@@ -1,9 +1,11 @@
 'use client'
 
+import { useState } from 'react'
 import useSWR from 'swr'
-import { Activity, Loader2, CheckCircle2, XCircle, Clock, Rocket, Zap } from 'lucide-react'
+import { Activity, Loader2, CheckCircle2, XCircle, Clock, Rocket, Zap, Square } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { api, type Task, type Account } from '@/lib/api'
 
 function actionIcon(a: string) {
@@ -14,9 +16,31 @@ function actionIcon(a: string) {
 
 export default function ActivityPage() {
   // Live: poll all tasks every 2s so the operator sees agents move in real time.
-  const { data: tasks } = useSWR<Task[]>('activity-tasks', () => api.getTasks(), { refreshInterval: 2000 })
+  const { data: tasks, mutate } = useSWR<Task[]>('activity-tasks', () => api.getTasks(), { refreshInterval: 2000 })
   const { data: accounts } = useSWR<Account[]>('accounts', () => api.getAccounts().catch(() => []))
   const nameById = new Map((accounts || []).map((a) => [a.id, a.ig_username]))
+
+  // Track in-flight cancel requests per-task-id so the UI button can show a
+  // spinner and prevent double-clicks while the SIGTERM is being delivered.
+  const [stopping, setStopping] = useState<Set<string>>(new Set())
+
+  const handleStop = async (taskId: string) => {
+    if (stopping.has(taskId)) return
+    setStopping((prev) => new Set(prev).add(taskId))
+    try {
+      await api.cancelTask(taskId)
+      // Optimistic refresh — the backend already flipped status to FAILED,
+      // mutate forces SWR to refetch immediately instead of waiting 2s.
+      await mutate()
+    } catch (e) {
+      console.error('cancel failed:', e)
+      alert(e instanceof Error ? e.message : 'Failed to stop task')
+    } finally {
+      setStopping((prev) => {
+        const next = new Set(prev); next.delete(taskId); return next
+      })
+    }
+  }
 
   const all = tasks || []
   const running = all.filter((t) => t.status === 'running')
@@ -48,6 +72,7 @@ export default function ActivityPage() {
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {running.map((t) => {
               const action = t.payload?.commands?.[0]?.action ?? 'task'
+              const busy = stopping.has(t.id)
               return (
                 <Card key={t.id} className="border-amber-500/30">
                   <CardContent className="p-4 space-y-3">
@@ -68,6 +93,21 @@ export default function ActivityPage() {
                         <Badge key={i} variant="outline" className="text-[10px]">{c.action.replace(/_/g, ' ')}</Badge>
                       ))}
                     </div>
+                    {/* Stop button: SIGTERMs the worker child → browser + pproxy
+                        tear down in InstagramBrowser.close(); DB status → failed */}
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="w-full text-destructive border-destructive/40 hover:bg-destructive/10"
+                      onClick={() => handleStop(t.id)}
+                      disabled={busy}
+                    >
+                      {busy ? (
+                        <><Loader2 className="w-3.5 h-3.5 mr-2 animate-spin" />Stopping…</>
+                      ) : (
+                        <><Square className="w-3.5 h-3.5 mr-2" />Stop agent</>
+                      )}
+                    </Button>
                   </CardContent>
                 </Card>
               )
