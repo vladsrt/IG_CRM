@@ -5,7 +5,13 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routers import (
+# Configure logging BEFORE importing routers so their module-level loggers
+# pick up the right handlers. Honours LOG_LEVEL / LOG_DIR env vars.
+from app.core.logging_config import setup_logging
+
+setup_logging(component="api")
+
+from app.api.routers import (  # noqa: E402  (after setup_logging on purpose)
     account,
     admin,
     ai,
@@ -17,7 +23,7 @@ from app.api.routers import (
     task,
     user,
 )
-from app.core.config import settings
+from app.core.config import settings  # noqa: E402
 
 app = FastAPI(
     title="Instagram CRM API",

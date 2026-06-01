@@ -1,0 +1,61 @@
+# Backend container: FastAPI + Celery worker + beat all built into one image.
+# docker-compose runs the SAME image three times with different commands so we
+# don't drift the dependency tree between processes.
+#
+# What's inside:
+#   - Python 3.13 slim
+#   - Google Chrome stable (deb-installed, not snap → can read /tmp/)
+#   - ffmpeg (for media uniqueize_video)
+#   - All Python deps from pyproject.toml via uv
+#
+# Build context = repo root; everything below paths is relative to it.
+
+FROM python:3.13-slim AS base
+
+# System deps:
+#   - Chrome runtime libs (libnss3, libatk, etc) plus Chrome itself
+#   - ffmpeg/ffprobe for media uniqueization
+#   - curl + gnupg to fetch the Chrome repo key
+#   - libpq-dev so psycopg compiles against PostgreSQL bindings
+#   - tini as PID-1 to reap zombies (Chrome forks a lot of subprocesses)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg tini ffmpeg libpq-dev fonts-liberation \
+        libasound2 libatk-bridge2.0-0 libatk1.0-0 libcups2 libdbus-1-3 \
+        libdrm2 libgbm1 libgtk-3-0 libnspr4 libnss3 libwayland-client0 \
+        libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxdamage1 libxext6 \
+        libxfixes3 libxkbcommon0 libxrandr2 libxshmfence1 xdg-utils \
+    && install -d -m 0755 /etc/apt/keyrings \
+    && curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+        | gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg \
+    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
+        > /etc/apt/sources.list.d/google-chrome.list \
+    && apt-get update && apt-get install -y --no-install-recommends google-chrome-stable \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# uv for fast dependency install. Pinned version is fine — uv is stable.
+COPY --from=ghcr.io/astral-sh/uv:0.5.4 /uv /uvx /usr/local/bin/
+
+WORKDIR /app
+
+# Install Python deps in their own layer so code changes don't bust the cache.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
+
+# App code.
+COPY backend ./backend
+COPY migrations ./migrations
+COPY alembic.ini ./alembic.ini
+
+# Runtime config:
+#   - app modules live under /app/backend so PYTHONPATH points there
+#   - log dir created so a non-root user (added later if needed) can write
+#   - MEDIA_ROOT default points at the volume mount
+ENV PYTHONPATH=/app/backend \
+    PYTHONUNBUFFERED=1 \
+    LOG_DIR=/var/log/ig_crm \
+    MEDIA_ROOT=/app/media
+RUN mkdir -p /var/log/ig_crm /app/media
+
+# Default command. docker-compose overrides this per service (api / worker / beat).
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["sh", "-c", "uv run --no-sync python -m uvicorn app.api.main:app --host 0.0.0.0 --port 8000"]

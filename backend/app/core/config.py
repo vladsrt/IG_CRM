@@ -78,6 +78,14 @@ class Settings(BaseSettings):
     # e.g. ADMIN_EMAILS=me@x.com,you@y.com
     ADMIN_EMAILS: str = ""
 
+    # logging (consumed by app/core/logging_config.py — see that module).
+    # LOG_DIR="" disables file output (dev default; stdout only).
+    # Set LOG_DIR=/var/log/ig_crm in prod to capture rotated .log files.
+    LOG_LEVEL: str = "INFO"
+    LOG_DIR: str = ""
+    LOG_MAX_BYTES: int = 20 * 1024 * 1024
+    LOG_BACKUP_COUNT: int = 5
+
     def is_admin(self, email: str | None) -> bool:
         """True if the email is in the admin allow-list (case-insensitive)."""
         if not email:

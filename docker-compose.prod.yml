@@ -1,0 +1,146 @@
+# Production stack: API + Celery worker + Celery beat + Postgres + Redis + Caddy.
+#
+# Frontend is NOT here — deploy it to Vercel (recommended) or build it as a
+# static export and point Caddy at the result. NEXT_PUBLIC_API_URL on the
+# Vercel side must point at https://<your-domain> (Caddy terminates SSL).
+#
+# Bring it up:
+#   cp .env.production.example .env
+#   # edit .env: DOMAIN, SECRET_KEY (openssl rand -hex 32),
+#   #            POSTGRES_PASSWORD, OPENAI_API_KEY, ADMIN_EMAILS
+#   docker compose -f docker-compose.prod.yml up -d --build
+#   docker compose -f docker-compose.prod.yml logs -f api
+#
+# First-time DB migration runs automatically via the `migrate` one-shot service.
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: ig_crm_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ig_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-ig_crm}
+    volumes:
+      - ig_crm_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ig_user} -d ${POSTGRES_DB:-ig_crm}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: ig_crm_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ig_crm_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: applies alembic migrations and exits. The api/worker depend
+  # on this completing successfully via service_completed_successfully.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: ig_crm_migrate
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["sh", "-c", "uv run --no-sync python -m alembic -c alembic.ini upgrade head"]
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    image: ig_crm_backend:latest    # tag so worker/beat reuse the same image
+    container_name: ig_crm_api
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ig_crm_media:/app/media
+      - ig_crm_logs:/var/log/ig_crm
+    command:
+      - "sh"
+      - "-c"
+      - "uv run --no-sync python -m uvicorn app.api.main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS:-2}"
+    expose:
+      - "8000"
+
+  worker:
+    image: ig_crm_backend:latest
+    container_name: ig_crm_worker
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      api:
+        condition: service_started
+    volumes:
+      - ig_crm_media:/app/media
+      - ig_crm_logs:/var/log/ig_crm
+      # /dev/shm boost — Chrome crashes on tiny shm. Default is 64 MB, way
+      # too small for headless Chrome with multiple tabs.
+    shm_size: "2gb"
+    command:
+      - "sh"
+      - "-c"
+      - "uv run --no-sync python -m celery -A app.core.celery_app.celery_app worker
+         --loglevel=info -Q ig_crm.default
+         --concurrency=${WORKER_CONCURRENCY:-2}
+         --include=app.workers.celery_tasks,app.workers.media_tasks"
+
+  beat:
+    image: ig_crm_backend:latest
+    container_name: ig_crm_beat
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      api:
+        condition: service_started
+    volumes:
+      - ig_crm_logs:/var/log/ig_crm
+      - ig_crm_beatdata:/var/lib/celerybeat
+    working_dir: /var/lib/celerybeat
+    command:
+      - "sh"
+      - "-c"
+      - "uv run --no-sync python -m celery -A app.core.celery_app.celery_app beat --loglevel=info"
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: ig_crm_caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+    depends_on:
+      - api
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ig_crm_caddydata:/data
+      - ig_crm_caddyconfig:/config
+
+volumes:
+  ig_crm_pgdata:
+  ig_crm_redisdata:
+  ig_crm_media:
+  ig_crm_logs:
+  ig_crm_beatdata:
+  ig_crm_caddydata:
+  ig_crm_caddyconfig:

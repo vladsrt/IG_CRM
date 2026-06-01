@@ -1,0 +1,40 @@
+# Caddy reverse proxy in front of the FastAPI container.
+#
+# Why Caddy and not nginx: Caddy auto-provisions Let's Encrypt SSL certs as
+# soon as a real domain points at this host's :80/:443. Zero config beyond
+# this file. Renewals happen automatically.
+#
+# Requirements before this works:
+#   1. A registered domain pointing (A record) at this server's public IP.
+#   2. Ports 80 and 443 reachable from the internet (open in firewall + cloud).
+#   3. DOMAIN env var set in .env — docker-compose passes it via the service
+#      environment (see compose file). Set DOMAIN=api.yourdomain.com.
+#
+# CORS: the API container has CORS_ALLOWED_ORIGINS=https://<your-frontend>;
+# Caddy just forwards the request, it does NOT do CORS itself.
+
+{$DOMAIN} {
+    # Forward everything to the api container on the internal docker network.
+    reverse_proxy api:8000 {
+        # Pass the real client IP through so the API logs see it, not
+        # 172.18.0.x docker-internal addresses.
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+
+    # Tighter request limits to keep ourselves safe from accidental DoS.
+    request_body {
+        max_size 500MB    # matches MEDIA_MAX_UPLOAD_BYTES in app config
+    }
+
+    encode gzip zstd
+
+    log {
+        output file /data/access.log {
+            roll_size 50MB
+            roll_keep 5
+        }
+        format json
+    }
+}
